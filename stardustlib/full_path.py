@@ -5,6 +5,7 @@ import json
 from .log import log
 from .config import config
 
+NODE_ALGORITHM = "RR"
 
 # NODE0PATH = config['nodes'][0]['abs_path']
 # DBfile = os.path.join(NODE0PATH, 'hashdata.db')
@@ -14,22 +15,39 @@ from .config import config
 def full_path(partial) -> str:
     if partial.startswith("/"):
         partial = partial[1:]
-    log(f'### partial {partial}')
+        log(f'partial startswith /: {partial}')
+
     for node in config['nodes']:
         # path = os.path.join(node['abs_path'], 'live', partial)
         path = os.path.join(node['abs_path'], partial)
-        log(f"### path {path}")
+        # log(f"lookup each node {path}")
         if os.path.exists(path):
             log(f'### full_path out === {path}')
             return path
 
+    # 없는 파일/디렉토리 시작
+    log(f'coun\'t find {partial}')
+
     # TODO: 없는 파일/디렉토리는 nodes 에서 적당한 node 골라서
-    node_for_new = config['nodes'][0]
-    return os.path.join(node_for_new['abs_path'], 'live', partial)
+
+    node_for_new = config['nodes'][get_node_byalgorithm()]
+    log(f'node_for_new[{node_for_new}]')
+    return os.path.join(node_for_new['abs_path'], partial)
 
     # 모든 노드 db에 같은 값이 들어 있어야 함
     # path = lookup_abspath(partial)
 
+LATEST_NODE = 0
+def get_node_byalgorithm() -> int:
+    global LATEST_NODE
+    sz = len(config['nodes'])
+    if NODE_ALGORITHM == 'RR':
+        log(f'RR nodes[{sz}]')
+        LATEST_NODE += 1
+        if LATEST_NODE >= sz:
+            LATEST_NODE = 0
+    log(f'picked node[{LATEST_NODE}]')
+    return LATEST_NODE
 
 # def lookup_abspath(partial: str) -> str:
 #     log(f"### lookup_db {partial}")
