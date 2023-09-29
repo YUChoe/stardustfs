@@ -4,15 +4,12 @@
 
 import os
 import errno
-import datetime
 
 from fuse import FUSE, FuseOSError, Operations
 
 import stardustlib
 from stardustlib.log import log
 
-# def log(s):
-#     print(datetime.datetime.now().strftime('%H:%M:%S.%f'), f'[{__name__}]', s)
 
 class Passthrough(Operations):
     def __init__(self):
@@ -58,12 +55,16 @@ class Passthrough(Operations):
         return os.mknod(self._full_path(path), mode, dev)
 
     def rmdir(self, path):
+        # TODO: 남은 파일있는 디렉토리 리턴 > 에러 발생
         full_path = self._full_path(path)
         return os.rmdir(full_path)
 
     def mkdir(self, path, mode):
         log(f"mkdir {path} {mode}")
-        return os.mkdir(self._full_path(path), mode)
+        # TODO: 만들 때 모든 노드 다 만들 것
+        # 아니면 일단 한 디렉토리에만 쓰다가 용량 부족할 때 다른 노드에 만들 것
+        return stardustlib.mkdir(path, mode)
+        # return os.mkdir(self._full_path(path), mode)
 
     def statfs(self, path):
         full_path = self._full_path(path)

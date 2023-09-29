@@ -1,5 +1,6 @@
 import datetime
 import traceback
+import os
 
 
 def log(s: str) -> None:
@@ -9,4 +10,4 @@ def log(s: str) -> None:
 def stackname():
     stack = traceback.extract_stack()
     filename, codeline, funcName, text = stack[-3]
-    return f'{filename}\t{funcName}({codeline})'
+    return f'{os.path.basename(filename)}:{funcName}({codeline})'

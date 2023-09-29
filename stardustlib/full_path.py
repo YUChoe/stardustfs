@@ -15,21 +15,21 @@ NODE_ALGORITHM = "RR"
 def full_path(partial) -> str:
     if partial.startswith("/"):
         partial = partial[1:]
-        log(f'partial startswith /: {partial}')
+        # log(f'partial startswith /: {partial}')
 
     for node in config['nodes']:
         # path = os.path.join(node['abs_path'], 'live', partial)
         path = os.path.join(node['abs_path'], partial)
         # log(f"lookup each node {path}")
+        # TODO: if isdir(path) == True RR
         if os.path.exists(path):
-            log(f'### full_path out === {path}')
+            # log(f'### full_path out === {path}')
             return path
+        else:
+            # how do i know path is dir or file?
+            pass
 
-    # 없는 파일/디렉토리 시작
-    log(f'coun\'t find {partial}')
-
-    # TODO: 없는 파일/디렉토리는 nodes 에서 적당한 node 골라서
-
+    # log(f'coun\'t find {partial}')
     node_for_new = config['nodes'][get_node_byalgorithm()]
     log(f'node_for_new[{node_for_new}]')
     return os.path.join(node_for_new['abs_path'], partial)
@@ -60,7 +60,6 @@ def get_node_byalgorithm() -> int:
 #             return _abspath
 #     # TODO: 없는 파일은 어떻게?
 #     return f"{NODE0PATH}/live"
-
 
 
 if __name__ == '__main__':
