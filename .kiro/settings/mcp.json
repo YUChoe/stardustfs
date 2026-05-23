@@ -1,0 +1,23 @@
+{
+  "mcpServers": {
+    "knowledge-graph": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "git+https@github.com:YUChoe/memory-mcp.git",
+        "C:\\Users\\yonguk.choe\\src\\stardustfs\\.kiro"
+      ],
+      "disabled": false,
+      "autoApprove": [
+        "search_nodes",
+        "create_entities",
+        "add_observations",
+        "open_nodes",
+        "create_relations",
+        "read_graph",
+        "search_nodes",
+        "search_nodes"
+      ]
+    }
+  }
+}

@@ -13,9 +13,7 @@ NODE_ALGORITHM = "RR"
 
 
 def full_path(partial) -> str:
-    if partial.startswith("/"):
-        partial = partial[1:]
-        # log(f'partial startswith /: {partial}')
+    partial = strip_startwithslash(partial)
 
     for node in config['nodes']:
         # path = os.path.join(node['abs_path'], 'live', partial)
@@ -60,6 +58,24 @@ def get_node_byalgorithm() -> int:
 #             return _abspath
 #     # TODO: 없는 파일은 어떻게?
 #     return f"{NODE0PATH}/live"
+
+def symlink(dst, src):
+    log(f'##### STARTED {src} {dst}')
+    # target 을 node 에서 찾아서 있는곳에 링크 생성
+    # TODO: target 이 디렉토리면 모든 노드에, 파일이면 파일 있는 곳에
+    _f = full_path(src)
+    dst = strip_startwithslash(dst)
+    log(f'##### ln -s {_f} > {dst}')
+    if os.path.isdir(_f):
+        return os.symlink(_f, dst, True)
+    else:
+        return os.symlink(_f, dst, False)
+    # WIP
+
+def strip_startwithslash(s:str) -> str:
+    if s.startswith("/"):
+        return s[1:]
+    return s
 
 
 if __name__ == '__main__':

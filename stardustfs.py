@@ -43,7 +43,7 @@ class Passthrough(Operations):
             yield r
 
     def readlink(self, path):
-        log('readlink', path)
+        log(f'readlink {path}')
         pathname = os.readlink(self._full_path(path))
         if pathname.startswith("/"):
             # Path name is absolute, sanitize it.
@@ -77,7 +77,13 @@ class Passthrough(Operations):
         return os.unlink(self._full_path(path))
 
     def symlink(self, name, target):
-        return os.symlink(name, self._full_path(target))
+        return stardustlib.symlink(name, target)
+
+    def _relative_path(self, partial):
+        if partial.startswith("/"):
+            partial = partial[1:]
+        return os.path.join('.', partial)
+
 
     def rename(self, old, new):
         return os.rename(self._full_path(old), self._full_path(new))

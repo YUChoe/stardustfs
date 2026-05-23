@@ -1,0 +1,97 @@
+{
+  "entities": [
+    {
+      "name": "StardustFS",
+      "entityType": "Project",
+      "observations": [
+        "2026-01-29: Python FUSE 기반 분산 파일시스템 프로젝트",
+        "2026-01-29: 여러 스토리지 노드를 단일 마운트 포인트로 통합",
+        "2026-01-29: Round-Robin 알고리즘으로 노드 선택",
+        "2026-01-29: fusepy 라이브러리 사용",
+        "2026-01-29: Windows 테스트 환경 구축 완료",
+        "2026-01-29: .venv 가상환경 사용 (python -m venv .venv)",
+        "2026-01-29: 가상환경 활성화: source .venv/Scripts/activate (bash)",
+        "2026-01-29: StardustOperations 클래스로 FUSE 의존성 분리하여 Windows 테스트 가능",
+        "2026-01-29: Mock 테스트 7개 모두 통과 (readdir, mkdir, 파일 I/O, RR 분배)",
+        "2026-01-29: Kiro spec 작성 완료 - .kiro/specs/stardustfs-core/design.md",
+        "2026-01-29: Design-First 워크플로우 사용 (High-Level + Low-Level Design)",
+        "2025-07-14: 1차 MVP 대폭 변경 - FUSE에서 WebDAV(wsgidav)로 전환",
+        "2025-07-14: AES-256 암호화 레이어 추가",
+        "2025-07-14: 디렉토리 + 루프백 파일(iso/dmg 형태) 스토리지 소스 지원",
+        "2025-07-14: JSON 설정에서 SQLite 메타데이터 저장소로 전환",
+        "2025-07-14: Round-Robin에서 JBOD(Just a Bunch of Disks) 통합으로 변경",
+        "2026-05-23: FUSE 기반에서 WebDAV(wsgidav) 기반으로 아키텍처 전환",
+        "2026-05-23: AES-256-GCM 암호화 레이어 추가",
+        "2026-05-23: 디렉토리 + 루프백 파일(iso/dmg 형태) 스토리지 소스 지원",
+        "2026-05-23: SQLite 메타데이터 저장소 도입",
+        "2026-05-23: JBOD(Just a Bunch of Disks) 방식 스토리지 통합",
+        "2026-05-23: 1차 MVP 요구사항 정의 완료"
+      ]
+    },
+    {
+      "name": "StardustFS-Architecture",
+      "entityType": "Documentation",
+      "observations": [
+        "2026-01-29: Passthrough 클래스가 FUSE Operations 구현",
+        "2026-01-29: stardustlib 모듈로 핵심 기능 분리 (config, full_path, getattr, readdir, log)",
+        "2026-01-29: setup.json으로 설정 관리",
+        "2026-01-29: 디렉토리는 모든 노드에 복제하여 일관성 유지"
+      ]
+    },
+    {
+      "name": "StardustFS-CodeReview",
+      "entityType": "Documentation",
+      "observations": [
+        "2026-01-29: 개선필요 - 에러 처리 부족",
+        "2026-01-29: 개선필요 - 전역 상태(LATEST_NODE) 사용으로 race condition 가능",
+        "2026-01-29: 개선필요 - rename 노드 간 이동 미지원",
+        "2026-01-29: 개선필요 - strip_startwithslash/strip_path 중복 함수",
+        "2026-01-29: 개선필요 - 설정 검증 부재",
+        "2026-01-29: 개선필요 - statfs가 단일 노드 통계만 반환"
+      ]
+    },
+    {
+      "name": "StardustFS-WindowsTest",
+      "entityType": "Task",
+      "observations": [
+        "2026-01-29: Windows에서 FUSE 테스트 방법 논의",
+        "2026-01-29: 옵션1 - Mock 기반 테스트 레이어 (권장)",
+        "2026-01-29: 옵션2 - WinFsp (Windows용 FUSE 구현체)",
+        "2026-01-29: 옵션3 - WSL2 사용"
+      ]
+    },
+    {
+      "name": "StardustFS-VirtualEnv",
+      "entityType": "Environment",
+      "observations": [
+        "2026-01-29: 경로: .venv",
+        "2026-01-29: 생성: python -m venv .venv",
+        "2026-01-29: 활성화 (bash): source .venv/Scripts/activate",
+        "2026-01-29: 활성화 (cmd): .venv\\Scripts\\activate.bat",
+        "2026-01-29: 의존성: fusepy==3.0.1"
+      ]
+    }
+  ],
+  "relations": [
+    {
+      "from": "StardustFS",
+      "to": "StardustFS-Architecture",
+      "relationType": "has-documentation"
+    },
+    {
+      "from": "StardustFS",
+      "to": "StardustFS-CodeReview",
+      "relationType": "has-documentation"
+    },
+    {
+      "from": "StardustFS",
+      "to": "StardustFS-WindowsTest",
+      "relationType": "has-task"
+    },
+    {
+      "from": "StardustFS",
+      "to": "StardustFS-VirtualEnv",
+      "relationType": "uses"
+    }
+  ]
+}
