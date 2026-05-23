@@ -6,20 +6,20 @@
 
 ## Tasks
 
-- [ ] 1. 프로젝트 구조 설정 및 데이터 모델 정의
-  - [ ] 1.1 프로젝트 디렉토리 구조 생성 및 의존성 설정
+- [x] 1. 프로젝트 구조 설정 및 데이터 모델 정의
+  - [x] 1.1 프로젝트 디렉토리 구조 생성 및 의존성 설정
     - `stardustlib/` 하위에 모듈 파일 생성: `config_loader.py`, `encryption_engine.py`, `metadata_store.py`, `storage_source.py`, `jbod_manager.py`, `webdav_provider.py`, `exceptions.py`, `models.py`
     - `requirements.txt` 업데이트: wsgidav, cheroot, cryptography, pysqlcipher3, hypothesis, pytest, requests
     - 기존 FUSE 관련 코드 제거 (stardustfs.py의 FUSE 의존성)
     - _Requirements: 1.1_
 
-  - [ ] 1.2 데이터 모델 및 예외 클래스 정의
+  - [x] 1.2 데이터 모델 및 예외 클래스 정의
     - `stardustlib/models.py`에 `StardustConfig`, `WebDAVConfig`, `DirectorySourceConfig`, `LoopbackSourceConfig`, `FileMetadata`, `EntryInfo`, `FileInfo`, `EncryptedFileHeader` dataclass 정의
     - `stardustlib/exceptions.py`에 `InsufficientStorageError`, `DecryptionError`, `IntegrityError`, `KeyNotFoundError`, `InvalidKeyError` 정의
     - _Requirements: 5.2, 4.5_
 
 - [ ] 2. Config Loader 구현
-  - [ ] 2.1 ConfigLoader 클래스 구현
+  - [x] 2.1 ConfigLoader 클래스 구현
     - JSON 설정 파일 파싱 및 `StardustConfig` 반환
     - 설정 검증: 최소 1개 소스, 절대 경로, Loopback 크기 범위(10MB~2TB), 포트 범위(1~65535)
     - `webdav.host`를 항상 `"127.0.0.1"`로 강제 (보안)
@@ -38,7 +38,7 @@
     - **Validates: Requirements 6.3, 6.4, 6.5, 6.6, 6.7**
 
 - [ ] 3. Encryption Engine 구현
-  - [ ] 3.1 EncryptionEngine 클래스 구현
+  - [x] 3.1 EncryptionEngine 클래스 구현
     - AES-256-GCM 암호화/복호화 구현 (`cryptography` 라이브러리 사용)
     - 파일 헤더 구조: `[MAGIC(4B)][VERSION(1B)][MODE_ID(1B)][IV(16B)][TAG(16B)][CIPHERTEXT...]`
     - CSPRNG으로 128비트 IV 생성 (`os.urandom(16)`)
@@ -62,11 +62,11 @@
     - **Property 4: 데이터 변조 감지**
     - **Validates: Requirements 4.8**
 
-- [ ] 4. Checkpoint - 암호화 엔진 검증
+- [x] 4. Checkpoint - 암호화 엔진 검증
   - Ensure all tests pass, ask the user if questions arise.
 
 - [ ] 5. Metadata Store 구현
-  - [ ] 5.1 MetadataStore 클래스 구현
+  - [x] 5.1 MetadataStore 클래스 구현
     - SQLCipher(pysqlcipher3) 기반 암호화 SQLite DB 초기화 및 스키마 생성
     - `PRAGMA key`로 암호화 키 설정
     - `files` 테이블 및 `directories` 테이블 생성 (인덱스 포함)
@@ -92,14 +92,14 @@
     - _Requirements: 5.1, 5.5, 5.6, 5.7, 5.8, 5.9_
 
 - [ ] 6. Storage Source 구현
-  - [ ] 6.1 StorageSource 추상 클래스 및 DirectorySource 구현
+  - [x] 6.1 StorageSource 추상 클래스 및 DirectorySource 구현
     - `StorageSource` ABC 정의: `initialize`, `read`, `write`, `delete`, `exists`, `mkdir`, `rmdir`, `list_dir`, `get_available_space`, `get_total_space`
     - `DirectorySource` 구현: 로컬 디렉토리 기반 읽기/쓰기/삭제
     - 경로 존재/권한 검증, 접근 불가 시 비활성 상태 전환
     - 용량 정보 제공 (`shutil.disk_usage`)
     - _Requirements: 3.1, 3.5, 3.6_
 
-  - [ ] 6.2 LoopbackSource 구현
+  - [x] 6.2 LoopbackSource 구현
     - 고정 크기 파일 생성 (10MB~2TB)
     - 내부 파일시스템 구조 초기화 (디렉토리 기반 논리적 구조)
     - 논리적 마운트/언마운트
@@ -114,7 +114,7 @@
     - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8_
 
 - [ ] 7. JBOD Manager 구현
-  - [ ] 7.1 JBODManager 핵심 파일 작업 구현
+  - [x] 7.1 JBODManager 핵심 파일 작업 구현
     - `read_file`: 메타데이터 조회 → 소스에서 읽기 → 복호화 → 반환
     - `write_file`: 암호화 → 소스 선택/기존 소스 → 저장 → 메타데이터 기록 (원자적 트랜잭션)
     - `delete_file`: 메타데이터 조회 → 소스에서 삭제 → 메타데이터 제거
@@ -123,7 +123,7 @@
     - 쓰기 실패 시 부분 파일 삭제 + 메타데이터 롤백
     - _Requirements: 2.1, 2.3, 2.4, 2.6, 2.7, 2.8, 8.1, 8.2, 8.4, 8.5_
 
-  - [ ] 7.2 JBODManager 디렉토리 작업 구현
+  - [x] 7.2 JBODManager 디렉토리 작업 구현
     - `list_directory`: 메타데이터 기반 엔트리 목록 조회 (파일 + 디렉토리 통합, 중복 제거)
     - `create_directory`: 모든 활성 소스에 디렉토리 복제, 일부 실패 시 로그 기록
     - `delete_directory`: 디렉토리 및 하위 파일 삭제
@@ -154,18 +154,18 @@
     - **Property 13: 비활성 소스 파일 접근 거부**
     - **Validates: Requirements 8.5**
 
-- [ ] 8. Checkpoint - JBOD 및 스토리지 검증
+- [x] 8. Checkpoint - JBOD 및 스토리지 검증
   - Ensure all tests pass, ask the user if questions arise.
 
 - [ ] 9. WebDAV Server 구현
-  - [ ] 9.1 StardustDAVProvider 및 리소스 클래스 구현
+  - [x] 9.1 StardustDAVProvider 및 리소스 클래스 구현
     - `StardustDAVProvider(DAVProvider)`: `get_resource_inst()` 구현
     - `StardustFileResource(DAVNonCollection)`: `get_content`, `begin_write`, `delete`, `copy_move_single`, 속성 메서드
     - `StardustDirectoryResource(DAVCollection)`: `get_member_names`, `get_member`, `create_empty_resource`, `create_collection`, `delete`
     - 에러를 HTTP 상태 코드로 변환: 404, 401, 507, 500
     - _Requirements: 1.2, 1.3, 1.4, 1.5, 1.6, 8.6_
 
-  - [ ] 9.2 WebDAV 앱 생성 및 인증 설정
+  - [x] 9.2 WebDAV 앱 생성 및 인증 설정
     - `create_webdav_app()`: wsgidav WSGI 앱 생성
     - HTTP Basic Authentication 설정 (설정 파일의 username/password 사용)
     - 인증 실패 시 401 반환 및 로그 기록
@@ -179,7 +179,7 @@
     - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 8.6_
 
 - [ ] 10. 시스템 초기화 및 메인 엔트리포인트 구현
-  - [ ] 10.1 시스템 초기화 로직 구현
+  - [x] 10.1 시스템 초기화 로직 구현
     - 순차적 검증: 설정 로드 → 스토리지 검증 → DB 초기화 → 키 검증 → WebDAV 시작
     - HKDF로 마스터 키에서 DB 전용 키 파생
     - 모든 검증 실패 원인 수집 후 일괄 로그 기록
@@ -187,7 +187,7 @@
     - 성공 시 "StardustFS 준비 완료" 로그 기록
     - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7_
 
-  - [ ] 10.2 메인 엔트리포인트 작성
+  - [x] 10.2 메인 엔트리포인트 작성
     - `stardustfs.py` 또는 `__main__.py`에서 `--config` 인자 처리
     - `initialize_system()` 호출 후 cheroot 서버 시작
     - _Requirements: 1.1, 7.5_
@@ -198,7 +198,7 @@
     - DB 타임아웃 시 실패 처리 테스트
     - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7_
 
-- [ ] 11. Final checkpoint - 전체 시스템 검증
+- [x] 11. Final checkpoint - 전체 시스템 검증
   - Ensure all tests pass, ask the user if questions arise.
 
 ## Notes

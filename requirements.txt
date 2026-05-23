@@ -1,1 +1,7 @@
-fusepy==3.0.1
+wsgidav
+cheroot
+cryptography
+pysqlcipher3
+hypothesis
+pytest
+requests
