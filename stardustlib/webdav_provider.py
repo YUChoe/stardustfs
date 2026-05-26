@@ -38,6 +38,7 @@ class _WriteBuffer(BytesIO):
         if not self.closed:
             data = self.getvalue()
             try:
+                logger.info("WRITE %s (%d bytes)", self._virtual_path, len(data))
                 self._jbod_manager.write_file(self._virtual_path, data)
             except Exception:
                 logger.error(
@@ -71,17 +72,12 @@ class StardustDAVProvider(DAVProvider):
         self.encryption_engine = encryption_engine
 
     def get_resource_inst(self, path: str, environ: dict):
-        """가상 경로에 해당하는 DAV 리소스 인스턴스를 반환한다.
-
-        Args:
-            path: 가상 경로 (예: "/", "/docs/file.txt").
-            environ: WSGI 환경 딕셔너리.
-
-        Returns:
-            DAVResource 인스턴스 또는 None (리소스 미존재 시).
-        """
+        """가상 경로에 해당하는 DAV 리소스 인스턴스를 반환한다."""
         # 경로 정규화
         path = path.rstrip("/") or "/"
+
+        method = environ.get("REQUEST_METHOD", "?")
+        logger.debug("[%s] %s", method, path)
 
         # 루트 경로는 항상 디렉토리
         if path == "/":
@@ -209,6 +205,7 @@ class StardustFileResource(DAVNonCollection):
             DAVError: 파일 미존재 시 404, 기타 에러 시 500.
         """
         try:
+            logger.info("DELETE %s", self.path)
             self._jbod_manager.delete_file(self.path)
         except FileNotFoundError:
             raise DAVError(HTTP_NOT_FOUND)
@@ -377,6 +374,7 @@ class StardustDirectoryResource(DAVCollection):
             DAVError: 기타 에러 시 500.
         """
         try:
+            logger.info("RMDIR %s", self.path)
             self._jbod_manager.delete_directory(self.path)
         except FileNotFoundError:
             raise DAVError(HTTP_NOT_FOUND)

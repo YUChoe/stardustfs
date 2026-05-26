@@ -1,7 +1,16 @@
-wsgidav
-cheroot
-cryptography
-pysqlcipher3
-hypothesis
-pytest
-requests
+# StardustFS 의존성 (pinned versions)
+
+# WebDAV 서버
+WsgiDAV==4.3.3
+cheroot==11.1.2
+
+# 암호화
+cryptography==48.0.0
+
+# 메타데이터 DB 암호화 (Linux 전용, Windows에서는 표준 sqlite3 폴백)
+# pysqlcipher3==1.2.1
+
+# 테스트
+hypothesis==6.152.9
+pytest==9.0.3
+requests==2.34.2

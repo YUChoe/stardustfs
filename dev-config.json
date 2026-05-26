@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "webdav": {
+    "host": "127.0.0.1",
+    "port": 8080,
+    "username": "admin",
+    "password": "stardust"
+  },
+  "sources": [
+    {
+      "type": "loopback",
+      "id": "loop-001",
+      "path": "C:/Users/yonguk.choe/src/stardustfs/.dev-storage/vol1.img",
+      "size": 10485760
+    },
+    {
+      "type": "loopback",
+      "id": "loop-002",
+      "path": "C:/Users/yonguk.choe/src/stardustfs/.dev-storage/vol2.img",
+      "size": 10485760
+    },
+    {
+      "type": "loopback",
+      "id": "loop-003",
+      "path": "C:/Users/yonguk.choe/src/stardustfs/.dev-storage/vol3.img",
+      "size": 10485760
+    }
+  ],
+  "metadata_db": "C:/Users/yonguk.choe/src/stardustfs/.dev-storage/metadata.db",
+  "key_file": "C:/Users/yonguk.choe/src/stardustfs/.dev-storage/master.key"
+}
