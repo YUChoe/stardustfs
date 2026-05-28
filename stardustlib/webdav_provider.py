@@ -6,6 +6,8 @@ WebDAV 클라이언트에 암호화된 가상 파일시스템을 제공한다.
 
 import logging
 import mimetypes
+import threading
+import time
 from io import BytesIO
 from typing import IO
 
@@ -24,14 +26,19 @@ HTTP_UNAUTHORIZED = 401
 HTTP_INSUFFICIENT_STORAGE = 507
 HTTP_INTERNAL_ERROR = 500
 
+# 메타데이터 캐시 TTL (초)
+_CACHE_TTL = 1.0
+
 
 class _WriteBuffer(BytesIO):
     """쓰기 완료 시 JBODManager에 데이터를 저장하는 BytesIO 래퍼."""
 
-    def __init__(self, jbod_manager: JBODManager, virtual_path: str) -> None:
+    def __init__(self, jbod_manager: JBODManager, virtual_path: str,
+                 provider: "StardustDAVProvider | None" = None) -> None:
         super().__init__()
         self._jbod_manager = jbod_manager
         self._virtual_path = virtual_path
+        self._provider = provider
 
     def close(self) -> None:
         """버퍼를 닫으면서 JBODManager에 데이터를 기록한다."""
@@ -40,6 +47,8 @@ class _WriteBuffer(BytesIO):
             try:
                 logger.info("WRITE %s (%d bytes)", self._virtual_path, len(data))
                 self._jbod_manager.write_file(self._virtual_path, data)
+                if self._provider is not None:
+                    self._provider._cache_invalidate(self._virtual_path)
             except Exception:
                 logger.error(
                     "파일 쓰기 실패: %s", self._virtual_path, exc_info=True
@@ -61,15 +70,41 @@ class StardustDAVProvider(DAVProvider):
         jbod_manager: JBODManager,
         encryption_engine: EncryptionEngine,
     ) -> None:
-        """StardustDAVProvider 초기화.
-
-        Args:
-            jbod_manager: JBOD 스토리지 통합 관리자.
-            encryption_engine: 암호화 엔진.
-        """
+        """StardustDAVProvider 초기화."""
         super().__init__()
         self.jbod_manager = jbod_manager
         self.encryption_engine = encryption_engine
+        # 개선 2: 경로 존재 여부 캐시 (TTL 기반)
+        self._cache: dict[str, tuple[float, str]] = {}  # path -> (expire_time, type)
+        self._cache_lock = threading.Lock()
+
+    def _cache_get(self, path: str) -> str | None:
+        """캐시에서 경로 타입을 조회. 만료되었으면 None."""
+        with self._cache_lock:
+            entry = self._cache.get(path)
+            if entry is None:
+                return None
+            expire_time, path_type = entry
+            if time.time() > expire_time:
+                del self._cache[path]
+                return None
+            return path_type
+
+    def _cache_set(self, path: str, path_type: str) -> None:
+        """캐시에 경로 타입을 저장. path_type: 'file', 'dir', 'none'."""
+        with self._cache_lock:
+            self._cache[path] = (time.time() + _CACHE_TTL, path_type)
+
+    def _cache_invalidate(self, path: str) -> None:
+        """캐시에서 경로와 모든 상위 경로를 제거."""
+        with self._cache_lock:
+            self._cache.pop(path, None)
+            # 모든 상위 디렉토리 무효화
+            parts = path.split("/")
+            for i in range(1, len(parts)):
+                ancestor = "/".join(parts[:i]) or "/"
+                self._cache.pop(ancestor, None)
+            self._cache.pop("/", None)
 
     def get_resource_inst(self, path: str, environ: dict):
         """가상 경로에 해당하는 DAV 리소스 인스턴스를 반환한다."""
@@ -85,27 +120,50 @@ class StardustDAVProvider(DAVProvider):
                 path, environ, self.jbod_manager
             )
 
-        # 파일 존재 여부 확인
+        # 캐시 확인
+        cached_type = self._cache_get(path)
+        if cached_type == "file":
+            file_info = self.jbod_manager.get_file_info(path)
+            if file_info is not None:
+                return StardustFileResource(
+                    path, environ, self.jbod_manager, file_info
+                )
+        elif cached_type == "dir":
+            return StardustDirectoryResource(
+                path, environ, self.jbod_manager
+            )
+        elif cached_type == "none":
+            return None
+
+        # 캐시 미스: DB 조회
         file_info = self.jbod_manager.get_file_info(path)
         if file_info is not None:
+            self._cache_set(path, "file")
             return StardustFileResource(
                 path, environ, self.jbod_manager, file_info
             )
 
-        # 디렉토리 존재 여부 확인 (하위 엔트리가 있으면 디렉토리)
+        # 디렉토리 존재 여부 확인
         entries = self.jbod_manager.list_directory(path)
         if entries:
+            self._cache_set(path, "dir")
             return StardustDirectoryResource(
                 path, environ, self.jbod_manager
             )
 
-        # 메타데이터에 디렉토리로 등록되어 있는지 확인
         dir_path = path.rstrip("/")
         if self.jbod_manager.metadata_store.lookup_directory(dir_path):
+            self._cache_set(path, "dir")
             return StardustDirectoryResource(
                 path, environ, self.jbod_manager
             )
 
+        self._cache_set(path, "none")
+        # Windows Explorer 노이즈 필터링
+        basename = path.rsplit("/", 1)[-1].lower()
+        _NOISE = {"desktop.ini", "folder.jpg", "folder.gif", "thumbs.db"}
+        if basename not in _NOISE and not basename.endswith((".lnk", ".7z", ".zip")):
+            logger.info("NOT_FOUND [%s] %s", method, path)
         return None
 
 
@@ -192,7 +250,8 @@ class StardustFileResource(DAVNonCollection):
         Raises:
             DAVError: 공간 부족 시 507, 기타 에러 시 500.
         """
-        return _WriteBuffer(self._jbod_manager, self.path)
+        return _WriteBuffer(self._jbod_manager, self.path,
+                            self.environ.get("wsgidav.provider"))
 
     def end_write(self, *, with_errors) -> None:
         """쓰기 완료 알림. _WriteBuffer.close()에서 처리하므로 별도 작업 없음."""
@@ -207,6 +266,9 @@ class StardustFileResource(DAVNonCollection):
         try:
             logger.info("DELETE %s", self.path)
             self._jbod_manager.delete_file(self.path)
+            provider = self.environ.get("wsgidav.provider")
+            if provider and hasattr(provider, "_cache_invalidate"):
+                provider._cache_invalidate(self.path)
         except FileNotFoundError:
             raise DAVError(HTTP_NOT_FOUND)
         except Exception as e:
@@ -358,7 +420,11 @@ class StardustDirectoryResource(DAVCollection):
 
         child_path = join_uri(self.path, name)
         try:
+            logger.info("MKCOL %s", child_path)
             self._jbod_manager.create_directory(child_path)
+            provider = self.environ.get("wsgidav.provider")
+            if provider and hasattr(provider, "_cache_invalidate"):
+                provider._cache_invalidate(child_path)
         except Exception as e:
             logger.error("디렉토리 생성 실패: %s - %s", child_path, e)
             raise DAVError(HTTP_INTERNAL_ERROR)
@@ -376,11 +442,54 @@ class StardustDirectoryResource(DAVCollection):
         try:
             logger.info("RMDIR %s", self.path)
             self._jbod_manager.delete_directory(self.path)
+            provider = self.environ.get("wsgidav.provider")
+            if provider and hasattr(provider, "_cache_invalidate"):
+                provider._cache_invalidate(self.path)
         except FileNotFoundError:
             raise DAVError(HTTP_NOT_FOUND)
         except Exception as e:
             logger.error("디렉토리 삭제 실패: %s - %s", self.path, e)
             raise DAVError(HTTP_INTERNAL_ERROR)
+
+    def copy_move_single(self, dest_path: str, *, is_move: bool) -> None:
+        """디렉토리를 복사 또는 이동한다.
+
+        Args:
+            dest_path: 대상 가상 경로.
+            is_move: True이면 이동, False이면 복사.
+        """
+        try:
+            if is_move:
+                logger.info("MOVE_DIR %s -> %s", self.path, dest_path)
+                self._jbod_manager.move_directory(self.path, dest_path)
+            else:
+                logger.info("COPY_DIR %s -> %s", self.path, dest_path)
+                self._copy_directory_recursive(self.path, dest_path)
+            provider = self.environ.get("wsgidav.provider")
+            if provider and hasattr(provider, "_cache_invalidate"):
+                provider._cache_invalidate(self.path)
+                provider._cache_invalidate(dest_path)
+        except FileNotFoundError:
+            raise DAVError(HTTP_NOT_FOUND)
+        except InsufficientStorageError:
+            raise DAVError(HTTP_INSUFFICIENT_STORAGE)
+        except Exception as e:
+            logger.error("디렉토리 %s 실패: %s -> %s - %s",
+                         "이동" if is_move else "복사",
+                         self.path, dest_path, e)
+            raise DAVError(HTTP_INTERNAL_ERROR)
+
+    def _copy_directory_recursive(self, src: str, dst: str) -> None:
+        """디렉토리를 재귀적으로 복사한다."""
+        self._jbod_manager.create_directory(dst)
+        entries = self._jbod_manager.list_directory(src)
+        for entry in entries:
+            src_child = src.rstrip("/") + "/" + entry.name
+            dst_child = dst.rstrip("/") + "/" + entry.name
+            if entry.is_directory:
+                self._copy_directory_recursive(src_child, dst_child)
+            else:
+                self._jbod_manager.copy_file(src_child, dst_child)
 
 
 def create_webdav_app(

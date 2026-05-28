@@ -280,6 +280,7 @@ class LoopbackSource(StorageSource):
             )
         self._size_bytes = size_bytes
         self._companion_dir = path + ".d"
+        self._used_bytes = 0  # 증분 추적용
 
     @property
     def companion_dir(self) -> str:
@@ -337,9 +338,12 @@ class LoopbackSource(StorageSource):
         if not os.path.isdir(self._companion_dir):
             os.makedirs(self._companion_dir, exist_ok=True)
 
+        # 초기 사용량 계산 (마운트 시 1회만)
+        self._used_bytes = self._scan_used_space()
         self._active = True
         logger.info(
-            "LoopbackSource '%s' mounted: %s", self._source_id, self._path
+            "LoopbackSource '%s' mounted: %s (used: %d bytes)",
+            self._source_id, self._path, self._used_bytes,
         )
 
     def _unmount(self) -> None:
@@ -368,8 +372,8 @@ class LoopbackSource(StorageSource):
         """물리 경로를 동반 디렉토리 기준으로 해석."""
         return os.path.join(self._companion_dir, physical_path)
 
-    def _get_used_space(self) -> int:
-        """동반 디렉토리의 실제 사용 공간을 계산."""
+    def _scan_used_space(self) -> int:
+        """동반 디렉토리의 실제 사용 공간을 전체 스캔으로 계산. 초기화 시 1회 사용."""
         total_size = 0
         for dirpath, _dirnames, filenames in os.walk(self._companion_dir):
             for filename in filenames:
@@ -404,10 +408,10 @@ class LoopbackSource(StorageSource):
             existing_size = os.path.getsize(full_path)
 
         needed = len(data) - existing_size
-        if needed > 0 and needed > self.get_available_space():
+        if needed > 0 and needed > (self._size_bytes - self._used_bytes):
             raise OSError(
                 f"LoopbackSource '{self._source_id}' insufficient space: "
-                f"need {needed}, available {self.get_available_space()}"
+                f"need {needed}, available {self._size_bytes - self._used_bytes}"
             )
 
         parent = os.path.dirname(full_path)
@@ -415,12 +419,17 @@ class LoopbackSource(StorageSource):
         with open(full_path, "wb") as f:
             f.write(data)
 
+        # 증분 추적: 기존 크기를 빼고 새 크기를 더함
+        self._used_bytes += len(data) - existing_size
+
     def delete(self, physical_path: str) -> None:
         """파일을 삭제한다."""
         self._check_active()
         full_path = self._resolve(physical_path)
         if os.path.isfile(full_path):
+            file_size = os.path.getsize(full_path)
             os.remove(full_path)
+            self._used_bytes = max(0, self._used_bytes - file_size)
 
     def exists(self, physical_path: str) -> bool:
         """경로가 존재하는지 확인한다."""
@@ -449,10 +458,9 @@ class LoopbackSource(StorageSource):
         return os.listdir(full_path)
 
     def get_available_space(self) -> int:
-        """가용 공간 = 예약 크기 - 실제 사용량."""
+        """가용 공간 = 예약 크기 - 추적된 사용량. O(1)."""
         self._check_active()
-        used = self._get_used_space()
-        return max(0, self._size_bytes - used)
+        return max(0, self._size_bytes - self._used_bytes)
 
     def get_total_space(self) -> int:
         """전체 공간 = 예약된 크기."""

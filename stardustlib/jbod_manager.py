@@ -40,6 +40,10 @@ class JBODManager:
         self.sources = sources
         self.metadata_store = metadata_store
         self.encryption_engine = encryption_engine
+        # 개선 1: source_id → StorageSource dict (O(1) 조회)
+        self._source_map: dict[str, StorageSource] = {
+            s.source_id: s for s in sources
+        }
 
     # --- 소스 관리 ---
 
@@ -73,11 +77,8 @@ class JBODManager:
         return best_source
 
     def _get_source_by_id(self, source_id: str) -> StorageSource | None:
-        """source_id로 소스를 찾는다."""
-        for source in self.sources:
-            if source.source_id == source_id:
-                return source
-        return None
+        """source_id로 소스를 찾는다. O(1)."""
+        return self._source_map.get(source_id)
 
     def _generate_physical_path(self, virtual_path: str) -> str:
         """가상 경로에서 물리 경로를 생성한다.
