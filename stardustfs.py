@@ -87,7 +87,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
     설정/스토리지 초기화 실패 시 종료.
     """
     from stardustlib.config_loader import ConfigLoader
-    from stardustlib.exceptions import AuthenticationError
+    from stardustlib.exceptions import AuthenticationError, KeyMismatchError
 
     logger = logging.getLogger(__name__)
 
@@ -247,6 +247,31 @@ async def startup_v2(config: dict, config_path: str) -> None:
 
     try:
         await sync_client.initial_sync()
+    except KeyMismatchError as e:
+        logger.warning("key 불일치 감지: %s", e)
+        logger.info("서버에서 올바른 key를 복원합니다...")
+        # key 복원 시도
+        try:
+            await _restore_key_from_server(auth_client, key_file_path, logger)
+            # key_file 교체 후 로컬 스토리지 재초기화
+            logger.info("key 복원 완료, 로컬 스토리지 재초기화...")
+            metadata_store.close()
+            app, jbod_manager, metadata_store, encryption_engine, db_key = (
+                _initialize_local_storage(config)
+            )
+            # SyncClient 재생성
+            conflict_resolver = ConflictResolver(metadata_store, device_name)
+            sync_client = SyncClient(
+                auth_client, server_url, metadata_store,
+                conflict_resolver, interval_seconds,
+                encryption_key=db_key,
+            )
+            await sync_client.initial_sync()
+            logger.info("key 복원 후 메타데이터 동기화 성공")
+        except Exception as restore_err:
+            logger.error(
+                "key 복원 실패, 로컬 DB만 사용: %s", restore_err
+            )
     except Exception as e:
         logger.warning(
             "메타데이터 동기화 실패, 로컬 DB만 사용: %s", e

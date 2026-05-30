@@ -267,7 +267,16 @@ class SyncClient:
             server_store = MetadataStore(
                 tmp_path, self._metadata_store._encryption_key
             )
-            server_store.initialize()
+            try:
+                server_store.initialize()
+            except Exception as e:
+                server_store.close()
+                from stardustlib.exceptions import KeyMismatchError
+                raise KeyMismatchError(
+                    f"서버 metadata 복호화 실패: {e}. "
+                    f"key_file이 서버에 업로드한 PC와 동일한지 확인하세요. "
+                    f"새 디바이스라면 먼저 key 복원(GET /sync/key)을 수행하세요."
+                ) from e
 
             # 서버 DB의 모든 파일 레코드 조회
             server_conn = server_store._get_conn()

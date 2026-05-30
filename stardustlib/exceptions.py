@@ -45,3 +45,10 @@ class P2PConnectionError(StardustError):
 
 class ConfigMigrationError(StardustError):
     """설정 파일 마이그레이션 실패."""
+
+
+class KeyMismatchError(StardustError):
+    """로컬 key_file이 서버의 metadata를 복호화할 수 없을 때 발생.
+
+    서버에서 올바른 key를 복원해야 함을 나타낸다.
+    """
