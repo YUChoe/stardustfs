@@ -239,16 +239,19 @@ class DeviceManager:
             external_ip = await igd_device.async_get_external_ip_address()
 
             # 포트 매핑 추가
+            import ipaddress
+            from datetime import timedelta
+
             local_ip = _get_local_ip()
             await igd_device.async_add_port_mapping(
-                remote_host="",
+                remote_host=ipaddress.IPv4Address("0.0.0.0"),
                 external_port=self._p2p_port,
                 protocol="TCP",
                 internal_port=self._p2p_port,
-                internal_client=local_ip,
+                internal_client=ipaddress.IPv4Address(local_ip),
                 enabled=True,
                 description=_UPNP_LEASE_DESCRIPTION,
-                lease_duration=0,
+                lease_duration=timedelta(0),
             )
 
             self._upnp_mapped = True
@@ -281,8 +284,9 @@ class DeviceManager:
 
         try:
             if hasattr(self, "_igd_device") and self._igd_device is not None:
+                import ipaddress
                 await self._igd_device.async_delete_port_mapping(
-                    remote_host="",
+                    remote_host=ipaddress.IPv4Address("0.0.0.0"),
                     external_port=self._upnp_external_port,
                     protocol="TCP",
                 )
