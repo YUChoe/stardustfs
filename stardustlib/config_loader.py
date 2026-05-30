@@ -181,10 +181,12 @@ class ConfigLoader:
                     f"webdav.port: {MIN_PORT}~{MAX_PORT} 범위여야 합니다"
                 )
 
-        # key_file 검증
+        # key_file 검증 (server.url이 있으면 서버에서 복원 가능하므로 존재 체크 생략)
         key_file = data.get("key_file")
+        server = data.get("server")
+        server_url = server.get("url") if isinstance(server, dict) else None
         if key_file is not None and isinstance(key_file, str):
-            if not Path(key_file).exists():
+            if not server_url and not Path(key_file).exists():
                 errors.append(
                     f"key_file: 파일이 존재하지 않습니다: {key_file}"
                 )
