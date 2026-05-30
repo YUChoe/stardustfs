@@ -105,7 +105,10 @@ class SyncClient:
         # pending 변경사항이 없으면 업로드 불필요
         pending_files = self._metadata_store.get_pending_files()
         if not pending_files:
+            logger.debug("Sync: pending 없음, 업로드 건너뜀")
             return
+
+        logger.info("Sync: pending %d개 파일 업로드 시작", len(pending_files))
 
         db_path = self._metadata_store._db_path
         if not os.path.exists(db_path):
@@ -318,6 +321,9 @@ class SyncClient:
                 ))
 
             # 각 서버 레코드에 대해 로컬과 비교 병합
+            logger.info(
+                "Merge: 서버 DB에서 %d개 레코드 조회됨", len(server_records)
+            )
             for server_rec in server_records:
                 self._merge_record(server_rec)
 
@@ -346,6 +352,10 @@ class SyncClient:
         if local_rec is None:
             # 로컬에 없는 파일 — 서버에서 새로 추가된 파일
             self._insert_from_server(server_rec)
+            logger.info(
+                "Merge: inserted from server: %s (version=%d)",
+                server_rec.virtual_path, server_rec.version,
+            )
             return
 
         server_version = server_rec.version
@@ -364,9 +374,17 @@ class SyncClient:
         if (server_version > local_base_version
                 and local_version > local_base_version):
             # 양쪽 모두 수정됨 → 충돌
+            logger.info(
+                "Merge: CONFLICT %s (server_v=%d, local_v=%d, base_v=%d)",
+                server_rec.virtual_path, server_version, local_version, local_base_version,
+            )
             self._handle_conflict(server_rec, local_rec)
         elif server_version > local_version:
             # 서버가 더 최신 → 서버 메타데이터로 갱신
+            logger.info(
+                "Merge: updated from server: %s (server_v=%d > local_v=%d)",
+                server_rec.virtual_path, server_version, local_version,
+            )
             self._update_from_server(server_rec)
         elif local_version > server_version:
             # 로컬이 더 최신 → 다음 업로드 시 반영 (아무 작업 안 함)

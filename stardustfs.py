@@ -35,6 +35,11 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
+    # 불필요한 로그 억제
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("wsgidav").setLevel(logging.WARNING)
+
     # 설정 로드 (Phase 1)
     from stardustlib.config_loader import ConfigLoader
 
