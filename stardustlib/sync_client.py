@@ -98,7 +98,15 @@ class SyncClient:
         )
 
     async def upload_metadata(self) -> None:
-        """로컬 metadata_db 스냅샷을 서버에 업로드."""
+        """로컬 metadata_db 스냅샷을 서버에 업로드.
+
+        pending 변경사항이 없으면 업로드를 건너뛴다.
+        """
+        # pending 변경사항이 없으면 업로드 불필요
+        pending_files = self._metadata_store.get_pending_files()
+        if not pending_files:
+            return
+
         db_path = self._metadata_store._db_path
         if not os.path.exists(db_path):
             logger.warning("Metadata DB not found: %s", db_path)
