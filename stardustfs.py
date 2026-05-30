@@ -101,7 +101,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
 
     # (2) 로컬 스토리지 초기화
     try:
-        app, jbod_manager, metadata_store, encryption_engine = (
+        app, jbod_manager, metadata_store, encryption_engine, db_key = (
             _initialize_local_storage(config)
         )
     except SystemExit:
@@ -160,6 +160,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
         sync_client = SyncClient(
             auth_client, server_url, metadata_store,
             conflict_resolver, interval_seconds,
+            encryption_key=db_key,
         )
 
         # P2P 서버 인스턴스 (복구 시 시작됨)
@@ -218,6 +219,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
     sync_client = SyncClient(
         auth_client, server_url, metadata_store,
         conflict_resolver, interval_seconds,
+        encryption_key=db_key,
     )
 
     try:
@@ -359,7 +361,7 @@ def _initialize_local_storage(config: dict) -> tuple:
     app = create_webdav_app(config, jbod_manager, encryption_engine)
 
     logger.info("로컬 스토리지 초기화 완료")
-    return app, jbod_manager, metadata_store, encryption_engine
+    return app, jbod_manager, metadata_store, encryption_engine, db_key
 
 
 def _start_webdav(config: dict, app) -> None:

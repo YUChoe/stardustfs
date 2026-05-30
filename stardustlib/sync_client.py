@@ -38,12 +38,14 @@ class SyncClient:
         metadata_store: MetadataStore,
         conflict_resolver: ConflictResolver,
         interval_seconds: int = 30,
+        encryption_key: bytes | None = None,
     ) -> None:
         self._auth_client = auth_client
         self._server_url = server_url.rstrip("/")
         self._metadata_store = metadata_store
         self._conflict_resolver = conflict_resolver
         self._interval_seconds = interval_seconds
+        self._encryption_key = encryption_key
         self._sync_task: asyncio.Task[None] | None = None
         self._running = False
         self._consecutive_failures = 0
@@ -106,10 +108,13 @@ class SyncClient:
             with open(db_path, "rb") as f:
                 db_blob = f.read()
 
+            # 서버 전송 전 AES-256-GCM 암호화
+            encrypted_blob = self._encrypt_blob(db_blob)
+
             response = await self._client.put(
                 f"{self._server_url}/sync/metadata",
                 headers={"Authorization": f"Bearer {token}"},
-                content=db_blob,
+                content=encrypted_blob,
             )
         except (httpx.TimeoutException, httpx.ConnectError) as e:
             self._consecutive_failures += 1
@@ -248,11 +253,14 @@ class SyncClient:
                 logger.error("Periodic sync error: %s", e)
 
     async def _merge_server_metadata(self, server_db_blob: bytes) -> None:
-        """서버에서 받은 DB blob을 임시 파일로 저장 후 레코드 단위 병합."""
+        """서버에서 받은 암호화된 DB blob을 복호화 후 임시 파일로 저장하고 레코드 단위 병합."""
+        # 서버에서 받은 blob 복호화
+        decrypted_blob = self._decrypt_blob(server_db_blob)
+
         # 임시 파일에 서버 DB 저장
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".db")
         try:
-            os.write(tmp_fd, server_db_blob)
+            os.write(tmp_fd, decrypted_blob)
             os.close(tmp_fd)
 
             # 서버 DB를 MetadataStore로 열기 (암호화 키 동일)
@@ -423,3 +431,56 @@ class SyncClient:
             ),
         )
         conn.commit()
+
+    # --- 암호화/복호화 헬퍼 ---
+
+    def _encrypt_blob(self, plaintext: bytes) -> bytes:
+        """AES-256-GCM으로 blob을 암호화한다.
+
+        encryption_key가 None이면 평문 그대로 반환 (개발/테스트용).
+        반환 형식: iv(12B) + tag(16B) + ciphertext
+        """
+        if self._encryption_key is None:
+            return plaintext
+
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        iv = os.urandom(12)
+        aesgcm = AESGCM(self._encryption_key)
+        ct_with_tag = aesgcm.encrypt(iv, plaintext, None)
+        # AESGCM.encrypt() returns ciphertext + tag(16B)
+        ciphertext = ct_with_tag[:-16]
+        tag = ct_with_tag[-16:]
+        return iv + tag + ciphertext
+
+    def _decrypt_blob(self, encrypted: bytes) -> bytes:
+        """AES-256-GCM으로 blob을 복호화한다.
+
+        encryption_key가 None이면 평문으로 간주하여 그대로 반환.
+        입력 형식: iv(12B) + tag(16B) + ciphertext
+        """
+        if self._encryption_key is None:
+            return encrypted
+
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        if len(encrypted) < 28:  # 12 + 16 minimum
+            logger.warning("Encrypted blob too short, treating as plaintext")
+            return encrypted
+
+        iv = encrypted[:12]
+        tag = encrypted[12:28]
+        ciphertext = encrypted[28:]
+
+        aesgcm = AESGCM(self._encryption_key)
+        ct_with_tag = ciphertext + tag
+
+        try:
+            return aesgcm.decrypt(iv, ct_with_tag, None)
+        except Exception as e:
+            logger.warning(
+                "Metadata blob decryption failed: %s. "
+                "Treating as plaintext (legacy unencrypted data).",
+                e,
+            )
+            return encrypted
