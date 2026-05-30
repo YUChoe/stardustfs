@@ -477,11 +477,11 @@ class SyncClient:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
         if len(encrypted) < 28:  # 12 + 16 minimum
-            raise SyncError(
+            from stardustlib.exceptions import KeyMismatchError
+            raise KeyMismatchError(
                 "서버 metadata blob 크기가 최소 크기(28바이트) 미만입니다. "
                 "서버에 저장된 데이터가 손상되었거나 암호화되지 않은 "
-                "레거시 데이터입니다. 서버의 metadata를 초기화하거나 "
-                "올바른 key_file을 사용하세요."
+                "레거시 데이터입니다."
             )
 
         iv = encrypted[:12]
@@ -494,7 +494,8 @@ class SyncClient:
         try:
             return aesgcm.decrypt(iv, ct_with_tag, None)
         except Exception as e:
-            raise SyncError(
+            from stardustlib.exceptions import KeyMismatchError
+            raise KeyMismatchError(
                 f"서버 metadata 복호화 실패: {e}. "
                 f"key_file이 서버에 업로드한 PC와 동일한지 확인하세요. "
                 f"새 디바이스라면 먼저 key 복원(GET /sync/key)을 수행하세요."

@@ -491,6 +491,7 @@ async def _backup_key_to_server(
 ) -> None:
     """최초 디바이스에서 key_file을 서버에 백업한다.
 
+    서버에 이미 key가 존재하면 덮어쓰지 않는다.
     환경변수 STARDUST_KEY_PASSWORD로 암호화한다.
     """
     from pathlib import Path
@@ -507,12 +508,25 @@ async def _backup_key_to_server(
         )
         return
 
+    # 서버에 이미 key가 존재하는지 확인
+    token = await auth_client.get_valid_token()
+    server_url = auth_client._server_url
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        check_resp = await client.get(
+            f"{server_url}/sync/key",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        if check_resp.status_code == 200:
+            logger.info("서버에 key 백업이 이미 존재, 덮어쓰지 않음")
+            return
+
+    # 서버에 key가 없으면 업로드
     master_key = Path(key_file_path).read_bytes()
     engine = KeyBackupEngine()
     encrypted_blob = engine.encrypt_for_backup(master_key, key_password)
 
     token = await auth_client.get_valid_token()
-    server_url = auth_client._server_url
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.put(
