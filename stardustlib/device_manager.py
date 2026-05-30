@@ -18,7 +18,8 @@ from stardustlib.exceptions import DeviceRegistrationError
 
 try:
     from async_upnp_client.aiohttp import AiohttpRequester
-    from async_upnp_client.igd import IgdDevice
+    from async_upnp_client.client_factory import UpnpFactory
+    from async_upnp_client.profiles.igd import IgdDevice
     from async_upnp_client.search import async_search
     _HAS_UPNP = True
 except ImportError:
@@ -202,22 +203,37 @@ class DeviceManager:
             return
 
         try:
-            requester = AiohttpRequester()
-            # SSDP 검색으로 IGD 디바이스 찾기 (10초 타임아웃)
-            devices = await asyncio.wait_for(
-                async_search(search_target="urn:schemas-upnp-org:device:InternetGatewayDevice:1"),
+            # SSDP 검색으로 IGD 디바이스 찾기
+            discovered: list = []
+
+            async def _on_device(headers):
+                discovered.append(headers)
+
+            await asyncio.wait_for(
+                async_search(
+                    async_callback=_on_device,
+                    timeout=5,
+                    search_target="urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+                ),
                 timeout=10.0,
             )
 
-            if not devices:
+            if not discovered:
                 logger.warning("UPnP 게이트웨이를 찾을 수 없음")
                 return
 
-            # 첫 번째 IGD 디바이스 사용
-            device_entry = devices[0]
-            igd_device = await IgdDevice.async_create(
-                requester, device_entry
-            )
+            # 첫 번째 IGD 디바이스의 location으로 UpnpDevice 생성
+            location = discovered[0].get("location", "")
+            if not location:
+                logger.warning("UPnP 디바이스 location 없음")
+                return
+
+            requester = AiohttpRequester()
+            factory = UpnpFactory(requester)
+            device = await factory.async_create_device(location)
+
+            # IgdDevice 래퍼 생성
+            igd_device = IgdDevice(device, None)
 
             # 외부 IP 조회
             external_ip = await igd_device.async_get_external_ip_address()
@@ -232,7 +248,7 @@ class DeviceManager:
                 internal_client=local_ip,
                 enabled=True,
                 description=_UPNP_LEASE_DESCRIPTION,
-                lease_duration=0,  # 무기한
+                lease_duration=0,
             )
 
             self._upnp_mapped = True
