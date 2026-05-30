@@ -77,11 +77,11 @@ def _startup_v1(config_path: str, config: dict) -> None:
 async def startup_v2(config: dict, config_path: str) -> None:
     """v2 설정 기반 MVP2 초기화 흐름.
 
-    순서: (1) 설정 로드 → (2) 로컬 스토리지 초기화 → (3) 인증
-    → (4) 디바이스 등록 → (5) 메타데이터 동기화 → (6) P2P 서버 시작
-    → (7) WebDAV 서버 시작
+    순서: (1) 설정 로드 → (2) 인증 → (3) key_file 복원 (필요 시)
+    → (4) 로컬 스토리지 초기화 → (5) 디바이스 등록
+    → (6) 메타데이터 동기화 → (7) P2P 서버 시작 → (8) WebDAV 서버 시작
 
-    인증 실패 시 오프라인 모드 (4-6 건너뛰기).
+    인증 실패 시 오프라인 모드 (key_file이 로컬에 있어야 동작 가능).
     메타데이터 동기화 실패 시 로컬 DB만 사용.
     server 섹션 없으면 오프라인 전용 모드.
     설정/스토리지 초기화 실패 시 종료.
@@ -99,17 +99,6 @@ async def startup_v2(config: dict, config_path: str) -> None:
             logger.error(err)
         sys.exit(1)
 
-    # (2) 로컬 스토리지 초기화
-    try:
-        app, jbod_manager, metadata_store, encryption_engine, db_key = (
-            _initialize_local_storage(config)
-        )
-    except SystemExit:
-        raise
-    except Exception as e:
-        logger.error("로컬 스토리지 초기화 실패: %s", e)
-        sys.exit(1)
-
     # server 섹션 확인 — 없거나 url이 None이면 오프라인 전용 모드
     server_config = config.get("server")  # type: ignore[attr-defined]
     server_url = None
@@ -117,12 +106,21 @@ async def startup_v2(config: dict, config_path: str) -> None:
         server_url = server_config.get("url")
 
     if not server_url:
-        # 오프라인 전용 모드: (3)-(6) 건너뛰기
+        # 오프라인 전용 모드: key_file이 로컬에 있어야 함
         logger.info("server.url 미설정, 오프라인 전용 모드로 시작")
+        try:
+            app, jbod_manager, metadata_store, encryption_engine, db_key = (
+                _initialize_local_storage(config)
+            )
+        except SystemExit:
+            raise
+        except Exception as e:
+            logger.error("로컬 스토리지 초기화 실패: %s", e)
+            sys.exit(1)
         _start_webdav(config, app)
         return
 
-    # (3) 인증
+    # (2) 인증
     from stardustlib.auth_client import AuthClient
 
     email = os.environ.get("STARDUST_EMAIL", "")
@@ -139,6 +137,27 @@ async def startup_v2(config: dict, config_path: str) -> None:
     except Exception as e:
         logger.warning("인증 중 예외 발생, 오프라인 모드로 전환: %s", e)
         offline_mode = True
+
+    # (3) key_file 복원 (필요 시)
+    key_file_path = config.get("key_file")  # type: ignore[attr-defined]
+    if not offline_mode and key_file_path:
+        from pathlib import Path
+        if not Path(key_file_path).exists():
+            await _restore_key_from_server(auth_client, key_file_path, logger)
+
+    # (3-b) 최초 디바이스: key_file 생성 직후 서버에 백업 업로드
+    # (로컬 스토리지 초기화 후 수행 — 아래에서 처리)
+
+    # (4) 로컬 스토리지 초기화
+    try:
+        app, jbod_manager, metadata_store, encryption_engine, db_key = (
+            _initialize_local_storage(config)
+        )
+    except SystemExit:
+        raise
+    except Exception as e:
+        logger.error("로컬 스토리지 초기화 실패: %s", e)
+        sys.exit(1)
 
     if offline_mode:
         # 오프라인 모드: (4)-(6) 건너뛰기, WebDAV 시작 + 백그라운드 복구
@@ -190,7 +209,11 @@ async def startup_v2(config: dict, config_path: str) -> None:
             await auth_client.close()
         return
 
-    # (4) 디바이스 등록
+    # (4-a) 최초 디바이스: key 백업 업로드 (서버에 백업이 없으면)
+    if key_file_path:
+        await _backup_key_to_server(auth_client, key_file_path, logger)
+
+    # (5) 디바이스 등록
     from stardustlib.device_manager import DeviceManager
     from stardustlib.exceptions import DeviceRegistrationError
 
@@ -380,6 +403,103 @@ def _start_webdav(config: dict, app) -> None:
         logging.info("서버 종료 중...")
     finally:
         server.stop()
+
+
+async def _restore_key_from_server(
+    auth_client, key_file_path: str, logger
+) -> None:
+    """서버에서 암호화된 key blob을 다운로드하여 로컬에 key_file을 복원한다.
+
+    환경변수 STARDUST_KEY_PASSWORD로 복호화한다.
+    실패 시 예외를 발생시킨다 (graceful skip 하지 않음).
+    """
+    from pathlib import Path
+
+    import httpx
+
+    from stardustlib.exceptions import KeyNotFoundError
+    from stardustlib.key_backup_engine import KeyBackupEngine
+
+    key_password = os.environ.get("STARDUST_KEY_PASSWORD", "")
+    if not key_password:
+        raise RuntimeError(
+            "key_file이 존재하지 않고 STARDUST_KEY_PASSWORD 환경변수가 "
+            "설정되지 않았습니다. 새 디바이스에서는 key 복원을 위해 "
+            "STARDUST_KEY_PASSWORD를 설정해야 합니다."
+        )
+
+    logger.info("key_file 미존재, 서버에서 key 백업 다운로드 시도...")
+
+    token = await auth_client.get_valid_token()
+    server_url = auth_client._server_url
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.get(
+            f"{server_url}/sync/key",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    if response.status_code == 404:
+        raise KeyNotFoundError(
+            "서버에 key 백업이 존재하지 않습니다. "
+            "최초 디바이스에서 먼저 key를 백업해야 합니다."
+        )
+
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"서버에서 key 다운로드 실패: HTTP {response.status_code}"
+        )
+
+    encrypted_blob = response.content
+    engine = KeyBackupEngine()
+    master_key = engine.decrypt_from_backup(encrypted_blob, key_password)
+
+    # key_file 저장
+    key_path = Path(key_file_path)
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    key_path.write_bytes(master_key)
+    logger.info("key_file 복원 완료: %s", key_file_path)
+
+
+async def _backup_key_to_server(
+    auth_client, key_file_path: str, logger
+) -> None:
+    """최초 디바이스에서 key_file을 서버에 백업한다.
+
+    환경변수 STARDUST_KEY_PASSWORD로 암호화한다.
+    """
+    from pathlib import Path
+
+    import httpx
+
+    from stardustlib.key_backup_engine import KeyBackupEngine
+
+    key_password = os.environ.get("STARDUST_KEY_PASSWORD", "")
+    if not key_password:
+        logger.warning(
+            "STARDUST_KEY_PASSWORD 미설정, key 백업 건너뜀. "
+            "다른 디바이스에서 key를 복원하려면 백업이 필요합니다."
+        )
+        return
+
+    master_key = Path(key_file_path).read_bytes()
+    engine = KeyBackupEngine()
+    encrypted_blob = engine.encrypt_for_backup(master_key, key_password)
+
+    token = await auth_client.get_valid_token()
+    server_url = auth_client._server_url
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.put(
+            f"{server_url}/sync/key",
+            headers={"Authorization": f"Bearer {token}"},
+            content=encrypted_blob,
+        )
+
+    if response.status_code < 400:
+        logger.info("key 백업 업로드 완료")
+    else:
+        logger.error("key 백업 업로드 실패: HTTP %d", response.status_code)
 
 
 if __name__ == "__main__":

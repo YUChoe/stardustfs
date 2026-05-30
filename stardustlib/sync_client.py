@@ -458,6 +458,9 @@ class SyncClient:
 
         encryption_key가 None이면 평문으로 간주하여 그대로 반환.
         입력 형식: iv(12B) + tag(16B) + ciphertext
+
+        Raises:
+            SyncError: 복호화 실패 시 (키 불일치 또는 데이터 손상).
         """
         if self._encryption_key is None:
             return encrypted
@@ -465,8 +468,12 @@ class SyncClient:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
         if len(encrypted) < 28:  # 12 + 16 minimum
-            logger.warning("Encrypted blob too short, treating as plaintext")
-            return encrypted
+            raise SyncError(
+                "서버 metadata blob 크기가 최소 크기(28바이트) 미만입니다. "
+                "서버에 저장된 데이터가 손상되었거나 암호화되지 않은 "
+                "레거시 데이터입니다. 서버의 metadata를 초기화하거나 "
+                "올바른 key_file을 사용하세요."
+            )
 
         iv = encrypted[:12]
         tag = encrypted[12:28]
@@ -478,9 +485,8 @@ class SyncClient:
         try:
             return aesgcm.decrypt(iv, ct_with_tag, None)
         except Exception as e:
-            logger.warning(
-                "Metadata blob decryption failed: %s. "
-                "Treating as plaintext (legacy unencrypted data).",
-                e,
-            )
-            return encrypted
+            raise SyncError(
+                f"서버 metadata 복호화 실패: {e}. "
+                f"key_file이 서버에 업로드한 PC와 동일한지 확인하세요. "
+                f"새 디바이스라면 먼저 key 복원(GET /sync/key)을 수행하세요."
+            ) from e
