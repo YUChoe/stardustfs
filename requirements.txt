@@ -19,8 +19,8 @@ python-dotenv==1.1.0
 # P2P 서버 (aiohttp)
 aiohttp==3.11.18
 
-# NAT 트래버설 (선택적 — 설치 실패 시 UPnP 기능 비활성화)
-miniupnpc==2.2.8
+# NAT 트래버설 (Pure Python UPnP — C 컴파일러 불필요)
+async-upnp-client==0.42.0
 
 # 테스트
 hypothesis==6.152.9

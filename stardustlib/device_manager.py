@@ -17,10 +17,12 @@ from stardustlib.auth_client import AuthClient
 from stardustlib.exceptions import DeviceRegistrationError
 
 try:
-    import miniupnpc  # type: ignore[import-untyped]
-    _HAS_MINIUPNPC = True
+    from async_upnp_client.aiohttp import AiohttpRequester
+    from async_upnp_client.igd import IgdDevice
+    from async_upnp_client.search import async_search
+    _HAS_UPNP = True
 except ImportError:
-    _HAS_MINIUPNPC = False
+    _HAS_UPNP = False
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +33,6 @@ _HEARTBEAT_NORMAL_INTERVAL = 60  # 초
 _HEARTBEAT_DEGRADED_INTERVAL = 120  # 초
 _HEARTBEAT_FAILURE_THRESHOLD = 3
 _REQUEST_TIMEOUT = 10.0  # 초
-_UPNP_DISCOVER_DELAY = 10000  # 밀리초 (10초)
 _UPNP_LEASE_DESCRIPTION = "StardustFS P2P"
 
 
@@ -76,6 +77,7 @@ class DeviceManager:
         # UPnP 상태
         self._upnp_mapped: bool = False
         self._upnp_external_port: int | None = None
+        self._igd_device = None
 
     async def register(self) -> str:
         """디바이스를 중앙 서버에 등록하고 device_id를 반환한다.
@@ -193,50 +195,59 @@ class DeviceManager:
         connection_address로 설정하고, 실패 시 로컬 IP:port를 유지한다.
         어떤 경우에도 예외를 발생시키지 않는다.
         """
-        if not _HAS_MINIUPNPC:
+        if not _HAS_UPNP:
             logger.warning(
-                "miniupnpc 라이브러리 미설치, UPnP 포트 매핑 건너뜀"
+                "async-upnp-client 라이브러리 미설치, UPnP 포트 매핑 건너뜀"
             )
             return
 
         try:
-            u = miniupnpc.UPnP()
-            u.discoverdelay = _UPNP_DISCOVER_DELAY
+            requester = AiohttpRequester()
+            # SSDP 검색으로 IGD 디바이스 찾기 (10초 타임아웃)
+            devices = await asyncio.wait_for(
+                async_search(search_target="urn:schemas-upnp-org:device:InternetGatewayDevice:1"),
+                timeout=10.0,
+            )
 
-            devices_found = await asyncio.to_thread(u.discover)
-            if devices_found == 0:
+            if not devices:
                 logger.warning("UPnP 게이트웨이를 찾을 수 없음")
                 return
 
-            await asyncio.to_thread(u.selectigd)
-            external_ip = await asyncio.to_thread(u.externalipaddress)
-
-            local_ip = _get_local_ip()
-            result = await asyncio.to_thread(
-                u.addportmapping,
-                self._p2p_port,
-                "TCP",
-                local_ip,
-                self._p2p_port,
-                _UPNP_LEASE_DESCRIPTION,
-                "",
+            # 첫 번째 IGD 디바이스 사용
+            device_entry = devices[0]
+            igd_device = await IgdDevice.async_create(
+                requester, device_entry
             )
 
-            if result:
-                self._upnp_mapped = True
-                self._upnp_external_port = self._p2p_port
-                self._connection_address = f"{external_ip}:{self._p2p_port}"
-                logger.info(
-                    "UPnP 포트 매핑 성공: %s:%d → %s:%d",
-                    external_ip,
-                    self._p2p_port,
-                    local_ip,
-                    self._p2p_port,
-                )
-            else:
-                logger.warning(
-                    "UPnP 포트 매핑 실패: addportmapping 반환값 falsy"
-                )
+            # 외부 IP 조회
+            external_ip = await igd_device.async_get_external_ip_address()
+
+            # 포트 매핑 추가
+            local_ip = _get_local_ip()
+            await igd_device.async_add_port_mapping(
+                remote_host="",
+                external_port=self._p2p_port,
+                protocol="TCP",
+                internal_port=self._p2p_port,
+                internal_client=local_ip,
+                enabled=True,
+                description=_UPNP_LEASE_DESCRIPTION,
+                lease_duration=0,  # 무기한
+            )
+
+            self._upnp_mapped = True
+            self._upnp_external_port = self._p2p_port
+            self._connection_address = f"{external_ip}:{self._p2p_port}"
+            self._igd_device = igd_device
+            logger.info(
+                "UPnP 포트 매핑 성공: %s:%d → %s:%d",
+                external_ip,
+                self._p2p_port,
+                local_ip,
+                self._p2p_port,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("UPnP 검색 타임아웃 (10초)")
         except Exception as e:
             logger.warning("UPnP 포트 매핑 실패: %s", e)
 
@@ -249,19 +260,16 @@ class DeviceManager:
         if not self._upnp_mapped:
             return
 
-        if not _HAS_MINIUPNPC:
+        if not _HAS_UPNP:
             return
 
         try:
-            u = miniupnpc.UPnP()
-            u.discoverdelay = _UPNP_DISCOVER_DELAY
-            await asyncio.to_thread(u.discover)
-            await asyncio.to_thread(u.selectigd)
-            await asyncio.to_thread(
-                u.deleteportmapping,
-                self._upnp_external_port,
-                "TCP",
-            )
+            if hasattr(self, "_igd_device") and self._igd_device is not None:
+                await self._igd_device.async_delete_port_mapping(
+                    remote_host="",
+                    external_port=self._upnp_external_port,
+                    protocol="TCP",
+                )
             self._upnp_mapped = False
             logger.info(
                 "UPnP 포트 매핑 해제 성공: port %d",
