@@ -24,7 +24,8 @@ miniupnpc==2.2.8
 
 # 테스트
 hypothesis==6.152.9
-pytest==9.0.3
+pytest==8.3.4
 pytest-asyncio==0.26.0
 pytest-httpx==0.35.0
+pytest-aiohttp==1.0.5
 requests==2.34.2
