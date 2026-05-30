@@ -10,7 +10,21 @@ cryptography==48.0.0
 # 메타데이터 DB 암호화 (Linux 전용, Windows에서는 표준 sqlite3 폴백)
 # pysqlcipher3==1.2.1
 
+# 비동기 HTTP 클라이언트
+httpx==0.28.1
+
+# .env 파일 로드 (개발/디버그용)
+python-dotenv==1.1.0
+
+# P2P 서버 (aiohttp)
+aiohttp==3.11.18
+
+# NAT 트래버설 (선택적 — 설치 실패 시 UPnP 기능 비활성화)
+miniupnpc==2.2.8
+
 # 테스트
 hypothesis==6.152.9
 pytest==9.0.3
+pytest-asyncio==0.26.0
+pytest-httpx==0.35.0
 requests==2.34.2

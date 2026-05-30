@@ -17,6 +17,7 @@ from wsgidav.dav_error import DAVError
 from stardustlib.encryption_engine import EncryptionEngine
 from stardustlib.exceptions import InsufficientStorageError
 from stardustlib.jbod_manager import JBODManager
+from stardustlib.remote_source import RemoteSource
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,10 @@ HTTP_NOT_FOUND = 404
 HTTP_UNAUTHORIZED = 401
 HTTP_INSUFFICIENT_STORAGE = 507
 HTTP_INTERNAL_ERROR = 500
+HTTP_SERVICE_UNAVAILABLE = 503
+
+# 오프라인 placeholder 확장자
+OFFLINE_SUFFIX = ".offline"
 
 # 메타데이터 캐시 TTL (초)
 _CACHE_TTL = 1.0
@@ -49,6 +54,13 @@ class _WriteBuffer(BytesIO):
                 self._jbod_manager.write_file(self._virtual_path, data)
                 if self._provider is not None:
                     self._provider._cache_invalidate(self._virtual_path)
+            except InsufficientStorageError:
+                logger.warning(
+                    "공간 부족으로 쓰기 실패: %s (%d bytes)",
+                    self._virtual_path, len(data),
+                )
+                super().close()
+                raise DAVError(HTTP_INSUFFICIENT_STORAGE)
             except Exception:
                 logger.error(
                     "파일 쓰기 실패: %s", self._virtual_path, exc_info=True
@@ -106,6 +118,13 @@ class StardustDAVProvider(DAVProvider):
                 self._cache.pop(ancestor, None)
             self._cache.pop("/", None)
 
+    def _is_offline_remote_source(self, source_id: str) -> bool:
+        """source_id에 해당하는 소스가 비활성 RemoteSource인지 판별한다."""
+        source = self.jbod_manager._get_source_by_id(source_id)
+        if source is None:
+            return False
+        return isinstance(source, RemoteSource) and not source.is_active
+
     def get_resource_inst(self, path: str, environ: dict):
         """가상 경로에 해당하는 DAV 리소스 인스턴스를 반환한다."""
         # 경로 정규화
@@ -125,6 +144,10 @@ class StardustDAVProvider(DAVProvider):
         if cached_type == "file":
             file_info = self.jbod_manager.get_file_info(path)
             if file_info is not None:
+                if self._is_offline_remote_source(file_info.source_id):
+                    return OfflinePlaceholderResource(
+                        path, environ, file_info
+                    )
                 return StardustFileResource(
                     path, environ, self.jbod_manager, file_info
                 )
@@ -139,6 +162,11 @@ class StardustDAVProvider(DAVProvider):
         file_info = self.jbod_manager.get_file_info(path)
         if file_info is not None:
             self._cache_set(path, "file")
+            # 오프라인 RemoteSource 파일은 placeholder로 반환
+            if self._is_offline_remote_source(file_info.source_id):
+                return OfflinePlaceholderResource(
+                    path, environ, file_info
+                )
             return StardustFileResource(
                 path, environ, self.jbod_manager, file_info
             )
@@ -159,6 +187,17 @@ class StardustDAVProvider(DAVProvider):
             )
 
         self._cache_set(path, "none")
+        # .offline 확장자로 접근하는 경우: 원본 경로를 조회하여 placeholder 반환
+        if path.endswith(OFFLINE_SUFFIX):
+            original_path = path[: -len(OFFLINE_SUFFIX)]
+            file_info = self.jbod_manager.get_file_info(original_path)
+            if file_info is not None and self._is_offline_remote_source(
+                file_info.source_id
+            ):
+                return OfflinePlaceholderResource(
+                    path, environ, file_info
+                )
+
         # Windows Explorer 노이즈 필터링
         basename = path.rsplit("/", 1)[-1].lower()
         _NOISE = {"desktop.ini", "folder.jpg", "folder.gif", "thumbs.db"}
@@ -327,21 +366,58 @@ class StardustDirectoryResource(DAVCollection):
         super().__init__(path, environ)
         self._jbod_manager = jbod_manager
 
+    def get_available_bytes(self) -> int | None:
+        """JBOD 전체 가용 공간을 반환한다 (DAV:quota-available-bytes)."""
+        return self._jbod_manager.get_available_space()
+
+    def get_used_bytes(self) -> int | None:
+        """JBOD 전체 사용량을 반환한다 (DAV:quota-used-bytes)."""
+        total = self._jbod_manager.get_total_space()
+        available = self._jbod_manager.get_available_space()
+        return total - available
+
     def get_member_names(self) -> list[str]:
         """디렉토리 내 엔트리 이름 목록을 반환한다.
+
+        오프라인 RemoteSource 파일은 ".offline" 확장자를 추가하여 표시한다.
 
         Returns:
             하위 파일/디렉토리 이름 목록.
         """
         try:
             entries = self._jbod_manager.list_directory(self.path)
-            return [entry.name for entry in entries]
+            result = []
+            for entry in entries:
+                if entry.is_directory:
+                    result.append(entry.name)
+                else:
+                    # 파일의 source_id를 확인하여 오프라인 여부 판별
+                    child_path = self.path.rstrip("/") + "/" + entry.name
+                    metadata = self._jbod_manager.metadata_store.lookup(
+                        child_path
+                    )
+                    if metadata is not None and self._is_offline_remote(
+                        metadata.source_id
+                    ):
+                        result.append(entry.name + OFFLINE_SUFFIX)
+                    else:
+                        result.append(entry.name)
+            return result
         except Exception as e:
             logger.error("디렉토리 목록 조회 실패: %s - %s", self.path, e)
             raise DAVError(HTTP_INTERNAL_ERROR)
 
+    def _is_offline_remote(self, source_id: str) -> bool:
+        """source_id에 해당하는 소스가 비활성 RemoteSource인지 판별한다."""
+        source = self._jbod_manager._get_source_by_id(source_id)
+        if source is None:
+            return False
+        return isinstance(source, RemoteSource) and not source.is_active
+
     def get_member(self, name: str):
         """이름으로 하위 리소스를 반환한다.
+
+        ".offline" 확장자가 붙은 이름은 오프라인 placeholder로 반환한다.
 
         Args:
             name: 하위 엔트리 이름.
@@ -351,11 +427,28 @@ class StardustDirectoryResource(DAVCollection):
         """
         from wsgidav.util import join_uri
 
+        # .offline 확장자로 요청된 경우 원본 파일 조회
+        if name.endswith(OFFLINE_SUFFIX):
+            original_name = name[: -len(OFFLINE_SUFFIX)]
+            child_path = join_uri(self.path, original_name)
+            file_info = self._jbod_manager.get_file_info(child_path)
+            if file_info is not None and self._is_offline_remote(
+                file_info.source_id
+            ):
+                offline_path = join_uri(self.path, name)
+                return OfflinePlaceholderResource(
+                    offline_path, self.environ, file_info
+                )
+            return None
+
         child_path = join_uri(self.path, name)
 
         # 파일인지 확인
         file_info = self._jbod_manager.get_file_info(child_path)
         if file_info is not None:
+            # 오프라인 RemoteSource 파일은 직접 접근 불가 (목록에서 .offline으로 표시됨)
+            if self._is_offline_remote(file_info.source_id):
+                return None
             return StardustFileResource(
                 child_path, self.environ, self._jbod_manager, file_info
             )
@@ -490,6 +583,120 @@ class StardustDirectoryResource(DAVCollection):
                 self._copy_directory_recursive(src_child, dst_child)
             else:
                 self._jbod_manager.copy_file(src_child, dst_child)
+
+
+class OfflinePlaceholderResource(DAVNonCollection):
+    """오프라인 RemoteSource 파일의 placeholder 리소스.
+
+    파일명에 ".offline" 확장자를 추가하고,
+    GET/PUT/DELETE 요청 시 503 Service Unavailable을 반환한다.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        environ: dict,
+        file_info,
+    ) -> None:
+        """OfflinePlaceholderResource 초기화.
+
+        Args:
+            path: 가상 파일 경로 (".offline" 포함 또는 원본).
+            environ: WSGI 환경 딕셔너리.
+            file_info: 원본 FileInfo 객체.
+        """
+        # path가 .offline으로 끝나지 않으면 추가
+        if not path.endswith(OFFLINE_SUFFIX):
+            path = path + OFFLINE_SUFFIX
+        super().__init__(path, environ)
+        self._file_info = file_info
+
+    def get_content_length(self) -> int:
+        """오프라인 placeholder는 content_length=0."""
+        return 0
+
+    def get_content_type(self) -> str:
+        """MIME 타입을 반환한다."""
+        return "application/octet-stream"
+
+    def get_creation_date(self) -> float:
+        """생성 시간을 반환한다."""
+        return self._file_info.created_at
+
+    def get_last_modified(self) -> float:
+        """원본 수정 시각을 반환한다."""
+        return self._file_info.modified_at
+
+    def support_etag(self) -> bool:
+        """ETag 미지원."""
+        return False
+
+    def get_etag(self) -> str | None:
+        """ETag 미지원."""
+        return None
+
+    def support_ranges(self) -> bool:
+        """Range 요청 미지원."""
+        return False
+
+    def get_content(self) -> IO[bytes]:
+        """GET 요청 시 503 Service Unavailable 반환.
+
+        Raises:
+            DAVError: 503 Service Unavailable.
+        """
+        raise DAVError(HTTP_SERVICE_UNAVAILABLE, "Remote device is offline")
+
+    def begin_write(self, *, content_type=None) -> IO[bytes]:
+        """PUT 요청 시 503 Service Unavailable 반환.
+
+        Raises:
+            DAVError: 503 Service Unavailable.
+        """
+        raise DAVError(HTTP_SERVICE_UNAVAILABLE, "Remote device is offline")
+
+    def delete(self) -> None:
+        """DELETE 요청 시 503 Service Unavailable 반환.
+
+        Raises:
+            DAVError: 503 Service Unavailable.
+        """
+        raise DAVError(HTTP_SERVICE_UNAVAILABLE, "Remote device is offline")
+
+    def copy_move_single(self, dest_path: str, *, is_move: bool) -> None:
+        """COPY/MOVE 요청 시 503 Service Unavailable 반환.
+
+        Raises:
+            DAVError: 503 Service Unavailable.
+        """
+        raise DAVError(HTTP_SERVICE_UNAVAILABLE, "Remote device is offline")
+
+    def get_properties(self, mode: str) -> dict:
+        """커스텀 속성을 포함한 속성 딕셔너리를 반환한다."""
+        props = {}
+        if mode in ("allprop", "named"):
+            props["stardust:availability"] = "offline"
+            # 원본 파일명 (path에서 .offline 제거)
+            original_name = self.path.rsplit("/", 1)[-1]
+            if original_name.endswith(OFFLINE_SUFFIX):
+                original_name = original_name[: -len(OFFLINE_SUFFIX)]
+            props["stardust:original-name"] = original_name
+        return props
+
+    def get_property_names(self, *, is_allprop: bool) -> list[str]:
+        """커스텀 속성 이름 목록을 반환한다."""
+        return ["stardust:availability", "stardust:original-name"]
+
+    def get_property_value(self, name: str):
+        """개별 속성 값을 반환한다."""
+        if name == "stardust:availability":
+            return "offline"
+        if name == "stardust:original-name":
+            original_name = self.path.rsplit("/", 1)[-1]
+            if original_name.endswith(OFFLINE_SUFFIX):
+                original_name = original_name[: -len(OFFLINE_SUFFIX)]
+            return original_name
+        return None
 
 
 def create_webdav_app(

@@ -159,6 +159,11 @@ class JBODManager:
                     modified_at=time.time(),
                 )
                 self.metadata_store.commit()
+            except OSError as e:
+                self.metadata_store.rollback()
+                if "insufficient space" in str(e).lower():
+                    raise InsufficientStorageError(str(e)) from e
+                raise
             except Exception:
                 self.metadata_store.rollback()
                 raise

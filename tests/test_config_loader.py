@@ -87,7 +87,7 @@ class TestConfigLoaderValidate:
         assert errors == []
 
     def test_invalid_version(self, valid_config: dict):
-        valid_config["version"] = 2
+        valid_config["version"] = 99
         loader = ConfigLoader("")
         errors = loader.validate(valid_config)
         assert any("version" in e for e in errors)

@@ -1,0 +1,548 @@
+"""P2PServer 단위 테스트."""
+
+from __future__ import annotations
+
+import base64
+import os
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+import pytest_asyncio
+from aiohttp import web
+
+from stardustlib.auth_client import AuthClient
+from stardustlib.jbod_manager import JBODManager
+from stardustlib.p2p_server import P2PServer
+from stardustlib.storage_source import DirectorySource
+
+
+@pytest.fixture
+def tmp_source_dir(tmp_path):
+    """임시 소스 디렉토리를 생성한다."""
+    source_dir = tmp_path / "source_root"
+    source_dir.mkdir()
+    return str(source_dir)
+
+
+@pytest.fixture
+def directory_source(tmp_source_dir):
+    """DirectorySource를 생성하고 초기화한다."""
+    source = DirectorySource(source_id="vol1", path=tmp_source_dir)
+    source.initialize()
+    return source
+
+
+@pytest.fixture
+def mock_metadata_store():
+    """MetadataStore mock."""
+    return MagicMock()
+
+
+@pytest.fixture
+def mock_auth_client():
+    """AuthClient mock."""
+    client = MagicMock(spec=AuthClient)
+    client.user_id = "test-user-123"
+    return client
+
+
+@pytest.fixture
+def jbod_manager(directory_source, mock_metadata_store):
+    """JBODManager를 생성한다."""
+    return JBODManager(
+        sources=[directory_source],
+        metadata_store=mock_metadata_store,
+    )
+
+
+@pytest.fixture
+def p2p_server(jbod_manager, mock_auth_client):
+    """P2PServer 인스턴스를 생성한다."""
+    return P2PServer(
+        jbod_manager=jbod_manager,
+        auth_client=mock_auth_client,
+        port=9999,
+        server_url="http://localhost:8000",
+    )
+
+
+@pytest.fixture
+def app(p2p_server):
+    """aiohttp Application을 생성한다."""
+    # client_max_size를 200MB로 설정하여 413 테스트가 서버 로직에서 처리되도록 함
+    application = web.Application(client_max_size=200 * 1024 * 1024)
+    application.router.add_post("/p2p/read", p2p_server.handle_read)
+    application.router.add_post("/p2p/write", p2p_server.handle_write)
+    application.router.add_post("/p2p/delete", p2p_server.handle_delete)
+    application.router.add_post("/p2p/list", p2p_server.handle_list)
+    application.router.add_post("/p2p/exists", p2p_server.handle_exists)
+    application.router.add_post("/p2p/mkdir", p2p_server.handle_mkdir)
+    application.router.add_post("/p2p/rmdir", p2p_server.handle_rmdir)
+    application.router.add_post("/p2p/space", p2p_server.handle_space)
+    return application
+
+
+@pytest_asyncio.fixture
+async def client(app, aiohttp_client):
+    """테스트 클라이언트를 생성한다."""
+    return await aiohttp_client(app)
+
+
+def _mock_verify_success():
+    """토큰 검증 성공 mock을 반환한다."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "valid": True,
+        "user_id": "test-user-123",
+    }
+    return mock_resp
+
+
+def _mock_verify_invalid():
+    """토큰 검증 실패 (invalid) mock."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"valid": False}
+    return mock_resp
+
+
+def _mock_verify_wrong_user():
+    """토큰 검증 성공이지만 user_id 불일치 mock."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "valid": True,
+        "user_id": "other-user-456",
+    }
+    return mock_resp
+
+
+# --- 인증 테스트 ---
+
+
+@pytest.mark.asyncio
+async def test_missing_auth_token(client):
+    """auth_token 누락 시 401 반환."""
+    resp = await client.post(
+        "/p2p/read", json={"physical_path": "test.txt"}
+    )
+    assert resp.status == 401
+
+
+@pytest.mark.asyncio
+async def test_invalid_token(client):
+    """유효하지 않은 토큰 시 401 반환."""
+    import httpx as _httpx
+
+    with patch("stardustlib.p2p_server.httpx.AsyncClient") as mock_cls:
+        mock_client = AsyncMock()
+        mock_client.post.return_value = _mock_verify_invalid()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_cls.return_value = mock_client
+
+        resp = await client.post(
+            "/p2p/read",
+            json={"physical_path": "test.txt", "auth_token": "bad-token"},
+        )
+        assert resp.status == 401
+
+
+@pytest.mark.asyncio
+async def test_user_id_mismatch(client):
+    """user_id 불일치 시 403 반환."""
+    with patch("stardustlib.p2p_server.httpx.AsyncClient") as mock_cls:
+        mock_client = AsyncMock()
+        mock_client.post.return_value = _mock_verify_wrong_user()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_cls.return_value = mock_client
+
+        resp = await client.post(
+            "/p2p/read",
+            json={"physical_path": "test.txt", "auth_token": "some-token"},
+        )
+        assert resp.status == 403
+
+
+@pytest.mark.asyncio
+async def test_auth_server_unreachable(client):
+    """중앙 서버 접근 불가 시 503 반환."""
+    import httpx as _httpx
+
+    with patch("stardustlib.p2p_server.httpx.AsyncClient") as mock_cls:
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = _httpx.TimeoutException("timeout")
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_cls.return_value = mock_client
+
+        resp = await client.post(
+            "/p2p/read",
+            json={"physical_path": "test.txt", "auth_token": "some-token"},
+        )
+        assert resp.status == 503
+
+
+# --- Path traversal 테스트 ---
+
+
+@pytest.mark.asyncio
+async def test_path_traversal_dotdot(client):
+    """.. 포함 경로 시 400 반환."""
+    with patch("stardustlib.p2p_server.httpx.AsyncClient") as mock_cls:
+        mock_client = AsyncMock()
+        mock_client.post.return_value = _mock_verify_success()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_cls.return_value = mock_client
+
+        resp = await client.post(
+            "/p2p/read",
+            json={
+                "physical_path": "../etc/passwd",
+                "auth_token": "valid-token",
+            },
+        )
+        assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_path_traversal_embedded(client):
+    """중간에 .. 포함된 경로 시 400 반환."""
+    with patch("stardustlib.p2p_server.httpx.AsyncClient") as mock_cls:
+        mock_client = AsyncMock()
+        mock_client.post.return_value = _mock_verify_success()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_cls.return_value = mock_client
+
+        resp = await client.post(
+            "/p2p/read",
+            json={
+                "physical_path": "subdir/../../secret.txt",
+                "auth_token": "valid-token",
+            },
+        )
+        assert resp.status == 400
+
+
+# --- /p2p/read 테스트 ---
+
+
+@pytest.mark.asyncio
+async def test_read_success(client, tmp_source_dir):
+    """정상 파일 읽기."""
+    # 테스트 파일 생성
+    test_file = os.path.join(tmp_source_dir, "hello.txt")
+    with open(test_file, "wb") as f:
+        f.write(b"Hello, P2P!")
+
+    with patch("stardustlib.p2p_server.httpx.AsyncClient") as mock_cls:
+        mock_client = AsyncMock()
+        mock_client.post.return_value = _mock_verify_success()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_cls.return_value = mock_client
+
+        resp = await client.post(
+            "/p2p/read",
+            json={"physical_path": "hello.txt", "auth_token": "valid-token"},
+        )
+        assert resp.status == 200
+        data = await resp.json()
+        decoded = base64.b64decode(data["data"])
+        assert decoded == b"Hello, P2P!"
+
+
+@pytest.mark.asyncio
+async def test_read_file_not_found(client):
+    """존재하지 않는 파일 읽기 시 404."""
+    with patch("stardustlib.p2p_server.httpx.AsyncClient") as mock_cls:
+        mock_client = AsyncMock()
+        mock_client.post.return_value = _mock_verify_success()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_cls.return_value = mock_client
+
+        resp = await client.post(
+            "/p2p/read",
+            json={
+                "physical_path": "nonexistent.txt",
+                "auth_token": "valid-token",
+            },
+        )
+        assert resp.status == 404
+
+
+# --- /p2p/write 테스트 ---
+
+
+@pytest.mark.asyncio
+async def test_write_success(client, tmp_source_dir):
+    """정상 파일 쓰기."""
+    content = b"Written via P2P"
+    encoded = base64.b64encode(content).decode("ascii")
+
+    with patch("stardustlib.p2p_server.httpx.AsyncClient") as mock_cls:
+        mock_client = AsyncMock()
+        mock_client.post.return_value = _mock_verify_success()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_cls.return_value = mock_client
+
+        resp = await client.post(
+            "/p2p/write",
+            json={
+                "physical_path": "subdir/new_file.txt",
+                "data": encoded,
+                "auth_token": "valid-token",
+            },
+        )
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["bytes_written"] == len(content)
+
+    # 파일이 실제로 생성되었는지 확인
+    written_path = os.path.join(tmp_source_dir, "subdir", "new_file.txt")
+    assert os.path.isfile(written_path)
+    with open(written_path, "rb") as f:
+        assert f.read() == content
+
+
+@pytest.mark.asyncio
+async def test_write_payload_too_large(client):
+    """100MB 초과 시 413 반환."""
+    # 100MB + 1 byte 데이터 (base64 인코딩)
+    large_data = base64.b64encode(b"x" * (100 * 1024 * 1024 + 1)).decode(
+        "ascii"
+    )
+
+    with patch("stardustlib.p2p_server.httpx.AsyncClient") as mock_cls:
+        mock_client = AsyncMock()
+        mock_client.post.return_value = _mock_verify_success()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_cls.return_value = mock_client
+
+        resp = await client.post(
+            "/p2p/write",
+            json={
+                "physical_path": "big_file.bin",
+                "data": large_data,
+                "auth_token": "valid-token",
+            },
+        )
+        assert resp.status == 413
+
+
+# --- /p2p/delete 테스트 ---
+
+
+@pytest.mark.asyncio
+async def test_delete_success(client, tmp_source_dir):
+    """정상 파일 삭제."""
+    test_file = os.path.join(tmp_source_dir, "to_delete.txt")
+    with open(test_file, "wb") as f:
+        f.write(b"delete me")
+
+    with patch("stardustlib.p2p_server.httpx.AsyncClient") as mock_cls:
+        mock_client = AsyncMock()
+        mock_client.post.return_value = _mock_verify_success()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_cls.return_value = mock_client
+
+        resp = await client.post(
+            "/p2p/delete",
+            json={
+                "physical_path": "to_delete.txt",
+                "auth_token": "valid-token",
+            },
+        )
+        assert resp.status == 200
+
+    assert not os.path.exists(test_file)
+
+
+@pytest.mark.asyncio
+async def test_delete_not_found(client):
+    """존재하지 않는 파일 삭제 시 404."""
+    with patch("stardustlib.p2p_server.httpx.AsyncClient") as mock_cls:
+        mock_client = AsyncMock()
+        mock_client.post.return_value = _mock_verify_success()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_cls.return_value = mock_client
+
+        resp = await client.post(
+            "/p2p/delete",
+            json={
+                "physical_path": "ghost.txt",
+                "auth_token": "valid-token",
+            },
+        )
+        assert resp.status == 404
+
+
+# --- /p2p/list 테스트 ---
+
+
+@pytest.mark.asyncio
+async def test_list_success(client, tmp_source_dir):
+    """디렉토리 목록 조회."""
+    # 파일 생성
+    with open(os.path.join(tmp_source_dir, "a.txt"), "wb") as f:
+        f.write(b"a")
+    with open(os.path.join(tmp_source_dir, "b.txt"), "wb") as f:
+        f.write(b"b")
+    os.makedirs(os.path.join(tmp_source_dir, "subdir"), exist_ok=True)
+
+    with patch("stardustlib.p2p_server.httpx.AsyncClient") as mock_cls:
+        mock_client = AsyncMock()
+        mock_client.post.return_value = _mock_verify_success()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_cls.return_value = mock_client
+
+        resp = await client.post(
+            "/p2p/list",
+            json={"physical_path": ".", "auth_token": "valid-token"},
+        )
+        assert resp.status == 200
+        data = await resp.json()
+        entries = sorted(data["entries"])
+        assert "a.txt" in entries
+        assert "b.txt" in entries
+        assert "subdir" in entries
+
+
+# --- /p2p/exists 테스트 ---
+
+
+@pytest.mark.asyncio
+async def test_exists_true(client, tmp_source_dir):
+    """존재하는 파일 확인."""
+    with open(os.path.join(tmp_source_dir, "exists.txt"), "wb") as f:
+        f.write(b"yes")
+
+    with patch("stardustlib.p2p_server.httpx.AsyncClient") as mock_cls:
+        mock_client = AsyncMock()
+        mock_client.post.return_value = _mock_verify_success()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_cls.return_value = mock_client
+
+        resp = await client.post(
+            "/p2p/exists",
+            json={
+                "physical_path": "exists.txt",
+                "auth_token": "valid-token",
+            },
+        )
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["exists"] is True
+
+
+@pytest.mark.asyncio
+async def test_exists_false(client):
+    """존재하지 않는 파일 확인."""
+    with patch("stardustlib.p2p_server.httpx.AsyncClient") as mock_cls:
+        mock_client = AsyncMock()
+        mock_client.post.return_value = _mock_verify_success()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_cls.return_value = mock_client
+
+        resp = await client.post(
+            "/p2p/exists",
+            json={
+                "physical_path": "nope.txt",
+                "auth_token": "valid-token",
+            },
+        )
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["exists"] is False
+
+
+# --- /p2p/mkdir 테스트 ---
+
+
+@pytest.mark.asyncio
+async def test_mkdir_success(client, tmp_source_dir):
+    """디렉토리 생성."""
+    with patch("stardustlib.p2p_server.httpx.AsyncClient") as mock_cls:
+        mock_client = AsyncMock()
+        mock_client.post.return_value = _mock_verify_success()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_cls.return_value = mock_client
+
+        resp = await client.post(
+            "/p2p/mkdir",
+            json={
+                "physical_path": "new_dir/nested",
+                "auth_token": "valid-token",
+            },
+        )
+        assert resp.status == 200
+
+    assert os.path.isdir(os.path.join(tmp_source_dir, "new_dir", "nested"))
+
+
+# --- /p2p/rmdir 테스트 ---
+
+
+@pytest.mark.asyncio
+async def test_rmdir_success(client, tmp_source_dir):
+    """디렉토리 삭제."""
+    dir_path = os.path.join(tmp_source_dir, "remove_me")
+    os.makedirs(dir_path)
+    with open(os.path.join(dir_path, "file.txt"), "wb") as f:
+        f.write(b"content")
+
+    with patch("stardustlib.p2p_server.httpx.AsyncClient") as mock_cls:
+        mock_client = AsyncMock()
+        mock_client.post.return_value = _mock_verify_success()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_cls.return_value = mock_client
+
+        resp = await client.post(
+            "/p2p/rmdir",
+            json={
+                "physical_path": "remove_me",
+                "auth_token": "valid-token",
+            },
+        )
+        assert resp.status == 200
+
+    assert not os.path.exists(dir_path)
+
+
+# --- /p2p/space 테스트 ---
+
+
+@pytest.mark.asyncio
+async def test_space_info(client):
+    """용량 정보 조회."""
+    with patch("stardustlib.p2p_server.httpx.AsyncClient") as mock_cls:
+        mock_client = AsyncMock()
+        mock_client.post.return_value = _mock_verify_success()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_cls.return_value = mock_client
+
+        resp = await client.post(
+            "/p2p/space",
+            json={"auth_token": "valid-token"},
+        )
+        assert resp.status == 200
+        data = await resp.json()
+        assert "available" in data
+        assert "total" in data
+        assert data["available"] > 0
+        assert data["total"] > 0
