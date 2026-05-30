@@ -49,6 +49,7 @@ class SyncClient:
         self._sync_task: asyncio.Task[None] | None = None
         self._running = False
         self._consecutive_failures = 0
+        self._last_synced_version = 0
         self._client = httpx.AsyncClient(timeout=_REQUEST_TIMEOUT)
 
     async def initial_sync(self) -> None:
@@ -144,6 +145,13 @@ class SyncClient:
 
         # 업로드 성공
         self._consecutive_failures = 0
+        # 서버 응답에서 version 추출
+        try:
+            resp_data = response.json()
+            if "version" in resp_data:
+                self._last_synced_version = resp_data["version"]
+        except Exception:
+            pass
         # pending → synced 갱신
         pending_files = self._metadata_store.get_pending_files()
         for fm in pending_files:
@@ -246,6 +254,8 @@ class SyncClient:
                 await asyncio.sleep(self._interval_seconds)
                 if not self._running:
                     break
+                # 양방향 동기화: 다운로드(병합) → 업로드
+                await self._download_and_merge()
                 await self.upload_metadata()
             except asyncio.CancelledError:
                 break
@@ -440,6 +450,46 @@ class SyncClient:
             ),
         )
         conn.commit()
+
+    async def _download_and_merge(self) -> None:
+        """서버 metadata version을 확인하고, 로컬보다 높으면 다운로드하여 병합한다."""
+        try:
+            token = await self._auth_client.get_valid_token()
+
+            # 서버 version 조회
+            status_resp = await self._client.get(
+                f"{self._server_url}/sync/metadata/status",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if status_resp.status_code != 200:
+                return
+
+            server_status = status_resp.json()
+            server_version = server_status.get("version")
+            if server_version is None:
+                return  # 서버에 metadata 없음
+
+            # 로컬 version과 비교
+            if server_version <= self._last_synced_version:
+                return  # 변경 없음
+
+            # 서버가 더 높으면 다운로드
+            response = await self._client.get(
+                f"{self._server_url}/sync/metadata",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if response.status_code != 200:
+                return
+
+            await self._merge_server_metadata(response.content)
+            self._last_synced_version = server_version
+            logger.info(
+                "Periodic sync: merged server version %d", server_version
+            )
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            logger.debug("Periodic download failed (network): %s", e)
+        except Exception as e:
+            logger.debug("Periodic merge failed: %s", e)
 
     # --- 암호화/복호화 헬퍼 ---
 
