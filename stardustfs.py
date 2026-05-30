@@ -291,9 +291,20 @@ async def startup_v2(config: dict, config_path: str) -> None:
     await device_mgr.start_heartbeat()
     await sync_client.start_periodic_sync()
 
-    # (7) WebDAV 서버 시작
+    # (7) WebDAV 서버 시작 (별도 스레드에서 블로킹 실행)
+    import threading
+
+    webdav_thread = threading.Thread(
+        target=_start_webdav, args=(config, app), daemon=True
+    )
+    webdav_thread.start()
+
+    # asyncio 루프 유지 (Ctrl+C로 종료)
     try:
-        _start_webdav(config, app)
+        while webdav_thread.is_alive():
+            await asyncio.sleep(1)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
     finally:
         # 정리
         await sync_client.stop()
