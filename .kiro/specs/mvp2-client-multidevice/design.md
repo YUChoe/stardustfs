@@ -430,6 +430,46 @@ class StardustConfigV2(TypedDict):
     key_file: str | None
 ```
 
+### Tombstone GC 및 Stale 재조정 (SyncClient 확장)
+
+삭제 동기화는 tombstone(deleted=1) 레코드를 영구 보존해야 다른 디바이스로 삭제가 전파된다. 그러나 무한 누적을 막기 위해 일정 기간(retention_days) 후 정리(GC)한다. GC로 인한 부작용("오래된 tombstone이 사라진 뒤, 그 삭제를 못 본 장기 오프라인 디바이스가 파일을 되살리는 resurrection")은 디바이스 측 stale 재조정으로 차단한다.
+
+**아키텍처 제약:** 서버는 암호화된 metadata blob만 보관하므로 어떤 행이 tombstone인지 알 수 없다. 따라서 GC와 stale 판정은 모두 클라이언트가 수행하고, 서버는 정책값(retention_days)만 전달한다.
+
+```python
+# 서버: GET /sync/metadata/status 응답에 정책값 포함
+{
+    "version": 42,
+    "uploaded_at": "...",
+    "tombstone_retention_days": 30   # 신규 필드 (Settings.tombstone_retention_days)
+}
+
+# 클라이언트 SyncClient 확장
+class SyncClient:
+    def _gc_tombstones(self, retention_days: int) -> None:
+        """deleted=1 AND modified_at < (now - retention_days*86400) 레코드를
+        로컬 메타데이터에서 물리적으로 DELETE한다. 활성 레코드는 건드리지 않는다.
+        병합/업로드 직전에 호출한다."""
+
+    def _is_stale(self, retention_days: int) -> bool:
+        """(now - last_sync_at) > retention_days 이면 True."""
+
+    async def reconcile_if_stale(self, retention_days: int) -> None:
+        """stale이면 재조정:
+        1. pending 레코드 조회
+        2. pending 있으면 각각 conflict copy 경로로 격리(rename) + 'pending' 유지
+        3. 로컬 동기화 상태를 초기화하고 서버 metadata 전체 재수신(initial_sync)
+        4. 격리한 레코드는 신규 변경으로 다음 업로드에 포함
+        non-stale이면 아무 작업 안 함."""
+
+    def _record_sync_success(self) -> None:
+        """last_sync_at을 현재 시각으로 갱신하여 로컬에 보존한다."""
+```
+
+**last_sync_at 보존:** 메타데이터 DB 외부의 작은 상태 파일(예: `{metadata_db}.syncstate.json`)에 `{"last_sync_at": <epoch>}`로 저장한다. 메타데이터 DB 자체에 두지 않는 이유는, stale 재조정 시 DB를 전면 교체하더라도 재조정 판단 기준은 유지되어야 하기 때문이다. 파일이 없으면(최초 구동/새 디바이스) stale로 보지 않고 정상 initial_sync 경로를 탄다.
+
+**retention_days 통일:** stale 판정 임계값과 tombstone 보관기간은 동일한 서버 정책값을 사용한다. 이로써 "retention_days 이내 동기화한 디바이스는 아직 GC되지 않은 모든 tombstone을 관측했다"는 불변식이 성립하여 resurrection이 원천 차단된다.
+
 ## Data Models
 
 ### MetadataStore v2 스키마 확장
@@ -584,6 +624,17 @@ sequenceDiagram
 *임의의* 원본 설정 파일 경로와 기존 백업 파일 집합에 대해, 마이그레이션 시 생성되는 백업 파일명은 기존 파일과 충돌하지 않는 고유한 이름이어야 한다. 기존 ".v1.bak"이 없으면 "{원본}.v1.bak"을, 이미 존재하면 "{원본}.v1.bak.{N}" (N은 최소 미사용 순번)을 사용해야 한다.
 
 **Validates: Requirements 13.9**
+
+
+### Property 9: Tombstone GC 및 stale 재조정 안전성
+
+*임의의* tombstone 레코드 집합과 retention_days, 그리고 디바이스의 last_sync_at에 대해:
+- GC 대상은 deleted=1이고 modified_at < (현재시각 - retention_days)인 레코드뿐이며, 활성(deleted=0) 레코드는 절대 GC되지 않는다
+- (현재시각 - last_sync_at) ≤ retention_days이면 디바이스는 non-stale로 판정되어 정상 병합한다
+- (현재시각 - last_sync_at) > retention_days이면 stale로 판정되어 재조정한다
+- stale 재조정 시 로컬 pending 레코드는 손실되지 않는다(pending 없으면 전체 재수신, pending 있으면 conflict copy로 격리 후 재수신)
+
+**Validates: Requirements 16.3, 16.6, 16.7, 16.8, 16.10**
 
 
 ## Error Handling

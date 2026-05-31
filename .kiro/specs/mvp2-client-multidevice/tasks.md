@@ -217,6 +217,38 @@ StardustFS 클라이언트에 중앙 서버 인증, 메타데이터 동기화, P
 - [x] 17. Final Checkpoint - 전체 테스트 통과 확인
   - 모든 테스트 통과 확인, 질문이 있으면 사용자에게 문의.
 
+- [ ] 18. Tombstone GC 및 장기 오프라인 디바이스 재조정
+  - [ ] 18.1 서버에 tombstone 보관기간 정책값 추가
+    - app/config.py Settings에 tombstone_retention_days 추가 (기본 30, env STARDUST_TOMBSTONE_RETENTION_DAYS)
+    - GET /sync/metadata/status 응답에 tombstone_retention_days 필드 포함
+    - 서버는 정책값 전달만 하고 GC를 직접 수행하지 않음 (암호화 blob이라 불가)
+    - _Requirements: 16.1, 16.2, 16.4_
+  - [ ]* 18.2 서버 status 응답 테스트
+    - tombstone_retention_days 기본값/환경변수 오버라이드 반영 확인
+    - _Requirements: 16.1, 16.2_
+  - [ ] 18.3 클라이언트 tombstone GC 구현
+    - SyncClient._gc_tombstones(retention_days): deleted=1 AND modified_at < now-retention 레코드 물리 삭제
+    - MetadataStore에 tombstone GC용 삭제 메서드 추가 (활성 레코드 보존)
+    - 병합·업로드 직전 호출 (status에서 받은 retention_days 사용)
+    - _Requirements: 16.3, 16.4_
+  - [ ] 18.4 last_sync_at 보존 및 stale 판정 구현
+    - 동기화 성공 시 {metadata_db}.syncstate.json에 last_sync_at 기록
+    - SyncClient._is_stale(retention_days): (now - last_sync_at) > retention
+    - 상태 파일 부재 시 non-stale (새 디바이스 경로)
+    - _Requirements: 16.5, 16.6, 16.9, 16.10_
+  - [ ] 18.5 stale 재조정(re-baseline) 구현
+    - reconcile_if_stale(): pending 없으면 전체 재수신, pending 있으면 conflict copy 격리 후 재수신
+    - 격리한 변경은 신규로 업로드
+    - stardustfs.py 시작 흐름에 stale 재조정 단계 통합 (initial_sync 전후)
+    - _Requirements: 16.6, 16.7, 16.8_
+  - [ ]* 18.6 Property 9 PBT + 단위 테스트
+    - **Property 9: Tombstone GC 및 stale 재조정 안전성**
+    - GC 대상 선별 정확성(활성 레코드 미삭제), stale 판정 경계, pending 보존 검증
+    - _Requirements: 16.3, 16.6, 16.7, 16.8, 16.10_
+
+- [ ] 19. Final Checkpoint - tombstone GC 포함 전체 테스트 통과 확인
+  - 모든 테스트 통과 확인, 질문이 있으면 사용자에게 문의.
+
 ## Notes
 
 - `*` 표시된 태스크는 선택적이며 빠른 MVP 구현을 위해 건너뛸 수 있음

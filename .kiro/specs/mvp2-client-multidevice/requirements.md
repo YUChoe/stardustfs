@@ -249,3 +249,22 @@ StardustFS 클라이언트의 MVP2 확장으로, 기존 단일 디바이스 WebD
 8. WHEN 이전에 오프라인이었던 Remote_Source가 다시 활성(온라인) 상태로 전환되면, THE WebDAV_Provider SHALL ".offline" 확장자를 제거하고 실제 파일 속성(크기, 수정 시각)을 반환한다
 9. IF 설정에서 remote source가 없거나 모든 remote source가 온라인이면, THEN THE WebDAV_Provider SHALL 모든 파일을 원본 파일명으로 정상 표시한다
 10. WHEN WebDAV PROPFIND 응답에서 오프라인 placeholder 파일의 속성을 반환할 때, THE WebDAV_Provider SHALL 커스텀 속성 stardust:availability를 "offline"으로, stardust:original-name을 원본 파일명으로 설정한다
+
+### Requirement 16: Tombstone 정리(GC) 및 장기 오프라인 디바이스 재조정
+
+**User Story:** 사용자로서, 삭제된 파일의 tombstone이 메타데이터에 무한히 쌓이지 않고, 오랫동안 사용하지 않던 디바이스를 다시 켰을 때 삭제된 파일이 되살아나지 않기를 원한다. 이를 통해 메타데이터 크기를 일정하게 유지하고 멀티디바이스 간 삭제 일관성을 보장한다.
+
+**전제:** StardustFS는 클라이언트 구동 중에만 WebDAV로 파일 접근이 가능하다. 클라이언트가 종료된 디바이스("오프라인 디바이스")에서는 파일 생성·수정·삭제가 발생할 수 없으며, 종료 직전 마지막 동기화 사이클에서 모든 변경이 서버에 반영(pending 없음)된다. 단, 종료 직전 사이클에서 동기화가 실패한 경우에만 pending 변경이 로컬에 잔존할 수 있다.
+
+#### Acceptance Criteria
+
+1. THE 중앙 서버 SHALL tombstone 보관기간(retention_days)을 설정값으로 보유하며, 기본값은 30일이다 (환경변수 STARDUST_TOMBSTONE_RETENTION_DAYS로 조정 가능)
+2. WHEN 클라이언트가 GET /sync/metadata/status를 호출하면, THE 중앙 서버 SHALL 응답에 tombstone_retention_days 필드를 포함하여 정책값을 전달한다
+3. WHEN 클라이언트가 메타데이터를 병합하거나 업로드하기 전에, THE SyncClient SHALL deleted=1이고 modified_at이 (현재시각 - retention_days)보다 오래된 tombstone 레코드를 로컬 메타데이터에서 물리적으로 제거(GC)한다
+4. THE tombstone GC는 메타데이터 blob을 복호화할 수 있는 클라이언트에서만 수행되며, 서버는 암호화된 blob을 보관할 뿐 GC를 직접 수행하지 않는다
+5. WHEN 클라이언트가 시작될 때, THE SyncClient SHALL 마지막으로 성공한 동기화 시각(last_sync_at)을 로컬에 보존된 값에서 읽는다
+6. IF 현재 시각과 last_sync_at의 차이가 retention_days를 초과하면(장기 오프라인 디바이스), THEN THE SyncClient SHALL 해당 디바이스를 stale 상태로 판정하고 재조정(re-baseline) 절차를 수행한다
+7. WHEN stale 재조정을 수행할 때, IF 로컬에 pending 변경이 없으면, THEN THE SyncClient SHALL 로컬 메타데이터를 서버의 정본으로 전면 교체(전체 재수신)한다
+8. WHEN stale 재조정을 수행할 때, IF 로컬에 pending 변경이 존재하면(종료 직전 동기화 실패), THEN THE SyncClient SHALL 해당 pending 레코드를 conflict copy 경로로 격리 보존한 뒤 서버 정본을 전면 채택하고, 격리한 변경을 신규로 업로드한다
+9. WHEN 동기화가 성공적으로 완료될 때마다, THE SyncClient SHALL last_sync_at을 현재 시각으로 갱신하여 로컬에 보존한다
+10. THE stale 판정 임계값은 tombstone 보관기간(retention_days)과 동일한 값을 사용하여, retention_days 이내에 동기화한 디바이스는 GC되지 않은 모든 tombstone을 관측했음을 보장한다
