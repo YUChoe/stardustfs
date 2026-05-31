@@ -236,10 +236,12 @@ class MetadataStore:
         file_size: int,
         created_at: float,
         modified_at: float,
+        device_id: str | None = None,
     ) -> None:
         """파일 메타데이터를 삽입한다.
 
         version=1, sync_status="pending"으로 초기 삽입한다.
+        device_id는 이 변경을 수행한 디바이스 ID (없으면 NULL).
         동일 경로에 tombstone(삭제 마커)이 남아 있으면 재활성화한다.
         """
         conn = self._get_conn()
@@ -252,34 +254,51 @@ class MetadataStore:
             conn.execute(
                 "UPDATE files SET source_id = ?, physical_path = ?, "
                 "file_size = ?, created_at = ?, modified_at = ?, "
-                "version = version + 1, sync_status = 'pending', deleted = 0 "
+                "version = version + 1, sync_status = 'pending', deleted = 0, "
+                "device_id = ? "
                 "WHERE virtual_path = ?",
                 (source_id, physical_path, file_size, created_at, modified_at,
-                 virtual_path),
+                 device_id, virtual_path),
             )
             conn.commit()
             return
         conn.execute(
             "INSERT INTO files "
             "(virtual_path, source_id, physical_path, file_size, "
-            "created_at, modified_at, version, sync_status, deleted) "
-            "VALUES (?, ?, ?, ?, ?, ?, 1, 'pending', 0)",
-            (virtual_path, source_id, physical_path, file_size, created_at, modified_at),
+            "created_at, modified_at, version, sync_status, deleted, device_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1, 'pending', 0, ?)",
+            (virtual_path, source_id, physical_path, file_size, created_at,
+             modified_at, device_id),
         )
         conn.commit()
 
-    def update(self, virtual_path: str, file_size: int, modified_at: float) -> None:
+    def update(
+        self,
+        virtual_path: str,
+        file_size: int,
+        modified_at: float,
+        device_id: str | None = None,
+    ) -> None:
         """파일 메타데이터를 갱신한다.
 
         version을 1 증가시키고 sync_status를 "pending"으로 설정한다.
+        device_id는 이 변경을 수행한 디바이스 ID (없으면 기존 값 유지).
         """
         conn = self._get_conn()
-        conn.execute(
-            "UPDATE files SET file_size = ?, modified_at = ?, "
-            "version = version + 1, sync_status = 'pending' "
-            "WHERE virtual_path = ?",
-            (file_size, modified_at, virtual_path),
-        )
+        if device_id is not None:
+            conn.execute(
+                "UPDATE files SET file_size = ?, modified_at = ?, "
+                "version = version + 1, sync_status = 'pending', device_id = ? "
+                "WHERE virtual_path = ?",
+                (file_size, modified_at, device_id, virtual_path),
+            )
+        else:
+            conn.execute(
+                "UPDATE files SET file_size = ?, modified_at = ?, "
+                "version = version + 1, sync_status = 'pending' "
+                "WHERE virtual_path = ?",
+                (file_size, modified_at, virtual_path),
+            )
         conn.commit()
 
     def increment_version(self, virtual_path: str, device_id: str) -> None:

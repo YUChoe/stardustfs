@@ -67,6 +67,36 @@ class TestWriteAndReadFile:
         with pytest.raises(FileNotFoundError):
             jbod.read_file("/no/such/file.txt")
 
+    def test_write_records_device_id(
+        self, temp_dirs, metadata_store, encryption_engine
+    ):
+        """device_id를 가진 JBOD로 파일을 쓰면 메타데이터에 device_id가 기록된다."""
+        d1, _d2 = temp_dirs
+        src = DirectorySource("src-dev", d1)
+        src.initialize()
+        jbod = JBODManager(
+            [src], metadata_store, encryption_engine, device_id="dev-123"
+        )
+
+        # 신규 생성 → device_id 기록
+        jbod.write_file("/a.txt", b"data")
+        rec = metadata_store.lookup("/a.txt")
+        assert rec is not None
+        assert rec.device_id == "dev-123"
+
+        # 수정 → device_id 유지/갱신
+        jbod.write_file("/a.txt", b"updated data")
+        rec2 = metadata_store.lookup("/a.txt")
+        assert rec2.device_id == "dev-123"
+
+    def test_write_without_device_id_is_null(self, jbod, metadata_store):
+        """device_id 없는 JBOD(기본)로 쓰면 device_id는 NULL이다."""
+        jbod.write_file("/b.txt", b"data")
+        rec = metadata_store.lookup("/b.txt")
+        assert rec is not None
+        assert rec.device_id is None
+
+
     def test_write_empty_data(self, jbod):
         """빈 데이터 쓰기/읽기."""
         jbod.write_file("/empty.bin", b"")

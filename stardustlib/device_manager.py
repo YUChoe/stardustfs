@@ -159,6 +159,29 @@ class DeviceManager:
             f"{last_error}"
         )
 
+    async def list_devices(self) -> list[dict]:
+        """서버에서 내 계정에 등록된 디바이스 목록을 조회한다.
+
+        GET /devices. 각 항목은 id, name, os, connection_address,
+        is_online 등을 포함한다. 실패 시 빈 리스트를 반환한다(예외 없음).
+        """
+        try:
+            token = await self._auth_client.get_valid_token()
+            response = await self._client.get(
+                f"{self._server_url}/devices",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if response.status_code < 400:
+                data = response.json()
+                return data if isinstance(data, list) else []
+            logger.warning(
+                "디바이스 목록 조회 실패: HTTP %d", response.status_code
+            )
+            return []
+        except Exception as e:
+            logger.warning("디바이스 목록 조회 중 예외: %s", e)
+            return []
+
     async def start_heartbeat(self) -> None:
         """백그라운드 heartbeat 루프를 시작한다.
 

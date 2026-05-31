@@ -29,6 +29,7 @@ class JBODManager:
         sources: list[StorageSource],
         metadata_store: MetadataStore,
         encryption_engine: EncryptionEngine | None = None,
+        device_id: str | None = None,
     ) -> None:
         """JBODManager 초기화.
 
@@ -36,10 +37,12 @@ class JBODManager:
             sources: Storage Source 목록.
             metadata_store: 메타데이터 저장소.
             encryption_engine: 암호화 엔진 (None이면 암호화 비활성).
+            device_id: 이 클라이언트의 디바이스 ID (파일 변경 추적용, 선택).
         """
         self.sources = sources
         self.metadata_store = metadata_store
         self.encryption_engine = encryption_engine
+        self.device_id = device_id
         # 개선 1: source_id → StorageSource dict (O(1) 조회)
         self._source_map: dict[str, StorageSource] = {
             s.source_id: s for s in sources
@@ -167,6 +170,7 @@ class JBODManager:
                     virtual_path,
                     file_size=len(data),
                     modified_at=time.time(),
+                    device_id=self.device_id,
                 )
                 self.metadata_store.commit()
             except OSError as e:
@@ -193,6 +197,7 @@ class JBODManager:
                     file_size=len(data),
                     created_at=now,
                     modified_at=now,
+                    device_id=self.device_id,
                 )
                 self.metadata_store.commit()
             except Exception:

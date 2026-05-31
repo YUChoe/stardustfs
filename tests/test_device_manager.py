@@ -160,6 +160,55 @@ class TestRegister:
         assert captured_kwargs["headers"]["Authorization"] == "Bearer fake-token"
 
 
+class TestListDevices:
+    """list_devices() 테스트."""
+
+    @pytest.mark.asyncio
+    async def test_list_devices_success(self, device_manager):
+        """디바이스 목록을 정상 조회한다."""
+        devices_json = [
+            {"id": "dev-1", "name": "PC-A", "is_online": True},
+            {"id": "dev-2", "name": "PC-B", "is_online": False},
+        ]
+        mock_response = httpx.Response(
+            200,
+            json=devices_json,
+            request=httpx.Request("GET", "https://api.example.com/devices"),
+        )
+        with patch.object(
+            device_manager._client, "get", return_value=mock_response
+        ):
+            result = await device_manager.list_devices()
+
+        assert len(result) == 2
+        assert result[0]["id"] == "dev-1"
+        assert result[1]["name"] == "PC-B"
+
+    @pytest.mark.asyncio
+    async def test_list_devices_http_error_returns_empty(self, device_manager):
+        """HTTP 오류 시 빈 리스트를 반환한다 (예외 없음)."""
+        mock_response = httpx.Response(
+            500,
+            json={"error": "internal"},
+            request=httpx.Request("GET", "https://api.example.com/devices"),
+        )
+        with patch.object(
+            device_manager._client, "get", return_value=mock_response
+        ):
+            result = await device_manager.list_devices()
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_list_devices_network_error_returns_empty(self, device_manager):
+        """네트워크 오류 시 빈 리스트를 반환한다 (예외 없음)."""
+        with patch.object(
+            device_manager._client, "get",
+            side_effect=httpx.ConnectError("refused"),
+        ):
+            result = await device_manager.list_devices()
+        assert result == []
+
+
 class TestHeartbeat:
     """heartbeat 관련 테스트."""
 

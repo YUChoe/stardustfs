@@ -237,6 +237,20 @@ async def startup_v2(config: dict, config_path: str) -> None:
         _start_webdav(config, app)
         return
 
+    # 등록된 device_id를 JBOD에 주입 (파일 변경 추적용)
+    jbod_manager.device_id = device_mgr.device_id
+
+    # 내 계정에 등록된 디바이스 목록 조회 (remote 소스 설정 참고용)
+    my_devices = await device_mgr.list_devices()
+    if my_devices:
+        logger.info("내 계정에 등록된 디바이스 (%d개):", len(my_devices))
+        for d in my_devices:
+            mark = " (이 디바이스)" if d.get("id") == device_mgr.device_id else ""
+            logger.info(
+                "  - id=%s name=%s online=%s%s",
+                d.get("id"), d.get("name"), d.get("is_online"), mark,
+            )
+
     # (5-b) remote 소스 마운트 (인증 완료 후) — 같은 유저의 다른 디바이스 스토리지 접근
     _mount_remote_sources(config, jbod_manager, auth_client, server_url)
 
@@ -273,7 +287,8 @@ async def startup_v2(config: dict, config_path: str) -> None:
             app, jbod_manager, metadata_store, encryption_engine, db_key = (
                 _initialize_local_storage(config)
             )
-            # remote 소스 재마운트 (jbod_manager가 교체되었으므로)
+            # device_id, remote 소스 재주입 (jbod_manager가 교체되었으므로)
+            jbod_manager.device_id = device_mgr.device_id
             _mount_remote_sources(config, jbod_manager, auth_client, server_url)
             # SyncClient 재생성
             conflict_resolver = ConflictResolver(metadata_store, device_name)
