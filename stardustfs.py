@@ -252,7 +252,10 @@ async def startup_v2(config: dict, config_path: str) -> None:
             )
 
     # (5-b) remote 소스 마운트 (인증 완료 후) — 같은 유저의 다른 디바이스 스토리지 접근
-    _mount_remote_sources(config, jbod_manager, auth_client, server_url)
+    _mount_remote_sources(
+        config, jbod_manager, auth_client, server_url,
+        my_devices=my_devices, self_device_id=device_mgr.device_id,
+    )
 
     # (5) 메타데이터 동기화
     from stardustlib.conflict_resolver import ConflictResolver
@@ -289,7 +292,10 @@ async def startup_v2(config: dict, config_path: str) -> None:
             )
             # device_id, remote 소스 재주입 (jbod_manager가 교체되었으므로)
             jbod_manager.device_id = device_mgr.device_id
-            _mount_remote_sources(config, jbod_manager, auth_client, server_url)
+            _mount_remote_sources(
+                config, jbod_manager, auth_client, server_url,
+                my_devices=my_devices, self_device_id=device_mgr.device_id,
+            )
             # SyncClient 재생성
             conflict_resolver = ConflictResolver(metadata_store, device_name)
             sync_client = SyncClient(
@@ -347,35 +353,59 @@ async def startup_v2(config: dict, config_path: str) -> None:
 
 
 def _mount_remote_sources(
-    config: dict, jbod_manager, auth_client, server_url: str
+    config: dict, jbod_manager, auth_client, server_url: str,
+    my_devices: list | None = None, self_device_id: str | None = None,
 ) -> None:
-    """설정의 remote 타입 소스를 RemoteSource로 생성해 JBOD에 마운트한다.
+    """remote 소스를 RemoteSource로 생성해 JBOD에 마운트한다.
 
-    인증이 완료된 뒤(서버 모드) 호출한다. RemoteSource.initialize()는 중앙 서버
-    routing으로 대상 디바이스 주소를 조회하며, 실패 시 비활성 상태로 남는다
-    (오프라인 placeholder로 표시됨). 개별 소스 실패는 전체를 막지 않는다.
+    두 종류를 마운트한다:
+    1. 설정에 명시된 remote 타입 소스 (cfg["device_id"] 지정)
+    2. 자동 발견: p2p.auto_mount_devices가 true이면, 내 계정의 다른 디바이스를
+       (my_devices에서) 자동으로 remote 소스로 마운트한다. source_id는
+       "remote-<device_id>" 규칙. config에 이미 명시된 device_id는 건너뛴다.
+
+    인증 완료 후 호출한다. RemoteSource.initialize()는 routing으로 대상 주소를
+    조회하며, 실패 시 비활성(오프라인 placeholder)으로 남는다. 개별 실패는
+    전체를 막지 않는다.
     """
     from stardustlib.remote_source import RemoteSource
 
     logger = logging.getLogger(__name__)
-    for cfg in config.get("sources", []):  # type: ignore[attr-defined]
-        if cfg.get("type") != "remote":
-            continue
+    mounted_device_ids: set[str] = set()
+
+    def _mount(source_id: str, device_id: str) -> None:
         try:
-            source = RemoteSource(
-                cfg["id"], cfg["device_id"], auth_client, server_url
-            )
+            source = RemoteSource(source_id, device_id, auth_client, server_url)
             source.initialize()
             jbod_manager.add_source(source)
+            mounted_device_ids.add(device_id)
             status = "활성" if source.is_active else "비활성(오프라인)"
             logger.info(
                 "RemoteSource 마운트: id=%s device=%s (%s)",
-                cfg["id"], cfg["device_id"], status,
+                source_id, device_id, status,
             )
         except Exception as e:
-            logger.warning(
-                "RemoteSource 마운트 실패 id=%s: %s", cfg.get("id"), e
-            )
+            logger.warning("RemoteSource 마운트 실패 id=%s: %s", source_id, e)
+
+    # 1) 설정에 명시된 remote 소스
+    for cfg in config.get("sources", []):  # type: ignore[attr-defined]
+        if cfg.get("type") != "remote":
+            continue
+        _mount(cfg["id"], cfg["device_id"])
+
+    # 2) 자동 발견: 내 다른 디바이스를 remote 소스로 자동 마운트
+    p2p_config = config.get("p2p", {})  # type: ignore[attr-defined]
+    auto_mount = p2p_config.get("auto_mount_devices", True)
+    if auto_mount and my_devices:
+        for dev in my_devices:
+            dev_id = dev.get("id")
+            if not dev_id:
+                continue
+            if dev_id == self_device_id:
+                continue  # 자기 자신 제외
+            if dev_id in mounted_device_ids:
+                continue  # 설정에 이미 명시된 디바이스 중복 방지
+            _mount(f"remote-{dev_id}", dev_id)
 
 
 def _initialize_local_storage(config: dict) -> tuple:

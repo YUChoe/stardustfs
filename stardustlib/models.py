@@ -71,6 +71,7 @@ class P2PConfig(TypedDict):
 
     port: int       # P2P 포트 (1024-65535)
     enabled: bool   # P2P 활성화 여부
+    auto_mount_devices: bool  # 내 다른 디바이스를 자동으로 remote 소스로 마운트 (기본 True)
 
 
 class RemoteSourceConfig(TypedDict):
