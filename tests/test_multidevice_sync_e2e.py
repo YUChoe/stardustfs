@@ -30,7 +30,7 @@ from stardustlib.conflict_resolver import ConflictResolver
 from stardustlib.metadata_store import MetadataStore
 from stardustlib.sync_client import SyncClient
 
-SERVER_URL = "https://stardustfs.noizze.net"
+SERVER_URL = os.environ.get("STARDUST_TEST_SERVER_URL", "https://stardustfs.noizze.net")
 # E2E 테스트 전용 계정 (실제 사용자 계정과 분리)
 EMAIL = os.environ.get("STARDUST_TEST_EMAIL", "e2e-test@example.com")
 PASSWORD = os.environ.get("STARDUST_TEST_PASSWORD", "e2e-test-password-2026")
@@ -106,8 +106,8 @@ class SimulatedDevice:
         await self.sync_client.upload_metadata()
 
     async def sync_download(self):
-        """서버에서 metadata를 다운로드하여 병합한다."""
-        await self.sync_client.initial_sync()
+        """서버에서 metadata를 다운로드하여 병합한다 (version 추적 포함)."""
+        await self.sync_client._download_and_merge()
 
     def lookup(self, path: str):
         return self.store.lookup(path)
@@ -329,35 +329,42 @@ async def test_version_pollution(devices):
 
 
 async def test_race_condition_simultaneous_upload(devices):
-    """케이스 7: 레이스컨디션 — A와 B가 거의 동시에 업로드."""
+    """케이스 7: 레이스컨디션 — A와 B가 거의 동시에 업로드해도 CAS로 유실 방지.
+
+    공통 기반(공유 파일)을 만든 뒤 A/B가 각자 다른 파일을 추가하고,
+    CAS 업로드 경로(upload_metadata)로 거의 동시에 올린다. 낙관적 잠금에 의해
+    한쪽은 409 후 재병합·재시도하므로 양쪽 변경이 모두 보존되어야 한다.
+    """
     dev_a, dev_b = devices
 
-    # 각각 다른 파일 생성
+    # 공통 기반: A가 파일 생성·업로드, B가 동일 서버 상태로 동기화
+    await dev_a.create_file("/race-base.txt", 10)
+    await dev_a.sync_upload()
+    await dev_b.sync_download()
+
+    # 각자 다른 파일 생성 (pending)
     await dev_a.create_file("/race-a.txt", 100)
     await dev_b.create_file("/race-b.txt", 200)
 
-    # 동시 업로드 (asyncio.gather)
+    # CAS 경로로 동시 업로드
     await asyncio.gather(
-        dev_a.sync_upload(),
-        dev_b.sync_upload(),
+        dev_a.sync_upload_pending(),
+        dev_b.sync_upload_pending(),
     )
 
     # 양쪽 다운로드
     await dev_a.sync_download()
     await dev_b.sync_download()
 
-    # 최소한 자신의 파일은 보여야 함
+    # CAS 덕분에 양쪽 파일이 모두 서버에 반영되어 서로 보여야 함
     assert dev_a.lookup("/race-a.txt") is not None
     assert dev_b.lookup("/race-b.txt") is not None
-
-    # 상대방 파일도 보이면 이상적 (레이스컨디션에 따라 실패 가능)
-    a_sees_b = dev_a.lookup("/race-b.txt")
-    b_sees_a = dev_b.lookup("/race-a.txt")
-    if a_sees_b is None or b_sees_a is None:
-        pytest.xfail(
-            "레이스컨디션: 동시 업로드 시 한쪽이 덮어씀. "
-            f"A sees B: {a_sees_b is not None}, B sees A: {b_sees_a is not None}"
-        )
+    assert dev_a.lookup("/race-b.txt") is not None, (
+        "CAS 실패: A에서 B의 파일이 보이지 않음 (B 변경 유실)"
+    )
+    assert dev_b.lookup("/race-a.txt") is not None, (
+        "CAS 실패: B에서 A의 파일이 보이지 않음 (A 변경 유실)"
+    )
 
 
 async def test_many_files_sync(devices):

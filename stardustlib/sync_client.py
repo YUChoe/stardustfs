@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 _REQUEST_TIMEOUT = 10.0
 _MAX_KEY_RETRIES = 3
 _MAX_UPLOAD_FAILURES = 3
+_MAX_CAS_RETRIES = 5  # 낙관적 잠금(CAS) 충돌 시 재병합·재시도 횟수
 
 
 class SyncClient:
@@ -101,80 +102,109 @@ class SyncClient:
         )
 
     async def upload_metadata(self) -> None:
-        """로컬 metadata_db 스냅샷을 서버에 업로드.
+        """로컬 metadata_db 스냅샷을 서버에 업로드 (낙관적 잠금/CAS).
 
         pending 변경사항(생성/수정/삭제 tombstone)이 없으면 업로드를 건너뛴다.
+
+        서버에 X-Base-Version 헤더로 마지막으로 동기화한 서버 version을 보낸다.
+        서버 version이 그 사이 다른 디바이스에 의해 올라갔으면 409가 반환되며,
+        이 경우 서버 변경을 다운로드·재병합한 뒤 재시도한다(최대 _MAX_CAS_RETRIES회).
+        이로써 동시 업로드 시 한쪽 변경이 유실되는 레이스컨디션을 방지한다.
         """
         db_path = self._metadata_store._db_path
 
         # pending 변경사항이 없으면 업로드 불필요 (삭제는 tombstone으로 pending에 포함됨)
-        pending_files = self._metadata_store.get_pending_files()
-        if not pending_files:
+        if not self._metadata_store.get_pending_files():
             return
 
         if not os.path.exists(db_path):
             logger.warning("Metadata DB not found: %s", db_path)
             return
 
-        logger.info("Sync: pending %d개 파일 업로드 시작", len(pending_files))
+        for attempt in range(1, _MAX_CAS_RETRIES + 1):
+            pending_files = self._metadata_store.get_pending_files()
+            if not pending_files:
+                return
 
-        try:
-            token = await self._auth_client.get_valid_token()
-
-            # WAL 모드에서 최신 데이터를 포함하려면 checkpoint 수행
-            conn = self._metadata_store._get_conn()
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-
-            with open(db_path, "rb") as f:
-                db_blob = f.read()
-
-            # 서버 전송 전 AES-256-GCM 암호화
-            encrypted_blob = self._encrypt_blob(db_blob)
-
-            response = await self._client.put(
-                f"{self._server_url}/sync/metadata",
-                headers={"Authorization": f"Bearer {token}"},
-                content=encrypted_blob,
+            logger.info(
+                "Sync: pending %d개 파일 업로드 시작 (base_version=%d, 시도 %d)",
+                len(pending_files), self._last_synced_version, attempt,
             )
-        except (httpx.TimeoutException, httpx.ConnectError) as e:
-            self._consecutive_failures += 1
-            if self._consecutive_failures >= _MAX_UPLOAD_FAILURES:
-                logger.error(
-                    "Metadata upload failed %d consecutive times: %s",
-                    self._consecutive_failures, e,
+
+            try:
+                token = await self._auth_client.get_valid_token()
+
+                # WAL 모드에서 최신 데이터를 포함하려면 checkpoint 수행
+                conn = self._metadata_store._get_conn()
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+                with open(db_path, "rb") as f:
+                    db_blob = f.read()
+
+                # 서버 전송 전 AES-256-GCM 암호화
+                encrypted_blob = self._encrypt_blob(db_blob)
+
+                response = await self._client.put(
+                    f"{self._server_url}/sync/metadata",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "X-Base-Version": str(self._last_synced_version),
+                    },
+                    content=encrypted_blob,
                 )
-            return
-        except Exception as e:
-            self._consecutive_failures += 1
-            if self._consecutive_failures >= _MAX_UPLOAD_FAILURES:
-                logger.error(
-                    "Metadata upload failed %d consecutive times: %s",
-                    self._consecutive_failures, e,
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                self._consecutive_failures += 1
+                if self._consecutive_failures >= _MAX_UPLOAD_FAILURES:
+                    logger.error(
+                        "Metadata upload failed %d consecutive times: %s",
+                        self._consecutive_failures, e,
+                    )
+                return
+            except Exception as e:
+                self._consecutive_failures += 1
+                if self._consecutive_failures >= _MAX_UPLOAD_FAILURES:
+                    logger.error(
+                        "Metadata upload failed %d consecutive times: %s",
+                        self._consecutive_failures, e,
+                    )
+                return
+
+            if response.status_code == 409:
+                # CAS 충돌: 다른 디바이스가 먼저 업로드함 → 다운로드·재병합 후 재시도
+                logger.info(
+                    "CAS 충돌 (base_version=%d) — 서버 변경 병합 후 재시도",
+                    self._last_synced_version,
                 )
+                await self._download_and_merge()
+                continue
+
+            if response.status_code >= 400:
+                self._consecutive_failures += 1
+                if self._consecutive_failures >= _MAX_UPLOAD_FAILURES:
+                    logger.error(
+                        "Metadata upload failed %d consecutive times (HTTP %d).",
+                        self._consecutive_failures, response.status_code,
+                    )
+                return
+
+            # 업로드 성공
+            self._consecutive_failures = 0
+            try:
+                resp_data = response.json()
+                if "version" in resp_data:
+                    self._last_synced_version = resp_data["version"]
+            except Exception:
+                pass
+            # pending → synced 갱신
+            for fm in pending_files:
+                self._metadata_store.set_sync_status(fm.virtual_path, "synced")
+            logger.info("Metadata uploaded successfully.")
             return
 
-        if response.status_code >= 400:
-            self._consecutive_failures += 1
-            if self._consecutive_failures >= _MAX_UPLOAD_FAILURES:
-                logger.error(
-                    "Metadata upload failed %d consecutive times (HTTP %d).",
-                    self._consecutive_failures, response.status_code,
-                )
-            return
-
-        # 업로드 성공
-        self._consecutive_failures = 0
-        # 서버 응답에서 version 추출
-        try:
-            resp_data = response.json()
-            if "version" in resp_data:
-                self._last_synced_version = resp_data["version"]
-        except Exception:
-            pass
-        # pending → synced 갱신
-        for fm in pending_files:
-            self._metadata_store.set_sync_status(fm.virtual_path, "synced")
-        logger.info("Metadata uploaded successfully.")
+        logger.warning(
+            "Metadata upload: CAS 재시도 %d회 초과, 다음 주기에 재시도",
+            _MAX_CAS_RETRIES,
+        )
 
     async def upload_key(self, encrypted_blob: bytes) -> None:
         """암호화된 key blob을 서버에 업로드 (10초 타임아웃, 3회 재시도)."""
