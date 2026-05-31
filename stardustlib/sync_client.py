@@ -50,6 +50,7 @@ class SyncClient:
         self._running = False
         self._consecutive_failures = 0
         self._last_synced_version = 0
+        self._dirty = False  # 로컬 DB에 변경이 있으면 True
         self._client = httpx.AsyncClient(timeout=_REQUEST_TIMEOUT)
 
     async def initial_sync(self) -> None:
@@ -103,13 +104,20 @@ class SyncClient:
 
         pending 변경사항이 없으면 업로드를 건너뛴다.
         """
-        # pending 변경사항이 없으면 업로드 불필요
+        # pending 변경사항이 없고 dirty도 아니면 업로드 불필요
         pending_files = self._metadata_store.get_pending_files()
-        if not pending_files:
-            logger.debug("Sync: pending 없음, 업로드 건너뜀")
-            return
+        if not pending_files and not self._dirty:
+            # DB 파일 mtime으로 변경 여부 추가 확인
+            try:
+                db_mtime = os.path.getmtime(db_path)
+                if not hasattr(self, '_last_upload_mtime'):
+                    self._last_upload_mtime = 0.0
+                if db_mtime <= self._last_upload_mtime:
+                    return
+            except OSError:
+                return
 
-        logger.info("Sync: pending %d개 파일 업로드 시작", len(pending_files))
+        logger.info("Sync: pending %d개 파일 업로드 시작 (dirty=%s)", len(pending_files), self._dirty)
 
         db_path = self._metadata_store._db_path
         if not os.path.exists(db_path):
@@ -173,6 +181,8 @@ class SyncClient:
         pending_files = self._metadata_store.get_pending_files()
         for fm in pending_files:
             self._metadata_store.set_sync_status(fm.virtual_path, "synced")
+        self._dirty = False
+        self._last_upload_mtime = os.path.getmtime(db_path)
         logger.info("Metadata uploaded successfully.")
 
     async def upload_key(self, encrypted_blob: bytes) -> None:
@@ -248,6 +258,10 @@ class SyncClient:
             f"Key download failed after {_MAX_KEY_RETRIES} retries: "
             f"{last_error}"
         )
+
+    def mark_dirty(self) -> None:
+        """로컬 DB에 변경이 있음을 표시한다 (삭제 등 pending으로 추적되지 않는 변경)."""
+        self._dirty = True
 
     async def stop(self) -> None:
         """동기화 루프 중지."""
