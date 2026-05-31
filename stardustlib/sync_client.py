@@ -72,8 +72,9 @@ class SyncClient:
             return
 
         if response.status_code == 404:
-            # 서버에 metadata가 아직 없음 — 첫 동기화
-            logger.info("No server metadata found. Skipping merge.")
+            # 서버에 metadata가 아직 없음 — 로컬 데이터를 업로드
+            logger.info("No server metadata found. Uploading local metadata.")
+            await self._force_upload()
             return
 
         if response.status_code >= 400:
@@ -487,6 +488,37 @@ class SyncClient:
         )
         conn.commit()
 
+    async def _force_upload(self) -> None:
+        """pending 여부와 관계없이 로컬 metadata_db를 서버에 강제 업로드한다."""
+        db_path = self._metadata_store._db_path
+        if not os.path.exists(db_path):
+            return
+
+        try:
+            token = await self._auth_client.get_valid_token()
+            with open(db_path, "rb") as f:
+                db_blob = f.read()
+
+            encrypted_blob = self._encrypt_blob(db_blob)
+
+            response = await self._client.put(
+                f"{self._server_url}/sync/metadata",
+                headers={"Authorization": f"Bearer {token}"},
+                content=encrypted_blob,
+            )
+            if response.status_code < 400:
+                try:
+                    resp_data = response.json()
+                    if "version" in resp_data:
+                        self._last_synced_version = resp_data["version"]
+                except Exception:
+                    pass
+                logger.info("Force upload completed.")
+            else:
+                logger.warning("Force upload failed: HTTP %d", response.status_code)
+        except Exception as e:
+            logger.warning("Force upload error: %s", e)
+
     async def _download_and_merge(self) -> None:
         """서버 metadata version을 확인하고, 로컬보다 높으면 다운로드하여 병합한다."""
         logger.debug("_download_and_merge called (last_synced_version=%d)", self._last_synced_version)
@@ -507,7 +539,9 @@ class SyncClient:
             server_status = status_resp.json()
             server_version = server_status.get("version")
             if server_version is None:
-                return  # 서버에 metadata 없음
+                # 서버에 metadata 없음 — 로컬 데이터 강제 업로드
+                await self._force_upload()
+                return
 
             # 로컬 version과 비교
             if server_version <= self._last_synced_version:
