@@ -260,11 +260,21 @@ class SyncClient:
 
     async def _periodic_loop(self) -> None:
         """interval_seconds마다 upload_metadata()를 호출하는 루프."""
+        logger.info("_periodic_loop started, interval=%ds", self._interval_seconds)
+        # 최초 기동 시 즉시 동기화
+        try:
+            logger.info("Periodic sync cycle: initial sync on start")
+            await self._download_and_merge()
+            await self.upload_metadata()
+        except Exception as e:
+            logger.error("Periodic sync initial error: %s", e)
+
         while self._running:
             try:
                 await asyncio.sleep(self._interval_seconds)
                 if not self._running:
                     break
+                logger.info("Periodic sync cycle: starting download+upload")
                 # 양방향 동기화: 다운로드(병합) → 업로드
                 await self._download_and_merge()
                 await self.upload_metadata()
@@ -479,6 +489,7 @@ class SyncClient:
 
     async def _download_and_merge(self) -> None:
         """서버 metadata version을 확인하고, 로컬보다 높으면 다운로드하여 병합한다."""
+        logger.debug("_download_and_merge called (last_synced_version=%d)", self._last_synced_version)
         try:
             token = await self._auth_client.get_valid_token()
 
@@ -488,6 +499,9 @@ class SyncClient:
                 headers={"Authorization": f"Bearer {token}"},
             )
             if status_resp.status_code != 200:
+                logger.warning(
+                    "Sync status check failed: HTTP %d", status_resp.status_code
+                )
                 return
 
             server_status = status_resp.json()
