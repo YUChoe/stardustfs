@@ -118,6 +118,11 @@ class SyncClient:
 
         try:
             token = await self._auth_client.get_valid_token()
+
+            # WAL 모드에서 최신 데이터를 포함하려면 checkpoint 수행
+            conn = self._metadata_store._get_conn()
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
             with open(db_path, "rb") as f:
                 db_blob = f.read()
 
@@ -496,6 +501,11 @@ class SyncClient:
 
         try:
             token = await self._auth_client.get_valid_token()
+
+            # WAL 모드에서 최신 데이터를 포함하려면 checkpoint 수행
+            conn = self._metadata_store._get_conn()
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
             with open(db_path, "rb") as f:
                 db_blob = f.read()
 
