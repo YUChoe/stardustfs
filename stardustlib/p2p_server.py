@@ -90,8 +90,12 @@ class P2PServer:
     # --- 엔드포인트 핸들러 ---
 
     async def handle_read(self, request: web.Request) -> web.Response:
-        """POST /p2p/read: 파일 읽기."""
-        body = await self._parse_and_verify(request)
+        """POST /p2p/read: 파일 읽기.
+
+        요청에 share_token이 있으면 user_id 일치 검증 대신 중앙 서버에
+        공유 토큰 검증을 위임한다 (읽기 전용 교차 사용자 공유, MVP5).
+        """
+        body = await self._parse_and_verify(request, allow_share_token=True)
         if isinstance(body, web.Response):
             return body
 
@@ -269,9 +273,14 @@ class P2PServer:
     # --- 내부 헬퍼 ---
 
     async def _parse_and_verify(
-        self, request: web.Request
+        self, request: web.Request, allow_share_token: bool = False
     ) -> dict | web.Response:
-        """요청 본문을 파싱하고 auth_token을 검증한다.
+        """요청 본문을 파싱하고 인가를 검증한다.
+
+        기본 인가: auth_token JWT를 중앙 서버에 위임 검증 + user_id 일치 확인.
+        allow_share_token=True이고 요청에 share_token이 있으면, user_id 일치
+        검증 대신 중앙 서버에 공유 토큰을 검증 위임한다 (요청 physical_path가
+        토큰에 묶인 경로와 일치해야 함).
 
         성공 시 파싱된 body dict를 반환, 실패 시 에러 Response를 반환.
         """
@@ -281,6 +290,17 @@ class P2PServer:
             return web.json_response(
                 {"error": "Invalid JSON body"}, status=400
             )
+
+        # 공유 토큰 경로 (읽기 전용): user_id 검증 우회, 경로 격리 검증
+        share_token = body.get("share_token")
+        if allow_share_token and share_token:
+            physical_path = body.get("physical_path", "")
+            verify_result = await self._verify_share_token(
+                share_token, physical_path
+            )
+            if isinstance(verify_result, web.Response):
+                return verify_result
+            return body
 
         auth_token = body.get("auth_token")
         if not auth_token:
@@ -294,6 +314,50 @@ class P2PServer:
             return verify_result
 
         return body
+
+    async def _verify_share_token(
+        self, share_token: str, physical_path: str
+    ) -> dict | web.Response:
+        """중앙 서버 POST /shares/{token}/verify로 공유 토큰을 검증한다.
+
+        유효(존재·미만료)하고 physical_path가 토큰에 묶인 경로와 일치하면
+        검증 결과 dict, 아니면 에러 Response를 반환한다.
+        - 무효/만료: 401
+        - 경로 불일치: 403
+        """
+        try:
+            async with httpx.AsyncClient(
+                timeout=AUTH_VERIFY_TIMEOUT
+            ) as client:
+                resp = await client.post(
+                    f"{self._server_url}/shares/{share_token}/verify",
+                    json={"physical_path": physical_path},
+                )
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            logger.warning(
+                "Share verification failed (server unreachable): %s", e
+            )
+            return web.json_response(
+                {"error": "Auth service unavailable"}, status=503
+            )
+
+        if resp.status_code != 200:
+            return web.json_response(
+                {"error": "Invalid or expired share token"}, status=401
+            )
+
+        data = resp.json()
+        if not data.get("valid"):
+            # device_id가 응답에 있으면 토큰은 존재하나 경로 불일치 → 403
+            if data.get("device_id"):
+                return web.json_response(
+                    {"error": "Share token path mismatch"}, status=403
+                )
+            return web.json_response(
+                {"error": "Invalid or expired share token"}, status=401
+            )
+
+        return data
 
     async def _verify_token(
         self, token: str
