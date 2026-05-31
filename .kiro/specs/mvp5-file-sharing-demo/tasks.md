@@ -1,5 +1,9 @@
 # Implementation Plan: MVP5 파일 공유 데모 (최소 슬라이스)
 
+> ⚠️ 방향 결정(2026-05): 평문 사용자 간 공유로서의 MVP5는 폐기됨(상세는
+> requirements.md / ROADMAP.md). 아래 태스크는 PoC로 완료된 상태이며,
+> share_token 인가 인프라는 MVP3 암호화 리플리케이션으로 승계된다.
+
 ## Overview
 
 기존 MVP2 P2P 인프라 위에 교차 사용자 읽기 전용 공유 레이어를 최소한으로 추가한다. 서버에 shares 테이블 + 3개 엔드포인트, 클라이언트 P2PServer에 share_token 인가 경로를 추가하고, 사용자 A 발급 → 사용자 B 읽기 흐름을 통합 테스트로 검증한다.
