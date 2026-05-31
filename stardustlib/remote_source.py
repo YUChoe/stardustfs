@@ -133,9 +133,13 @@ class RemoteSource(StorageSource):
             return
 
         data = response.json()
-        address = data.get("address")
+        # 서버 RoutingResponse는 connection_address 필드를 반환한다
+        # (구버전 호환을 위해 address도 fallback으로 허용)
+        address = data.get("connection_address") or data.get("address")
         if not address:
-            self._deactivate("Routing response missing 'address' field")
+            self._deactivate(
+                "Routing response missing 'connection_address' field"
+            )
             return
 
         self._peer_address = address
