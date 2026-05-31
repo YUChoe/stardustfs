@@ -139,14 +139,14 @@ class TestRegister:
     async def test_register_sends_correct_payload(
         self, device_manager, auth_client
     ):
-        """등록 시 device_name, os_info, connection_address를 전송한다."""
+        """등록 시 name, os, connection_address를 전송한다."""
         captured_kwargs = {}
 
         async def capture_post(*args, **kwargs):
             captured_kwargs.update(kwargs)
             return httpx.Response(
                 200,
-                json={"device_id": "dev-789"},
+                json={"id": "dev-789"},
                 request=httpx.Request("POST", "https://api.example.com/devices"),
             )
 
@@ -154,8 +154,8 @@ class TestRegister:
             await device_manager.register()
 
         payload = captured_kwargs["json"]
-        assert payload["device_name"] == "test-device"
-        assert "os_info" in payload
+        assert payload["name"] == "test-device"
+        assert "os" in payload
         assert "connection_address" in payload
         assert captured_kwargs["headers"]["Authorization"] == "Bearer fake-token"
 

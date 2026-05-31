@@ -115,6 +115,7 @@ class FileMetadata:
     version: int = 1        # 메타데이터 버전 (동기화용)
     device_id: str | None = None    # 마지막 수정 디바이스 ID
     sync_status: str = "synced"     # synced | pending | conflict
+    deleted: bool = False   # tombstone 여부 (삭제 동기화용)
 
 
 @dataclass

@@ -99,6 +99,7 @@ class MetadataStore:
         conn.executescript(_SCHEMA_SQL)
         conn.commit()
         self._migrate_to_v2()
+        self._migrate_to_v3()
         self._initialized = True
         logger.info("Metadata Store 초기화 완료: %s", self._db_path)
 
@@ -193,10 +194,40 @@ class MetadataStore:
             logger.error("스키마 마이그레이션 실패, 롤백 수행: %s", e)
             raise
 
+    def _migrate_to_v3(self) -> None:
+        """v2 → v3 스키마 마이그레이션을 수행한다.
+
+        - files 테이블에 deleted 컬럼 추가 (tombstone, 삭제 동기화용)
+        - schema_version을 3으로 갱신
+        이미 deleted 컬럼이 존재하면 아무 작업도 하지 않는다.
+        """
+        conn = self._get_conn()
+
+        cursor = conn.execute("PRAGMA table_info(files)")
+        columns = [row["name"] for row in cursor.fetchall()]
+        if "deleted" in columns:
+            return
+
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_version (id, version, migrated_at) "
+                "VALUES (1, 3, ?)",
+                (time.time(),),
+            )
+            conn.commit()
+            logger.info("MetadataStore v3 스키마 마이그레이션 완료 (tombstone)")
+        except Exception as e:
+            conn.rollback()
+            logger.error("v3 스키마 마이그레이션 실패, 롤백 수행: %s", e)
+            raise
+
     # --- 파일 메타데이터 CRUD ---
 
     _VALID_SYNC_STATUSES = ("synced", "pending", "conflict")
-
     def insert(
         self,
         virtual_path: str,
@@ -209,13 +240,30 @@ class MetadataStore:
         """파일 메타데이터를 삽입한다.
 
         version=1, sync_status="pending"으로 초기 삽입한다.
+        동일 경로에 tombstone(삭제 마커)이 남아 있으면 재활성화한다.
         """
         conn = self._get_conn()
+        # 동일 경로에 tombstone이 있으면 재활성화 (version 증가로 삭제보다 우선)
+        existing = conn.execute(
+            "SELECT version FROM files WHERE virtual_path = ?",
+            (virtual_path,),
+        ).fetchone()
+        if existing is not None:
+            conn.execute(
+                "UPDATE files SET source_id = ?, physical_path = ?, "
+                "file_size = ?, created_at = ?, modified_at = ?, "
+                "version = version + 1, sync_status = 'pending', deleted = 0 "
+                "WHERE virtual_path = ?",
+                (source_id, physical_path, file_size, created_at, modified_at,
+                 virtual_path),
+            )
+            conn.commit()
+            return
         conn.execute(
             "INSERT INTO files "
             "(virtual_path, source_id, physical_path, file_size, "
-            "created_at, modified_at, version, sync_status) "
-            "VALUES (?, ?, ?, ?, ?, ?, 1, 'pending')",
+            "created_at, modified_at, version, sync_status, deleted) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1, 'pending', 0)",
             (virtual_path, source_id, physical_path, file_size, created_at, modified_at),
         )
         conn.commit()
@@ -267,11 +315,14 @@ class MetadataStore:
         conn.commit()
 
     def get_pending_files(self) -> list[FileMetadata]:
-        """sync_status가 "pending"인 모든 파일 목록을 반환한다."""
+        """sync_status가 "pending"인 모든 파일 목록을 반환한다.
+
+        tombstone(deleted=1)도 pending이면 포함한다 (삭제 동기화 업로드 대상).
+        """
         conn = self._get_conn()
         cursor = conn.execute(
             "SELECT virtual_path, source_id, physical_path, file_size, "
-            "created_at, modified_at, version, device_id, sync_status "
+            "created_at, modified_at, version, device_id, sync_status, deleted "
             "FROM files WHERE sync_status = 'pending'"
         )
         results: list[FileMetadata] = []
@@ -286,24 +337,59 @@ class MetadataStore:
                 version=row["version"],
                 device_id=row["device_id"],
                 sync_status=row["sync_status"],
+                deleted=bool(row["deleted"]),
             ))
         return results
 
     def delete(self, virtual_path: str) -> None:
-        """파일 메타데이터를 삭제한다."""
+        """파일을 tombstone으로 표시한다 (soft delete).
+
+        실제 행을 제거하지 않고 deleted=1, version+1, sync_status='pending'으로
+        설정하여 삭제 사실이 다른 디바이스로 동기화되도록 한다.
+        """
         conn = self._get_conn()
         conn.execute(
-            "DELETE FROM files WHERE virtual_path = ?",
-            (virtual_path,),
+            "UPDATE files SET deleted = 1, version = version + 1, "
+            "sync_status = 'pending', modified_at = ? "
+            "WHERE virtual_path = ?",
+            (time.time(), virtual_path),
         )
         conn.commit()
 
     def lookup(self, virtual_path: str) -> FileMetadata | None:
-        """가상 경로로 파일 메타데이터를 조회한다."""
+        """가상 경로로 파일 메타데이터를 조회한다.
+
+        tombstone(deleted=1)은 존재하지 않는 것으로 간주하여 None을 반환한다.
+        """
         conn = self._get_conn()
         cursor = conn.execute(
             "SELECT virtual_path, source_id, physical_path, file_size, "
-            "created_at, modified_at, version, device_id, sync_status "
+            "created_at, modified_at, version, device_id, sync_status, deleted "
+            "FROM files WHERE virtual_path = ? AND deleted = 0",
+            (virtual_path,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return FileMetadata(
+            virtual_path=row["virtual_path"],
+            source_id=row["source_id"],
+            physical_path=row["physical_path"],
+            file_size=row["file_size"],
+            created_at=row["created_at"],
+            modified_at=row["modified_at"],
+            version=row["version"],
+            device_id=row["device_id"],
+            sync_status=row["sync_status"],
+            deleted=bool(row["deleted"]),
+        )
+
+    def lookup_any(self, virtual_path: str) -> FileMetadata | None:
+        """tombstone을 포함하여 가상 경로로 레코드를 조회한다 (동기화 병합용)."""
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "SELECT virtual_path, source_id, physical_path, file_size, "
+            "created_at, modified_at, version, device_id, sync_status, deleted "
             "FROM files WHERE virtual_path = ?",
             (virtual_path,),
         )
@@ -320,6 +406,7 @@ class MetadataStore:
             version=row["version"],
             device_id=row["device_id"],
             sync_status=row["sync_status"],
+            deleted=bool(row["deleted"]),
         )
 
     # --- 디렉토리 메타데이터 ---
@@ -365,7 +452,7 @@ class MetadataStore:
 
         cursor = conn.execute(
             "SELECT virtual_path, file_size, created_at, modified_at "
-            "FROM files WHERE virtual_path LIKE ? || '%'",
+            "FROM files WHERE virtual_path LIKE ? || '%' AND deleted = 0",
             (directory_path,),
         )
         for row in cursor.fetchall():

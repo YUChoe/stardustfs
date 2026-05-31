@@ -74,14 +74,20 @@ class TestInitialSync:
     async def test_initial_sync_no_server_metadata(
         self, sync_client, httpx_mock
     ):
-        """서버에 metadata가 없으면 (404) 병합 없이 종료."""
+        """서버에 metadata가 없으면 (404) 로컬 DB를 강제 업로드한다."""
         httpx_mock.add_response(
             url="http://test-server/sync/metadata",
             method="GET",
             status_code=404,
         )
+        httpx_mock.add_response(
+            url="http://test-server/sync/metadata",
+            method="PUT",
+            json={"version": 1},
+            status_code=200,
+        )
         await sync_client.initial_sync()
-        # 에러 없이 완료
+        # 404 → force_upload PUT 수행, 에러 없이 완료
 
     @pytest.mark.asyncio
     async def test_initial_sync_network_error(
@@ -420,6 +426,12 @@ class TestPeriodicSync:
             interval_seconds=1,
         )
         httpx_mock.add_response(
+            url="http://test-server/sync/metadata/status",
+            method="GET",
+            json={"version": 0},
+            status_code=200,
+        )
+        httpx_mock.add_response(
             url="http://test-server/sync/metadata",
             method="PUT",
             status_code=200,
@@ -446,6 +458,12 @@ class TestPeriodicSync:
             metadata_store=metadata_store,
             conflict_resolver=conflict_resolver,
             interval_seconds=1,
+        )
+        httpx_mock.add_response(
+            url="http://test-server/sync/metadata/status",
+            method="GET",
+            json={"version": 0},
+            status_code=200,
         )
         httpx_mock.add_response(
             url="http://test-server/sync/metadata",

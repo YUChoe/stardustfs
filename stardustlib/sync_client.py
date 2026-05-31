@@ -39,6 +39,7 @@ class SyncClient:
         conflict_resolver: ConflictResolver,
         interval_seconds: int = 30,
         encryption_key: bytes | None = None,
+        jbod_manager=None,
     ) -> None:
         self._auth_client = auth_client
         self._server_url = server_url.rstrip("/")
@@ -46,11 +47,11 @@ class SyncClient:
         self._conflict_resolver = conflict_resolver
         self._interval_seconds = interval_seconds
         self._encryption_key = encryption_key
+        self._jbod_manager = jbod_manager  # tombstone 전파 시 물리 파일 삭제용 (선택)
         self._sync_task: asyncio.Task[None] | None = None
         self._running = False
         self._consecutive_failures = 0
         self._last_synced_version = 0
-        self._dirty = False  # 로컬 DB에 변경이 있으면 True
         self._client = httpx.AsyncClient(timeout=_REQUEST_TIMEOUT)
 
     async def initial_sync(self) -> None:
@@ -102,27 +103,20 @@ class SyncClient:
     async def upload_metadata(self) -> None:
         """로컬 metadata_db 스냅샷을 서버에 업로드.
 
-        pending 변경사항이 없으면 업로드를 건너뛴다.
+        pending 변경사항(생성/수정/삭제 tombstone)이 없으면 업로드를 건너뛴다.
         """
-        # pending 변경사항이 없고 dirty도 아니면 업로드 불필요
-        pending_files = self._metadata_store.get_pending_files()
-        if not pending_files and not self._dirty:
-            # DB 파일 mtime으로 변경 여부 추가 확인
-            try:
-                db_mtime = os.path.getmtime(db_path)
-                if not hasattr(self, '_last_upload_mtime'):
-                    self._last_upload_mtime = 0.0
-                if db_mtime <= self._last_upload_mtime:
-                    return
-            except OSError:
-                return
-
-        logger.info("Sync: pending %d개 파일 업로드 시작 (dirty=%s)", len(pending_files), self._dirty)
-
         db_path = self._metadata_store._db_path
+
+        # pending 변경사항이 없으면 업로드 불필요 (삭제는 tombstone으로 pending에 포함됨)
+        pending_files = self._metadata_store.get_pending_files()
+        if not pending_files:
+            return
+
         if not os.path.exists(db_path):
             logger.warning("Metadata DB not found: %s", db_path)
             return
+
+        logger.info("Sync: pending %d개 파일 업로드 시작", len(pending_files))
 
         try:
             token = await self._auth_client.get_valid_token()
@@ -178,11 +172,8 @@ class SyncClient:
         except Exception:
             pass
         # pending → synced 갱신
-        pending_files = self._metadata_store.get_pending_files()
         for fm in pending_files:
             self._metadata_store.set_sync_status(fm.virtual_path, "synced")
-        self._dirty = False
-        self._last_upload_mtime = os.path.getmtime(db_path)
         logger.info("Metadata uploaded successfully.")
 
     async def upload_key(self, encrypted_blob: bytes) -> None:
@@ -260,8 +251,11 @@ class SyncClient:
         )
 
     def mark_dirty(self) -> None:
-        """로컬 DB에 변경이 있음을 표시한다 (삭제 등 pending으로 추적되지 않는 변경)."""
-        self._dirty = True
+        """deprecated: tombstone 도입으로 삭제도 pending으로 추적되어 더 이상 불필요.
+
+        하위 호환을 위해 no-op으로 유지한다.
+        """
+        return
 
     async def stop(self) -> None:
         """동기화 루프 중지."""
@@ -329,11 +323,11 @@ class SyncClient:
                     f"새 디바이스라면 먼저 key 복원(GET /sync/key)을 수행하세요."
                 ) from e
 
-            # 서버 DB의 모든 파일 레코드 조회
+            # 서버 DB의 모든 파일 레코드 조회 (tombstone 포함)
             server_conn = server_store._get_conn()
             cursor = server_conn.execute(
                 "SELECT virtual_path, source_id, physical_path, file_size, "
-                "created_at, modified_at, version, device_id, sync_status "
+                "created_at, modified_at, version, device_id, sync_status, deleted "
                 "FROM files"
             )
             server_records: list[FileMetadata] = []
@@ -348,6 +342,7 @@ class SyncClient:
                     version=row["version"],
                     device_id=row["device_id"],
                     sync_status=row["sync_status"],
+                    deleted=bool(row["deleted"]),
                 ))
 
             # 각 서버 레코드에 대해 로컬과 비교 병합
@@ -366,20 +361,24 @@ class SyncClient:
                 pass
 
     def _merge_record(self, server_rec: FileMetadata) -> None:
-        """단일 레코드의 version 비교 기반 병합 로직.
+        """단일 레코드의 version 비교 기반 병합 로직 (tombstone 포함).
 
         병합 규칙:
         1. server_version > local_base_version AND local_version > local_base_version
            → ConflictResolver.resolve_conflict()
         2. server_version > local_version (충돌 아님)
-           → 서버 메타데이터로 로컬 갱신
+           → 서버 메타데이터로 로컬 갱신 (서버가 tombstone이면 로컬도 삭제 전파)
         3. local_version > server_version (충돌 아님)
            → 다음 업로드 시 반영 (아무 작업 안 함)
         4. version 동일 → 변경 없음
         """
-        local_rec = self._metadata_store.lookup(server_rec.virtual_path)
+        # tombstone도 비교 대상에 포함하기 위해 lookup_any 사용
+        local_rec = self._metadata_store.lookup_any(server_rec.virtual_path)
 
         if local_rec is None:
+            if server_rec.deleted:
+                # 로컬에 없는 삭제 레코드 — 전파할 대상 없음
+                return
             # 로컬에 없는 파일 — 서버에서 새로 추가된 파일
             self._insert_from_server(server_rec)
             logger.info(
@@ -410,11 +409,17 @@ class SyncClient:
             )
             self._handle_conflict(server_rec, local_rec)
         elif server_version > local_version:
-            # 서버가 더 최신 → 서버 메타데이터로 갱신
-            logger.info(
-                "Merge: updated from server: %s (server_v=%d > local_v=%d)",
-                server_rec.virtual_path, server_version, local_version,
-            )
+            # 서버가 더 최신 → 서버 메타데이터로 갱신 (tombstone 전파 포함)
+            if server_rec.deleted:
+                logger.info(
+                    "Merge: deleted from server: %s (server_v=%d > local_v=%d)",
+                    server_rec.virtual_path, server_version, local_version,
+                )
+            else:
+                logger.info(
+                    "Merge: updated from server: %s (server_v=%d > local_v=%d)",
+                    server_rec.virtual_path, server_version, local_version,
+                )
             self._update_from_server(server_rec)
         elif local_version > server_version:
             # 로컬이 더 최신 → 다음 업로드 시 반영 (아무 작업 안 함)
@@ -444,15 +449,16 @@ class SyncClient:
             )
 
     def _insert_from_server(self, server_rec: FileMetadata) -> None:
-        """서버 레코드를 로컬 DB에 삽입 (이미 존재하면 갱신)."""
-        existing = self._metadata_store.lookup(server_rec.virtual_path)
+        """서버 레코드를 로컬 DB에 삽입 (이미 존재하면 갱신). tombstone 포함."""
+        existing = self._metadata_store.lookup_any(server_rec.virtual_path)
+        deleted_val = 1 if server_rec.deleted else 0
         if existing is not None:
             # 기존 레코드 갱신
             conn = self._metadata_store._get_conn()
             conn.execute(
                 "UPDATE files SET source_id = ?, physical_path = ?, "
                 "file_size = ?, created_at = ?, modified_at = ?, "
-                "version = ?, device_id = ?, sync_status = 'synced' "
+                "version = ?, device_id = ?, sync_status = 'synced', deleted = ? "
                 "WHERE virtual_path = ?",
                 (
                     server_rec.source_id,
@@ -462,6 +468,7 @@ class SyncClient:
                     server_rec.modified_at,
                     server_rec.version,
                     server_rec.device_id,
+                    deleted_val,
                     server_rec.virtual_path,
                 ),
             )
@@ -472,8 +479,8 @@ class SyncClient:
             conn.execute(
                 "INSERT INTO files "
                 "(virtual_path, source_id, physical_path, file_size, "
-                "created_at, modified_at, version, device_id, sync_status) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'synced')",
+                "created_at, modified_at, version, device_id, sync_status, deleted) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'synced', ?)",
                 (
                     server_rec.virtual_path,
                     server_rec.source_id,
@@ -483,17 +490,39 @@ class SyncClient:
                     server_rec.modified_at,
                     server_rec.version,
                     server_rec.device_id,
+                    deleted_val,
                 ),
             )
             conn.commit()
 
     def _update_from_server(self, server_rec: FileMetadata) -> None:
-        """서버 메타데이터로 로컬 레코드를 갱신."""
+        """서버 메타데이터로 로컬 레코드를 갱신. tombstone(deleted) 전파 포함.
+
+        서버 레코드가 tombstone이면 로컬 물리 파일도 삭제한다.
+        """
+        # tombstone 전파 시 물리 파일 삭제 (JBODManager 참조가 있을 때만)
+        if server_rec.deleted and self._jbod_manager is not None:
+            local_rec = self._metadata_store.lookup(server_rec.virtual_path)
+            if local_rec is not None:
+                try:
+                    source = self._jbod_manager._get_source_by_id(
+                        local_rec.source_id
+                    )
+                    if source is not None and source.is_active:
+                        source.delete(local_rec.physical_path)
+                except FileNotFoundError:
+                    pass
+                except Exception as e:
+                    logger.warning(
+                        "tombstone 물리 파일 삭제 실패 %s: %s",
+                        server_rec.virtual_path, e,
+                    )
+
         conn = self._metadata_store._get_conn()
         conn.execute(
             "UPDATE files SET source_id = ?, physical_path = ?, "
             "file_size = ?, modified_at = ?, "
-            "version = ?, device_id = ?, sync_status = 'synced' "
+            "version = ?, device_id = ?, sync_status = 'synced', deleted = ? "
             "WHERE virtual_path = ?",
             (
                 server_rec.source_id,
@@ -502,6 +531,7 @@ class SyncClient:
                 server_rec.modified_at,
                 server_rec.version,
                 server_rec.device_id,
+                1 if server_rec.deleted else 0,
                 server_rec.virtual_path,
             ),
         )
@@ -537,6 +567,9 @@ class SyncClient:
                         self._last_synced_version = resp_data["version"]
                 except Exception:
                     pass
+                # pending → synced 갱신 (중복 업로드로 인한 version 무한 증가 방지)
+                for fm in self._metadata_store.get_pending_files():
+                    self._metadata_store.set_sync_status(fm.virtual_path, "synced")
                 logger.info("Force upload completed.")
             else:
                 logger.warning("Force upload failed: HTTP %d", response.status_code)

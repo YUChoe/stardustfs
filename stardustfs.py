@@ -185,6 +185,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
             auth_client, server_url, metadata_store,
             conflict_resolver, interval_seconds,
             encryption_key=db_key,
+            jbod_manager=jbod_manager,
         )
 
         # P2P 서버 인스턴스 (복구 시 시작됨)
@@ -248,6 +249,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
         auth_client, server_url, metadata_store,
         conflict_resolver, interval_seconds,
         encryption_key=db_key,
+        jbod_manager=jbod_manager,
     )
 
     try:
@@ -270,6 +272,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
                 auth_client, server_url, metadata_store,
                 conflict_resolver, interval_seconds,
                 encryption_key=db_key,
+                jbod_manager=jbod_manager,
             )
             await sync_client.initial_sync()
             logger.info("key 복원 후 메타데이터 동기화 성공")

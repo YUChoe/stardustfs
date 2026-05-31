@@ -98,8 +98,12 @@ class SimulatedDevice:
         self.store.insert(path, f"src-{self.name}", f"phys/{path}", size, now, now)
 
     async def sync_upload(self):
-        """서버에 metadata를 업로드한다."""
+        """서버에 metadata를 업로드한다 (강제)."""
         await self.sync_client._force_upload()
+
+    async def sync_upload_pending(self):
+        """pending 변경이 있을 때만 업로드한다 (실제 주기 동기화 경로)."""
+        await self.sync_client.upload_metadata()
 
     async def sync_download(self):
         """서버에서 metadata를 다운로드하여 병합한다."""
@@ -218,7 +222,7 @@ async def test_bidirectional_sync(devices):
 
 
 async def test_file_deletion_sync(devices):
-    """케이스 3: A에서 파일 삭제 → 업로드 → B에서 다운로드 → B에서도 삭제됨."""
+    """케이스 3: A에서 파일 삭제(tombstone) → 업로드 → B에서 다운로드 → B에서도 삭제됨."""
     dev_a, dev_b = devices
 
     # A에서 파일 생성 + 업로드
@@ -229,18 +233,16 @@ async def test_file_deletion_sync(devices):
     await dev_b.sync_download()
     assert dev_b.lookup("/to-delete.txt") is not None
 
-    # A에서 삭제 + 업로드
+    # A에서 삭제(soft delete, tombstone) + 업로드
     dev_a.store.delete("/to-delete.txt")
     await dev_a.sync_upload()
 
-    # B에서 다운로드 → 파일이 사라져야 함
+    # B에서 다운로드 → tombstone이 전파되어 파일이 사라져야 함
     await dev_b.sync_download()
-    # 현재 설계에서는 삭제된 파일이 서버 DB에서 사라지므로
-    # B의 로컬에는 여전히 존재할 수 있음 (삭제 동기화 미구현)
-    # 이 테스트는 현재 동작을 기록하는 용도
     result = dev_b.lookup("/to-delete.txt")
-    if result is not None:
-        pytest.xfail("삭제 동기화 미구현 — 서버에서 삭제된 파일이 B에 남아있음")
+    assert result is None, (
+        "tombstone 삭제 동기화 실패 — A에서 삭제한 파일이 B에 남아있음"
+    )
 
 
 async def test_file_modification_sync(devices):
@@ -403,3 +405,101 @@ async def test_empty_db_upload_does_not_overwrite(devices):
     assert dev_a.lookup("/important.txt") is not None, (
         "B의 업로드가 A의 데이터를 덮어씀"
     )
+
+
+async def test_delete_then_recreate_sync(devices):
+    """케이스 10: A에서 삭제한 파일을 다시 생성하면 B에서 재생성이 반영됨.
+
+    tombstone(version=2) → 재생성(version=3) 순으로 version이 증가하므로
+    재생성이 삭제보다 우선해야 한다.
+    """
+    dev_a, dev_b = devices
+
+    # A에서 생성 + 업로드 (version=1)
+    await dev_a.create_file("/recreate.txt", 100)
+    await dev_a.sync_upload()
+
+    # B 다운로드 → 존재 확인
+    await dev_b.sync_download()
+    assert dev_b.lookup("/recreate.txt") is not None
+
+    # A에서 삭제(version=2) → 재생성(version=3)
+    dev_a.store.delete("/recreate.txt")
+    await dev_a.create_file("/recreate.txt", 777)
+    await dev_a.sync_upload()
+
+    # B 다운로드 → 재생성된 파일이 보여야 함
+    await dev_b.sync_download()
+    meta = dev_b.lookup("/recreate.txt")
+    assert meta is not None, "재생성된 파일이 B에 반영되지 않음"
+    assert meta.file_size == 777
+
+
+async def test_pending_gate_skips_upload_when_no_changes(devices):
+    """케이스 11: pending 변경이 없으면 upload_metadata는 서버 version을 올리지 않음.
+
+    삭제 후 dirty 상태에서는 업로드되고, 업로드 후에는 pending이 없어
+    추가 업로드가 일어나지 않아야 한다 (version 무한 증가 방지).
+    """
+    dev_a, dev_b = devices
+
+    # A에서 생성 후 강제 업로드로 서버 초기화
+    await dev_a.create_file("/gate.txt", 100)
+    await dev_a.sync_upload()
+
+    # 서버 현재 version 조회
+    v1 = await _server_version(dev_a)
+
+    # pending 없는 상태에서 upload_metadata 호출 → 업로드 건너뜀
+    await dev_a.sync_upload_pending()
+    v2 = await _server_version(dev_a)
+    assert v2 == v1, f"pending 없는데 업로드됨 (v1={v1}, v2={v2})"
+
+    # 삭제(tombstone, pending 발생) 후 upload_metadata → 업로드됨
+    dev_a.store.delete("/gate.txt")
+    await dev_a.sync_upload_pending()
+    v3 = await _server_version(dev_a)
+    assert v3 > v2, f"삭제 후에도 업로드 안 됨 (v2={v2}, v3={v3})"
+
+    # 다시 pending 없는 상태 → 업로드 건너뜀
+    await dev_a.sync_upload_pending()
+    v4 = await _server_version(dev_a)
+    assert v4 == v3, f"pending 없는데 또 업로드됨 (v3={v3}, v4={v4})"
+
+
+async def test_deletion_sync_via_pending_path(devices):
+    """케이스 12: 실제 주기 동기화 경로(upload_metadata)로 삭제가 전파됨."""
+    dev_a, dev_b = devices
+
+    # A 생성 + 업로드
+    await dev_a.create_file("/pending-delete.txt", 50)
+    await dev_a.sync_upload()
+
+    # B 다운로드 → 존재
+    await dev_b.sync_download()
+    assert dev_b.lookup("/pending-delete.txt") is not None
+
+    # A 삭제 후 pending 경로로 업로드
+    dev_a.store.delete("/pending-delete.txt")
+    await dev_a.sync_upload_pending()
+
+    # B 다운로드 → 삭제 전파 확인
+    await dev_b.sync_download()
+    assert dev_b.lookup("/pending-delete.txt") is None, (
+        "pending 경로 삭제 동기화 실패"
+    )
+
+
+async def _server_version(dev) -> int:
+    """서버의 현재 metadata version을 조회한다. 없으면 0."""
+    import httpx
+
+    token = await dev.auth_client.get_valid_token()
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(
+            f"{SERVER_URL}/sync/metadata/status",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    if resp.status_code != 200:
+        return 0
+    return resp.json().get("version") or 0
