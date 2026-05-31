@@ -80,6 +80,16 @@ class JBODManager:
         """source_id로 소스를 찾는다. O(1)."""
         return self._source_map.get(source_id)
 
+    def add_source(self, source: StorageSource) -> None:
+        """소스를 동적으로 추가한다 (예: 인증 후 RemoteSource 마운트).
+
+        동일 source_id가 이미 있으면 교체한다.
+        """
+        # 기존 동일 id 소스 제거 후 추가 (중복 방지)
+        self.sources = [s for s in self.sources if s.source_id != source.source_id]
+        self.sources.append(source)
+        self._source_map[source.source_id] = source
+
     def _generate_physical_path(self, virtual_path: str) -> str:
         """가상 경로에서 물리 경로를 생성한다.
 

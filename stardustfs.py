@@ -237,6 +237,9 @@ async def startup_v2(config: dict, config_path: str) -> None:
         _start_webdav(config, app)
         return
 
+    # (5-b) remote 소스 마운트 (인증 완료 후) — 같은 유저의 다른 디바이스 스토리지 접근
+    _mount_remote_sources(config, jbod_manager, auth_client, server_url)
+
     # (5) 메타데이터 동기화
     from stardustlib.conflict_resolver import ConflictResolver
     from stardustlib.sync_client import SyncClient
@@ -270,6 +273,8 @@ async def startup_v2(config: dict, config_path: str) -> None:
             app, jbod_manager, metadata_store, encryption_engine, db_key = (
                 _initialize_local_storage(config)
             )
+            # remote 소스 재마운트 (jbod_manager가 교체되었으므로)
+            _mount_remote_sources(config, jbod_manager, auth_client, server_url)
             # SyncClient 재생성
             conflict_resolver = ConflictResolver(metadata_store, device_name)
             sync_client = SyncClient(
@@ -324,6 +329,38 @@ async def startup_v2(config: dict, config_path: str) -> None:
         if p2p_server is not None:
             await p2p_server.stop()
         await auth_client.close()
+
+
+def _mount_remote_sources(
+    config: dict, jbod_manager, auth_client, server_url: str
+) -> None:
+    """설정의 remote 타입 소스를 RemoteSource로 생성해 JBOD에 마운트한다.
+
+    인증이 완료된 뒤(서버 모드) 호출한다. RemoteSource.initialize()는 중앙 서버
+    routing으로 대상 디바이스 주소를 조회하며, 실패 시 비활성 상태로 남는다
+    (오프라인 placeholder로 표시됨). 개별 소스 실패는 전체를 막지 않는다.
+    """
+    from stardustlib.remote_source import RemoteSource
+
+    logger = logging.getLogger(__name__)
+    for cfg in config.get("sources", []):  # type: ignore[attr-defined]
+        if cfg.get("type") != "remote":
+            continue
+        try:
+            source = RemoteSource(
+                cfg["id"], cfg["device_id"], auth_client, server_url
+            )
+            source.initialize()
+            jbod_manager.add_source(source)
+            status = "활성" if source.is_active else "비활성(오프라인)"
+            logger.info(
+                "RemoteSource 마운트: id=%s device=%s (%s)",
+                cfg["id"], cfg["device_id"], status,
+            )
+        except Exception as e:
+            logger.warning(
+                "RemoteSource 마운트 실패 id=%s: %s", cfg.get("id"), e
+            )
 
 
 def _initialize_local_storage(config: dict) -> tuple:
