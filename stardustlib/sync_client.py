@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import tempfile
@@ -27,6 +28,7 @@ _REQUEST_TIMEOUT = 10.0
 _MAX_KEY_RETRIES = 3
 _MAX_UPLOAD_FAILURES = 3
 _MAX_CAS_RETRIES = 5  # 낙관적 잠금(CAS) 충돌 시 재병합·재시도 횟수
+_DEFAULT_RETENTION_DAYS = 30  # status에서 받지 못한 경우의 tombstone 보관기간 기본값
 
 
 class SyncClient:
@@ -53,6 +55,10 @@ class SyncClient:
         self._running = False
         self._consecutive_failures = 0
         self._last_synced_version = 0
+        # tombstone 보관기간(초). status 응답에서 갱신됨. 기본 30일.
+        self._retention_seconds: float = _DEFAULT_RETENTION_DAYS * 86400
+        # last_sync_at 보존 파일 (메타데이터 DB 외부)
+        self._syncstate_path = f"{metadata_store._db_path}.syncstate.json"
         self._client = httpx.AsyncClient(timeout=_REQUEST_TIMEOUT)
 
     async def initial_sync(self) -> None:
@@ -120,6 +126,9 @@ class SyncClient:
         if not os.path.exists(db_path):
             logger.warning("Metadata DB not found: %s", db_path)
             return
+
+        # 업로드 전 만료된 tombstone 정리 (서버에 정리된 상태가 반영되도록)
+        self._gc_tombstones()
 
         for attempt in range(1, _MAX_CAS_RETRIES + 1):
             pending_files = self._metadata_store.get_pending_files()
@@ -198,6 +207,7 @@ class SyncClient:
             # pending → synced 갱신
             for fm in pending_files:
                 self._metadata_store.set_sync_status(fm.virtual_path, "synced")
+            self._record_sync_success()
             logger.info("Metadata uploaded successfully.")
             return
 
@@ -286,6 +296,115 @@ class SyncClient:
         하위 호환을 위해 no-op으로 유지한다.
         """
         return
+
+    # --- tombstone GC / stale 재조정 ---
+
+    def _gc_tombstones(self) -> None:
+        """보관기간이 지난 tombstone을 로컬 메타데이터에서 제거한다.
+
+        서버는 암호화 blob만 보관하므로 GC는 클라이언트에서만 수행된다.
+        활성 레코드는 영향받지 않는다.
+        """
+        try:
+            removed = self._metadata_store.purge_expired_tombstones(
+                self._retention_seconds
+            )
+            if removed > 0:
+                logger.info("Tombstone GC: %d개 만료 삭제 레코드 정리", removed)
+        except Exception as e:
+            logger.warning("Tombstone GC 실패: %s", e)
+
+    def _read_last_sync_at(self) -> float | None:
+        """syncstate 파일에서 마지막 성공 동기화 시각을 읽는다. 없으면 None."""
+        try:
+            with open(self._syncstate_path, encoding="utf-8") as f:
+                data = json.load(f)
+            value = data.get("last_sync_at")
+            return float(value) if value is not None else None
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+
+    def _record_sync_success(self) -> None:
+        """동기화 성공 시각을 syncstate 파일에 기록한다."""
+        try:
+            tmp = f"{self._syncstate_path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"last_sync_at": time.time()}, f)
+            os.replace(tmp, self._syncstate_path)
+        except OSError as e:
+            logger.warning("last_sync_at 기록 실패: %s", e)
+
+    def _is_stale(self) -> bool:
+        """마지막 동기화 후 보관기간을 초과했으면 stale(장기 오프라인)로 판정한다.
+
+        syncstate 파일이 없으면(최초 구동/새 디바이스) stale이 아니다.
+        """
+        last_sync_at = self._read_last_sync_at()
+        if last_sync_at is None:
+            return False
+        return (time.time() - last_sync_at) > self._retention_seconds
+
+    async def _fetch_retention_days(self) -> None:
+        """서버 status에서 tombstone_retention_days를 받아 보관기간을 갱신한다."""
+        try:
+            token = await self._auth_client.get_valid_token()
+            resp = await self._client.get(
+                f"{self._server_url}/sync/metadata/status",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if resp.status_code == 200:
+                days = resp.json().get("tombstone_retention_days")
+                if isinstance(days, int) and days > 0:
+                    self._retention_seconds = days * 86400
+        except Exception as e:
+            logger.debug("retention_days 조회 실패, 기본값 유지: %s", e)
+
+    async def reconcile_if_stale(self) -> bool:
+        """장기 오프라인 디바이스면 서버 정본으로 재조정(re-baseline)한다.
+
+        오프라인 중에는 파일 변경이 불가능하므로, 정상적으로는 pending이 없어
+        서버 정본을 전면 채택(initial_sync)하면 된다. 단, 종료 직전 사이클의
+        동기화 실패로 pending이 남은 경우에만 해당 레코드를 conflict copy로
+        격리 보존한 뒤 재수신한다.
+
+        Returns:
+            재조정을 수행했으면 True, stale이 아니면 False.
+        """
+        await self._fetch_retention_days()
+        if not self._is_stale():
+            return False
+
+        logger.warning(
+            "장기 오프라인 디바이스 감지(stale) — 서버 정본으로 재조정 수행"
+        )
+
+        # 종료 직전 동기화 실패로 남은 pending 변경을 격리 보존
+        pending = self._metadata_store.get_pending_files()
+        isolated = 0
+        for fm in pending:
+            if fm.deleted:
+                continue  # 삭제 tombstone은 격리 대상 아님
+            try:
+                conflict_path = self._conflict_resolver.generate_conflict_name(
+                    fm.virtual_path
+                )
+                self._metadata_store.rename_path(fm.virtual_path, conflict_path)
+                self._metadata_store.set_sync_status(conflict_path, "pending")
+                isolated += 1
+                logger.info(
+                    "stale 재조정: 미동기 변경 격리 %s → %s",
+                    fm.virtual_path, conflict_path,
+                )
+            except Exception as e:
+                logger.warning("미동기 변경 격리 실패 %s: %s", fm.virtual_path, e)
+
+        # 서버 정본 전면 채택. 격리한 레코드는 pending으로 남아 다음 업로드에 포함된다.
+        self._last_synced_version = 0
+        await self.initial_sync()
+        if isolated:
+            await self.upload_metadata()
+        logger.info("stale 재조정 완료 (격리 %d건)", isolated)
+        return True
 
     async def stop(self) -> None:
         """동기화 루프 중지."""
@@ -600,6 +719,7 @@ class SyncClient:
                 # pending → synced 갱신 (중복 업로드로 인한 version 무한 증가 방지)
                 for fm in self._metadata_store.get_pending_files():
                     self._metadata_store.set_sync_status(fm.virtual_path, "synced")
+                self._record_sync_success()
                 logger.info("Force upload completed.")
             else:
                 logger.warning("Force upload failed: HTTP %d", response.status_code)
@@ -625,6 +745,10 @@ class SyncClient:
 
             server_status = status_resp.json()
             server_version = server_status.get("version")
+            # tombstone 보관기간 정책 갱신 (서버가 알려준 값)
+            days = server_status.get("tombstone_retention_days")
+            if isinstance(days, int) and days > 0:
+                self._retention_seconds = days * 86400
             if server_version is None:
                 # 서버에 metadata 없음 — 로컬 데이터 강제 업로드
                 await self._force_upload()
@@ -644,6 +768,8 @@ class SyncClient:
 
             await self._merge_server_metadata(response.content)
             self._last_synced_version = server_version
+            self._gc_tombstones()
+            self._record_sync_success()
             logger.info(
                 "Periodic sync: merged server version %d", server_version
             )

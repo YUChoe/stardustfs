@@ -356,6 +356,27 @@ class MetadataStore:
         )
         conn.commit()
 
+    def purge_expired_tombstones(self, retention_seconds: float) -> int:
+        """보관기간이 지난 tombstone을 물리적으로 제거한다 (GC).
+
+        deleted=1이고 modified_at이 (현재시각 - retention_seconds)보다 오래된
+        레코드만 삭제한다. 활성(deleted=0) 레코드는 절대 삭제하지 않는다.
+
+        Args:
+            retention_seconds: tombstone 보관기간(초).
+
+        Returns:
+            삭제된 tombstone 레코드 수.
+        """
+        cutoff = time.time() - retention_seconds
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "DELETE FROM files WHERE deleted = 1 AND modified_at < ?",
+            (cutoff,),
+        )
+        conn.commit()
+        return cursor.rowcount if cursor.rowcount is not None else 0
+
     def lookup(self, virtual_path: str) -> FileMetadata | None:
         """가상 경로로 파일 메타데이터를 조회한다.
 

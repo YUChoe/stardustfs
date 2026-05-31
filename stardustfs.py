@@ -253,7 +253,11 @@ async def startup_v2(config: dict, config_path: str) -> None:
     )
 
     try:
-        await sync_client.initial_sync()
+        # 장기 오프라인(stale) 디바이스면 서버 정본으로 재조정.
+        # 재조정 시 내부에서 initial_sync까지 수행하므로 중복 호출하지 않는다.
+        reconciled = await sync_client.reconcile_if_stale()
+        if not reconciled:
+            await sync_client.initial_sync()
     except KeyMismatchError as e:
         logger.warning("key 불일치 감지: %s", e)
         logger.info("서버에서 올바른 key를 복원합니다...")

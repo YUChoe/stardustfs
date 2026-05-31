@@ -510,3 +510,56 @@ async def _server_version(dev) -> int:
     if resp.status_code != 200:
         return 0
     return resp.json().get("version") or 0
+
+
+async def test_tombstone_gc_removes_expired(devices):
+    """케이스 13: 보관기간이 지난 tombstone은 GC로 정리된다."""
+    dev_a, dev_b = devices
+
+    # A에서 파일 생성·업로드
+    await dev_a.create_file("/gc-target.txt", 50)
+    await dev_a.sync_upload()
+
+    # A에서 삭제 (tombstone 생성)
+    dev_a.store.delete("/gc-target.txt")
+
+    # tombstone의 modified_at을 과거로 조작 (보관기간 초과 시뮬레이션)
+    conn = dev_a.store._get_conn()
+    conn.execute(
+        "UPDATE files SET modified_at = ? WHERE virtual_path = '/gc-target.txt'",
+        (time.time() - 40 * 86400,),
+    )
+    conn.commit()
+
+    # 보관기간을 30일로 설정하고 GC 수행
+    dev_a.sync_client._retention_seconds = 30 * 86400
+    removed = dev_a.store.purge_expired_tombstones(30 * 86400)
+
+    assert removed == 1
+    # tombstone이 물리적으로 제거됨 (lookup_any로도 조회 안 됨)
+    assert dev_a.store.lookup_any("/gc-target.txt") is None
+
+
+async def test_tombstone_gc_preserves_active_and_fresh(devices):
+    """케이스 14: GC는 활성 파일과 최근 tombstone을 보존한다."""
+    dev_a, _dev_b = devices
+
+    # 활성 파일 (오래됨)
+    await dev_a.create_file("/keep-active.txt", 10)
+    conn = dev_a.store._get_conn()
+    conn.execute(
+        "UPDATE files SET modified_at = ? WHERE virtual_path = '/keep-active.txt'",
+        (time.time() - 100 * 86400,),
+    )
+    conn.commit()
+
+    # 최근 삭제된 tombstone
+    await dev_a.create_file("/recent-delete.txt", 10)
+    dev_a.store.delete("/recent-delete.txt")  # modified_at = now
+
+    dev_a.store.purge_expired_tombstones(30 * 86400)
+
+    # 활성 파일은 오래돼도 보존
+    assert dev_a.store.lookup("/keep-active.txt") is not None
+    # 최근 tombstone은 보관기간 내라 보존 (lookup_any로 확인)
+    assert dev_a.store.lookup_any("/recent-delete.txt") is not None
