@@ -47,6 +47,26 @@ def _get_local_ip() -> str:
         return "127.0.0.1"
 
 
+def _is_private_or_cgnat_ip(ip: str) -> bool:
+    """IP가 사설 대역 또는 도달 불가 대역인지 판별한다.
+
+    공인 라우팅이 불가능한 주소(사설 RFC1918, 루프백, 링크로컬, CGNAT 100.64/10
+    등)이면 True를 반환한다. 이중 NAT 환경에서 UPnP가 보고한 '외부 IP'가 실제로는
+    상위 NAT의 사설 주소인 경우를 걸러내기 위해 사용한다.
+
+    파싱 실패 시 보수적으로 True(신뢰 불가)를 반환한다.
+    """
+    import ipaddress
+
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return True
+    # is_global이 False면 공인 라우팅 불가(사설/루프백/링크로컬/예약 등)
+    # CGNAT 100.64.0.0/10은 is_global=False로 분류되므로 별도 처리 불필요
+    return not addr.is_global
+
+
 def _get_os_info() -> str:
     """운영체제 정보 문자열을 반환한다."""
     return f"{platform.system()} {platform.release()} ({platform.machine()})"
@@ -279,7 +299,6 @@ class DeviceManager:
 
             self._upnp_mapped = True
             self._upnp_external_port = self._p2p_port
-            self._connection_address = f"{external_ip}:{self._p2p_port}"
             self._igd_device = igd_device
             logger.info(
                 "UPnP 포트 매핑 성공: %s:%d → %s:%d",
@@ -288,6 +307,37 @@ class DeviceManager:
                 local_ip,
                 self._p2p_port,
             )
+
+            # 이중 NAT 검증: UPnP가 보고한 외부 IP가 사설/CGNAT 대역이면
+            # 그 주소는 외부에서 도달 불가하다. 서버 reflexive 조회로
+            # 진짜 공인 IP를 확인하여 connection_address를 보정한다.
+            if _is_private_or_cgnat_ip(external_ip):
+                logger.warning(
+                    "UPnP 외부 IP가 사설/CGNAT 대역(%s) — 이중 NAT 추정. "
+                    "서버 reflexive 조회로 공인 IP 확인 시도",
+                    external_ip,
+                )
+                reflexive_ip = await self.query_reflexive_ip()
+                if reflexive_ip and not _is_private_or_cgnat_ip(reflexive_ip):
+                    self._connection_address = (
+                        f"{reflexive_ip}:{self._p2p_port}"
+                    )
+                    logger.info(
+                        "reflexive 공인 IP로 connection_address 보정: %s "
+                        "(주의: 이중 NAT에서는 상위 NAT 포트포워딩이 없으면 "
+                        "여전히 도달 불가할 수 있음)",
+                        self._connection_address,
+                    )
+                else:
+                    # 공인 IP 확보 실패 — UPnP 외부 IP를 그대로 등록하되 경고
+                    self._connection_address = f"{external_ip}:{self._p2p_port}"
+                    logger.warning(
+                        "공인 IP 확인 실패 — 도달 불가 가능성이 있는 주소(%s)를 "
+                        "등록함. 수동 포트포워딩이 필요할 수 있음",
+                        self._connection_address,
+                    )
+            else:
+                self._connection_address = f"{external_ip}:{self._p2p_port}"
         except asyncio.TimeoutError:
             logger.warning("UPnP 검색 타임아웃 (10초)")
         except Exception as e:
@@ -324,6 +374,29 @@ class DeviceManager:
     def get_connection_address(self) -> str:
         """현재 P2P 접속 주소 (IP:port)를 반환한다."""
         return self._connection_address
+
+    async def query_reflexive_ip(self) -> str | None:
+        """서버에 server-reflexive(공인) IP를 조회한다 (HTTP STUN 등가).
+
+        GET /network/reflexive. 서버가 본 요청자의 공인 source IP를 반환한다.
+        실패 시 None을 반환한다(예외 없음).
+        """
+        try:
+            token = await self._auth_client.get_valid_token()
+            response = await self._client.get(
+                f"{self._server_url}/network/reflexive",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if response.status_code < 400:
+                ip = response.json().get("public_ip", "")
+                return ip or None
+            logger.warning(
+                "reflexive IP 조회 실패: HTTP %d", response.status_code
+            )
+            return None
+        except Exception as e:
+            logger.warning("reflexive IP 조회 중 예외: %s", e)
+            return None
 
     def set_connection_address(self, address: str) -> None:
         """P2P 접속 주소를 외부에서 설정한다 (UPnP 성공 시 사용)."""

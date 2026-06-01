@@ -18,6 +18,7 @@ from stardustlib.device_manager import (
     _HEARTBEAT_DEGRADED_INTERVAL,
     _HEARTBEAT_NORMAL_INTERVAL,
     _REGISTER_MAX_RETRIES,
+    _is_private_or_cgnat_ip,
 )
 from stardustlib.exceptions import DeviceRegistrationError
 
@@ -359,3 +360,81 @@ class TestConnectionAddress:
         """set_connection_address로 주소를 변경할 수 있다."""
         device_manager.set_connection_address("1.2.3.4:9090")
         assert device_manager.get_connection_address() == "1.2.3.4:9090"
+
+
+class TestPrivateIpClassification:
+    """_is_private_or_cgnat_ip 분류 테스트."""
+
+    @pytest.mark.parametrize(
+        "ip",
+        [
+            "10.100.9.213",   # 사설 10/8 (이중 NAT 상위 라우터)
+            "192.168.91.15",  # 사설 192.168/16
+            "172.16.5.4",     # 사설 172.16/12
+            "100.64.1.1",     # CGNAT 100.64/10
+            "127.0.0.1",      # 루프백
+            "169.254.1.1",    # 링크로컬
+            "not-an-ip",      # 파싱 실패 → 보수적 True
+        ],
+    )
+    def test_non_routable_returns_true(self, ip):
+        """공인 라우팅 불가 주소는 True."""
+        assert _is_private_or_cgnat_ip(ip) is True
+
+    @pytest.mark.parametrize(
+        "ip",
+        [
+            "121.134.198.224",  # 실제 공인 IP
+            "8.8.8.8",
+            "1.1.1.1",
+        ],
+    )
+    def test_public_returns_false(self, ip):
+        """공인 IP는 False."""
+        assert _is_private_or_cgnat_ip(ip) is False
+
+
+class TestQueryReflexiveIp:
+    """query_reflexive_ip() 메서드 테스트."""
+
+    @pytest.mark.asyncio
+    async def test_returns_public_ip_on_success(self, device_manager):
+        """200 응답이면 public_ip를 반환한다."""
+        mock_response = httpx.Response(
+            200,
+            json={"public_ip": "121.134.198.224"},
+            request=httpx.Request(
+                "GET", "https://api.example.com/network/reflexive"
+            ),
+        )
+        with patch.object(
+            device_manager._client, "get", return_value=mock_response
+        ):
+            result = await device_manager.query_reflexive_ip()
+        assert result == "121.134.198.224"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_error(self, device_manager):
+        """4xx/5xx 응답이면 None을 반환한다."""
+        mock_response = httpx.Response(
+            500,
+            request=httpx.Request(
+                "GET", "https://api.example.com/network/reflexive"
+            ),
+        )
+        with patch.object(
+            device_manager._client, "get", return_value=mock_response
+        ):
+            result = await device_manager.query_reflexive_ip()
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_exception(self, device_manager):
+        """네트워크 예외 시 None을 반환한다(예외 전파 안 함)."""
+        with patch.object(
+            device_manager._client,
+            "get",
+            side_effect=httpx.ConnectError("boom"),
+        ):
+            result = await device_manager.query_reflexive_ip()
+        assert result is None
