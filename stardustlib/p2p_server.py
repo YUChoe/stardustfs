@@ -99,12 +99,15 @@ class P2PServer:
         if isinstance(body, web.Response):
             return body
 
+        source = self._select_source(body)
+        if isinstance(source, web.Response):
+            return source
+
         physical_path = body.get("physical_path", "")
-        err = self._validate_path(physical_path)
+        err = self._validate_path(physical_path, source.path)
         if err is not None:
             return err
 
-        source = self._jbod_manager.sources[0]
         full_path = os.path.join(source.path, physical_path)
 
         if not os.path.isfile(full_path):
@@ -190,12 +193,15 @@ class P2PServer:
         if isinstance(body, web.Response):
             return body
 
+        source = self._select_source(body)
+        if isinstance(source, web.Response):
+            return source
+
         physical_path = body.get("physical_path", "")
-        err = self._validate_path(physical_path)
+        err = self._validate_path(physical_path, source.path)
         if err is not None:
             return err
 
-        source = self._jbod_manager.sources[0]
         full_path = os.path.join(source.path, physical_path)
 
         if not os.path.isdir(full_path):
@@ -212,12 +218,15 @@ class P2PServer:
         if isinstance(body, web.Response):
             return body
 
+        source = self._select_source(body)
+        if isinstance(source, web.Response):
+            return source
+
         physical_path = body.get("physical_path", "")
-        err = self._validate_path(physical_path)
+        err = self._validate_path(physical_path, source.path)
         if err is not None:
             return err
 
-        source = self._jbod_manager.sources[0]
         exists = source.exists(physical_path)
         return web.json_response({"exists": exists})
 
@@ -403,10 +412,31 @@ class P2PServer:
 
         return data
 
-    def _validate_path(self, physical_path: str) -> web.Response | None:
+    def _select_source(self, body: dict):
+        """요청 body의 source_id로 소스를 선택한다.
+
+        source_id가 있으면 그 소스를, 없으면 첫 소스(구버전 호환)를 반환한다.
+        존재하지 않는 source_id이거나 소스가 하나도 없으면 에러 Response를 반환한다.
+        """
+        source_id = body.get("source_id")
+        if source_id:
+            src = self._jbod_manager._get_source_by_id(source_id)
+            if src is None:
+                return web.json_response(
+                    {"error": "Source not found"}, status=404
+                )
+            return src
+        if self._jbod_manager.sources:
+            return self._jbod_manager.sources[0]
+        return web.json_response({"error": "No source available"}, status=404)
+
+    def _validate_path(
+        self, physical_path: str, source_root: str | None = None
+    ) -> web.Response | None:
         """Path traversal 방지 검증.
 
         ".." 세그먼트 포함 또는 정규화 후 소스 루트 외부 참조 시 400 반환.
+        source_root가 None이면 첫 소스 루트(_source_root)를 사용한다.
         유효하면 None 반환.
         """
         if not physical_path:
@@ -421,15 +451,16 @@ class P2PServer:
             )
 
         # 정규화 후 소스 루트 내부인지 확인
-        source_root = os.path.normpath(self._source_root)
+        root = source_root if source_root is not None else self._source_root
+        source_root_norm = os.path.normpath(root)
         resolved = os.path.normpath(
-            os.path.join(source_root, physical_path)
+            os.path.join(source_root_norm, physical_path)
         )
 
         # 소스 루트로 시작하는지 확인 (os.sep 추가로 정확한 접두사 매칭)
         if not (
-            resolved == source_root
-            or resolved.startswith(source_root + os.sep)
+            resolved == source_root_norm
+            or resolved.startswith(source_root_norm + os.sep)
         ):
             return web.json_response(
                 {"error": "Path traversal detected"}, status=400

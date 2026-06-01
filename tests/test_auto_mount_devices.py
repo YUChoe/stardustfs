@@ -39,9 +39,13 @@ class _FakeRemoteSource:
 class _FakeJbod:
     def __init__(self):
         self.added = []
+        self.registered = {}
 
     def add_source(self, source):
         self.added.append(source)
+
+    def register_remote_device(self, device_id, remote):
+        self.registered[device_id] = remote
 
 
 def _mounted_pairs(jbod):

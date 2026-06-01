@@ -378,6 +378,8 @@ def _mount_remote_sources(
             source = RemoteSource(source_id, device_id, auth_client, server_url)
             source.initialize()
             jbod_manager.add_source(source)
+            # device_id로도 등록 → read_file의 크로스 디바이스 라우팅에 사용
+            jbod_manager.register_remote_device(device_id, source)
             mounted_device_ids.add(device_id)
             status = "활성" if source.is_active else "비활성(오프라인)"
             logger.info(

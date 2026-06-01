@@ -157,9 +157,22 @@ class RemoteSource(StorageSource):
 
     def read(self, physical_path: str) -> bytes:
         """P2P POST /p2p/read 요청으로 파일 데이터를 읽는다."""
+        return self.read_from_source(physical_path, None)
+
+    def read_from_source(
+        self, physical_path: str, source_id: str | None
+    ) -> bytes:
+        """원격 디바이스의 특정 소스(source_id)에서 파일을 읽는다.
+
+        source_id가 None이면 원격 첫 소스를 사용한다(구버전 호환).
+        디바이스 단위 라우팅(Device_Router)에서 원격 소스 ID를 지정해 호출한다.
+        """
         self._check_active()
+        payload: dict[str, Any] = {"physical_path": physical_path}
+        if source_id is not None:
+            payload["source_id"] = source_id
         result = self._io.run_coroutine(
-            self._p2p_request("/p2p/read", {"physical_path": physical_path})
+            self._p2p_request("/p2p/read", payload)
         )
         # 응답 본문에서 base64 디코딩된 data를 반환
         return base64.b64decode(result["data"])
@@ -184,9 +197,18 @@ class RemoteSource(StorageSource):
 
     def exists(self, physical_path: str) -> bool:
         """P2P POST /p2p/exists 요청으로 파일 존재 여부를 확인한다."""
+        return self.exists_on_source(physical_path, None)
+
+    def exists_on_source(
+        self, physical_path: str, source_id: str | None
+    ) -> bool:
+        """원격 디바이스의 특정 소스에서 파일 존재 여부를 확인한다."""
         self._check_active()
+        payload: dict[str, Any] = {"physical_path": physical_path}
+        if source_id is not None:
+            payload["source_id"] = source_id
         result = self._io.run_coroutine(
-            self._p2p_request("/p2p/exists", {"physical_path": physical_path})
+            self._p2p_request("/p2p/exists", payload)
         )
         return bool(result.get("exists", False))
 
@@ -206,9 +228,18 @@ class RemoteSource(StorageSource):
 
     def list_dir(self, physical_path: str) -> list[str]:
         """P2P POST /p2p/list 요청으로 디렉토리 엔트리 목록을 반환한다."""
+        return self.list_dir_on_source(physical_path, None)
+
+    def list_dir_on_source(
+        self, physical_path: str, source_id: str | None
+    ) -> list[str]:
+        """원격 디바이스의 특정 소스에서 디렉토리 엔트리 목록을 반환한다."""
         self._check_active()
+        payload: dict[str, Any] = {"physical_path": physical_path}
+        if source_id is not None:
+            payload["source_id"] = source_id
         result = self._io.run_coroutine(
-            self._p2p_request("/p2p/list", {"physical_path": physical_path})
+            self._p2p_request("/p2p/list", payload)
         )
         return list(result.get("entries", []))
 

@@ -47,6 +47,15 @@ class JBODManager:
         self._source_map: dict[str, StorageSource] = {
             s.source_id: s for s in sources
         }
+        # device_id → 원격 디바이스 프록시 (RemoteSource). 크로스 디바이스 읽기 라우팅용.
+        self._remote_devices: dict = {}
+
+    def register_remote_device(self, device_id: str, remote) -> None:
+        """원격 디바이스 프록시(RemoteSource)를 device_id로 등록한다.
+
+        read_file이 원격 소유 파일을 이 프록시로 라우팅한다.
+        """
+        self._remote_devices[device_id] = remote
 
     # --- 소스 관리 ---
 
@@ -125,6 +134,15 @@ class JBODManager:
         if metadata is None:
             raise FileNotFoundError(f"파일을 찾을 수 없습니다: {virtual_path}")
 
+        owner = metadata.device_id
+        # 로컬 소유 또는 레거시(NULL) → 로컬 읽기
+        if owner is None or owner == self.device_id:
+            return self._read_local(metadata)
+        # 원격 소유 → 디바이스 프록시로 라우팅
+        return self._read_remote(metadata)
+
+    def _read_local(self, metadata) -> bytes:
+        """로컬 소스에서 파일을 읽어 복호화한다."""
         source = self._get_source_by_id(metadata.source_id)
         if source is None or not source.is_active:
             raise OSError(
@@ -132,6 +150,26 @@ class JBODManager:
             )
 
         encrypted_data = source.read(metadata.physical_path)
+
+        if self.encryption_engine is not None:
+            return self.encryption_engine.decrypt(encrypted_data)
+        return encrypted_data
+
+    def _read_remote(self, metadata) -> bytes:
+        """원격 디바이스의 P2P 서버에서 파일을 읽어 로컬에서 복호화한다.
+
+        같은 계정이면 master_key가 동일하므로 원격에서 받은 암호문을
+        로컬 encryption_engine으로 복호화할 수 있다.
+        """
+        remote = self._remote_devices.get(metadata.device_id)
+        if remote is None or not remote.is_active:
+            raise OSError(
+                f"원격 디바이스 미마운트/오프라인: {metadata.device_id}"
+            )
+
+        encrypted_data = remote.read_from_source(
+            metadata.physical_path, metadata.source_id
+        )
 
         if self.encryption_engine is not None:
             return self.encryption_engine.decrypt(encrypted_data)
@@ -157,6 +195,13 @@ class JBODManager:
         existing = self.metadata_store.lookup(virtual_path)
 
         if existing is not None:
+            # 원격 디바이스 소유 파일은 원격 쓰기를 하지 않는다 (읽기 전용 라우팅)
+            owner = existing.device_id
+            if owner is not None and owner != self.device_id:
+                raise OSError(
+                    f"원격 디바이스 소유 파일은 수정할 수 없습니다: "
+                    f"{virtual_path} (owner={owner})"
+                )
             # 기존 파일 덮어쓰기
             source = self._get_source_by_id(existing.source_id)
             if source is None or not source.is_active:
@@ -219,6 +264,13 @@ class JBODManager:
         metadata = self.metadata_store.lookup(virtual_path)
         if metadata is None:
             raise FileNotFoundError(f"파일을 찾을 수 없습니다: {virtual_path}")
+
+        owner = metadata.device_id
+        # 원격 디바이스 소유 파일은 물리 삭제하지 않고 로컬 metadata만 tombstone 처리한다.
+        # (실제 물리 삭제는 소유 디바이스가 자신의 tombstone 동기화 시 수행)
+        if owner is not None and owner != self.device_id:
+            self.metadata_store.delete(virtual_path)
+            return
 
         source = self._get_source_by_id(metadata.source_id)
         if source is not None and source.is_active:
