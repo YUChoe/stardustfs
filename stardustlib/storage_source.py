@@ -42,6 +42,15 @@ class StorageSource(ABC):
         """소스가 활성 상태인지 반환한다."""
         return self._active
 
+    @property
+    def is_remote(self) -> bool:
+        """원격(크로스 디바이스 프록시) 소스인지 반환한다.
+
+        로컬 쓰기 가능 소스는 False. 원격 소스는 읽기 전용 라우팅 대상이며
+        로컬 용량 집계/쓰기 대상 선택에서 제외된다.
+        """
+        return False
+
     def _deactivate(self, reason: str) -> None:
         """소스를 비활성 상태로 전환하고 로그를 기록한다."""
         self._active = False

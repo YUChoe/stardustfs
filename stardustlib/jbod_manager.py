@@ -75,7 +75,7 @@ class JBODManager:
         best_space: int = -1
 
         for source in self.sources:
-            if not source.is_active:
+            if not source.is_active or source.is_remote:
                 continue
             available = source.get_available_space()
             if available >= file_size and available > best_space:
@@ -362,7 +362,7 @@ class JBODManager:
         physical_path = virtual_path.lstrip("/")
 
         for source in self.sources:
-            if not source.is_active:
+            if not source.is_active or source.is_remote:
                 continue
             try:
                 source.mkdir(physical_path)
@@ -399,10 +399,10 @@ class JBODManager:
                         "삭제 대상 파일이 이미 없음: %s", child_path
                     )
 
-        # 모든 활성 소스에서 물리 디렉토리 삭제
+        # 모든 활성 로컬 소스에서 물리 디렉토리 삭제 (원격은 읽기 전용)
         physical_path = virtual_path.lstrip("/")
         for source in self.sources:
-            if not source.is_active:
+            if not source.is_active or source.is_remote:
                 continue
             try:
                 source.rmdir(physical_path)
@@ -436,11 +436,11 @@ class JBODManager:
         )
         self.metadata_store._conn.commit()
 
-        # 물리 디렉토리 이동 (각 활성 소스)
+        # 물리 디렉토리 이동 (각 활성 로컬 소스, 원격은 읽기 전용)
         src_physical = src_path.lstrip("/")
         dst_physical = dst_path.lstrip("/")
         for source in self.sources:
-            if not source.is_active:
+            if not source.is_active or source.is_remote:
                 continue
             try:
                 # 대상 디렉토리 생성 후 원본 삭제 방식
@@ -458,18 +458,24 @@ class JBODManager:
     # --- 용량 정보 ---
 
     def get_total_space(self) -> int:
-        """모든 활성 소스의 전체 공간 합계를 반환한다."""
+        """모든 활성 로컬 소스의 전체 공간 합계를 반환한다.
+
+        원격 소스(is_remote)는 읽기 전용 프록시이므로 로컬 용량에서 제외한다.
+        """
         total = 0
         for source in self.sources:
-            if source.is_active:
+            if source.is_active and not source.is_remote:
                 total += source.get_total_space()
         return total
 
     def get_available_space(self) -> int:
-        """모든 활성 소스의 가용 공간 합계를 반환한다."""
+        """모든 활성 로컬 소스의 가용 공간 합계를 반환한다.
+
+        원격 소스(is_remote)는 읽기 전용 프록시이므로 로컬 용량에서 제외한다.
+        """
         available = 0
         for source in self.sources:
-            if source.is_active:
+            if source.is_active and not source.is_remote:
                 available += source.get_available_space()
         return available
 

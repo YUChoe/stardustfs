@@ -89,6 +89,11 @@ class RemoteSource(StorageSource):
         return self._device_id
 
     @property
+    def is_remote(self) -> bool:
+        """원격 프록시 소스이므로 항상 True (로컬 용량/쓰기 대상에서 제외)."""
+        return True
+
+    @property
     def peer_address(self) -> str | None:
         """대상 디바이스의 P2P 접속 주소 (IP:port)."""
         return self._peer_address

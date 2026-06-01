@@ -221,3 +221,55 @@ class TestSpaceInfo:
     def test_available_space_positive(self, jbod):
         """가용 공간이 양수."""
         assert jbod.get_available_space() > 0
+
+
+class _FakeRemoteSource:
+    """오프라인 원격 소스 모사: 용량/쓰기 호출 시 OSError를 던진다.
+
+    routing은 성공해 is_active=True지만 실제 디바이스는 오프라인인 상황을 재현한다.
+    is_remote=True이므로 JBOD의 로컬 용량 집계/쓰기 대상 선택에서 제외되어야 한다.
+    """
+
+    def __init__(self, source_id: str) -> None:
+        self._source_id = source_id
+
+    @property
+    def source_id(self) -> str:
+        return self._source_id
+
+    @property
+    def is_active(self) -> bool:
+        return True
+
+    @property
+    def is_remote(self) -> bool:
+        return True
+
+    def get_total_space(self) -> int:
+        raise OSError("P2P connection failed (/p2p/space)")
+
+    def get_available_space(self) -> int:
+        raise OSError("P2P connection failed (/p2p/space)")
+
+
+class TestRemoteSourceExcludedFromLocalCapacity:
+    """오프라인 원격 소스가 로컬 용량 집계/쓰기 선택을 깨뜨리지 않아야 한다."""
+
+    def test_total_space_ignores_remote(self, jbod):
+        """get_total_space는 원격 소스의 P2P를 호출하지 않고 로컬만 합산한다."""
+        local_total = jbod.get_total_space()
+        jbod.add_source(_FakeRemoteSource("remote-offline"))
+        # 원격이 OSError를 던져도 예외 없이 동일한 로컬 합계를 반환해야 한다
+        assert jbod.get_total_space() == local_total
+
+    def test_available_space_ignores_remote(self, jbod):
+        """get_available_space는 원격 소스를 제외한다."""
+        local_avail = jbod.get_available_space()
+        jbod.add_source(_FakeRemoteSource("remote-offline"))
+        assert jbod.get_available_space() == local_avail
+
+    def test_select_source_ignores_remote(self, jbod):
+        """select_source는 원격 소스를 쓰기 대상으로 선택하지 않는다."""
+        jbod.add_source(_FakeRemoteSource("remote-offline"))
+        selected = jbod.select_source(1024)
+        assert selected.is_remote is False
