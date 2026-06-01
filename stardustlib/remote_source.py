@@ -82,6 +82,9 @@ class RemoteSource(StorageSource):
         self._peer_address: str | None = None
         self._client = httpx.AsyncClient(timeout=timeout)
         self._io = _EventLoopThread.get_instance()
+        # 재네고시에이션(refresh) throttle: 마지막 시도 시각, 최소 간격(초)
+        self._last_refresh_at: float = 0.0
+        self._refresh_min_interval: float = 30.0
 
     @property
     def device_id(self) -> str:
@@ -111,8 +114,39 @@ class RemoteSource(StorageSource):
         except Exception as e:
             self._deactivate(f"Initialisation failed: {e}")
 
+    def refresh(self, *, force: bool = False) -> bool:
+        """routing을 재조회하여 활성/주소 상태를 갱신한다 (재네고시에이션).
+
+        오프라인으로 비활성화됐던 디바이스가 다시 온라인이 되면 활성으로
+        전환하고, 반대로 온라인이던 디바이스가 오프라인이 되면 비활성으로
+        전환한다. 갱신 후 활성 여부를 반환한다.
+
+        잦은 호출을 막기 위해 최소 간격(_refresh_min_interval) 내 재호출은
+        건너뛴다. force=True이면 간격을 무시하고 즉시 재조회한다.
+
+        실패(서버 도달 불가 등) 시 예외 없이 현재 상태를 유지하고 활성
+        여부를 반환한다.
+        """
+        import time
+
+        now = time.monotonic()
+        if not force and (now - self._last_refresh_at) < self._refresh_min_interval:
+            return self._active
+        self._last_refresh_at = now
+
+        try:
+            self._io.run_coroutine(self._async_initialize())
+        except Exception as e:
+            logger.warning(
+                "RemoteSource '%s' refresh 실패: %s", self._source_id, e
+            )
+        return self._active
+
     async def _async_initialize(self) -> None:
-        """GET /routing/{device_id}로 접속 주소를 조회한다."""
+        """GET /routing/{device_id}로 접속 주소를 조회한다.
+
+        재호출(refresh) 시에도 동작하도록 매 호출마다 활성 상태를 재평가한다.
+        """
         try:
             token = await self._auth_client.get_valid_token()
         except AuthenticationError as e:
@@ -148,6 +182,18 @@ class RemoteSource(StorageSource):
             return
 
         self._peer_address = address
+
+        # 대상 디바이스가 오프라인(heartbeat 만료)이면 비활성으로 마운트한다.
+        # 활성으로 두면 매 읽기마다 무의미한 P2P 연결 시도(타임아웃)를 반복하므로,
+        # 오프라인 placeholder(503)로 즉시 응답하도록 한다.
+        # is_online 필드가 없는 구버전 서버는 도달 가능성을 알 수 없으므로 활성 유지.
+        is_online = data.get("is_online")
+        if is_online is False:
+            self._deactivate(
+                f"Target device offline (heartbeat expired): {self._device_id}"
+            )
+            return
+
         self._active = True
         logger.info(
             "RemoteSource '%s' initialised: device=%s, address=%s",

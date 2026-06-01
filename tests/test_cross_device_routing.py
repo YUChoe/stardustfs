@@ -49,13 +49,23 @@ def _free_port() -> int:
 class _FakeRemote:
     """원격 디바이스 프록시 대역."""
 
-    def __init__(self, active=True, data=b"remote-bytes"):
+    def __init__(self, active=True, data=b"remote-bytes", refresh_to=None):
         self._active = active
         self._data = data
         self.calls = []
+        # refresh() 호출 시 전환될 활성 상태(None이면 refresh 미지원으로 간주)
+        self._refresh_to = refresh_to
+        self.refresh_calls = 0
 
     @property
     def is_active(self):
+        return self._active
+
+    def refresh(self, *, force=False):
+        """재네고시에이션 모사: refresh_to가 설정되어 있으면 그 상태로 전환."""
+        self.refresh_calls += 1
+        if self._refresh_to is not None:
+            self._active = self._refresh_to
         return self._active
 
     def read_from_source(self, physical_path, source_id):
@@ -136,6 +146,47 @@ def test_router_remote_offline_raises():
                      device_id="dev-remote")
         with pytest.raises(OSError):
             jbod.read_file("/r.txt")
+    finally:
+        store.close()
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_router_remote_reactivates_via_refresh():
+    """비활성 원격이 read 시점 refresh로 재활성화되면 읽기에 성공한다."""
+    d = tempfile.mkdtemp()
+    jbod, store = _make_jbod(d, "dev-local")
+    try:
+        # 비활성으로 시작하지만 refresh 시 활성으로 전환되는 프록시
+        remote = _FakeRemote(active=False, data=b"now-online", refresh_to=True)
+        jbod.register_remote_device("dev-remote", remote)
+        now = time.time()
+        store.insert("/r.txt", "loop-001", "phys/r.txt", 10, now, now,
+                     device_id="dev-remote")
+
+        data = jbod.read_file("/r.txt")
+
+        assert data == b"now-online"
+        assert remote.refresh_calls == 1
+        assert remote.calls == [("phys/r.txt", "loop-001")]
+    finally:
+        store.close()
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_router_remote_still_offline_after_refresh_raises():
+    """refresh 후에도 여전히 오프라인이면 OSError."""
+    d = tempfile.mkdtemp()
+    jbod, store = _make_jbod(d, "dev-local")
+    try:
+        # 비활성, refresh해도 비활성 유지
+        remote = _FakeRemote(active=False, refresh_to=False)
+        jbod.register_remote_device("dev-remote", remote)
+        now = time.time()
+        store.insert("/r.txt", "loop-001", "phys/r.txt", 10, now, now,
+                     device_id="dev-remote")
+        with pytest.raises(OSError):
+            jbod.read_file("/r.txt")
+        assert remote.refresh_calls == 1
     finally:
         store.close()
         shutil.rmtree(d, ignore_errors=True)

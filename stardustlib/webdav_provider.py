@@ -119,11 +119,20 @@ class StardustDAVProvider(DAVProvider):
             self._cache.pop("/", None)
 
     def _is_offline_remote_source(self, source_id: str) -> bool:
-        """source_id에 해당하는 소스가 비활성 RemoteSource인지 판별한다."""
+        """source_id에 해당하는 소스가 비활성 RemoteSource인지 판별한다.
+
+        비활성 RemoteSource이면 재네고시에이션(refresh)을 한 번 시도한다
+        (throttle 적용). 디바이스가 재온라인되었으면 활성으로 전환되어
+        오프라인 placeholder 대신 정상 파일로 노출된다.
+        """
         source = self.jbod_manager._get_source_by_id(source_id)
         if source is None:
             return False
-        return isinstance(source, RemoteSource) and not source.is_active
+        if not isinstance(source, RemoteSource):
+            return False
+        if not source.is_active:
+            source.refresh()
+        return not source.is_active
 
     def get_resource_inst(self, path: str, environ: dict):
         """가상 경로에 해당하는 DAV 리소스 인스턴스를 반환한다."""
@@ -408,11 +417,18 @@ class StardustDirectoryResource(DAVCollection):
             raise DAVError(HTTP_INTERNAL_ERROR)
 
     def _is_offline_remote(self, source_id: str) -> bool:
-        """source_id에 해당하는 소스가 비활성 RemoteSource인지 판별한다."""
+        """source_id에 해당하는 소스가 비활성 RemoteSource인지 판별한다.
+
+        비활성이면 재네고시에이션(refresh)을 한 번 시도한다(throttle 적용).
+        """
         source = self._jbod_manager._get_source_by_id(source_id)
         if source is None:
             return False
-        return isinstance(source, RemoteSource) and not source.is_active
+        if not isinstance(source, RemoteSource):
+            return False
+        if not source.is_active:
+            source.refresh()
+        return not source.is_active
 
     def get_member(self, name: str):
         """이름으로 하위 리소스를 반환한다.

@@ -66,6 +66,37 @@ class TestInitialize:
         assert remote_source.is_active is True
         assert remote_source.peer_address == "192.168.1.100:9090"
 
+    def test_initialize_is_online_true_activates(self, remote_source, httpx_mock):
+        """is_online=True면 활성화한다."""
+        httpx_mock.add_response(
+            url="https://api.stardustfs.io/routing/550e8400-e29b-41d4-a716-446655440000",
+            json={"connection_address": "192.168.1.100:9090", "is_online": True},
+        )
+
+        remote_source.initialize()
+
+        assert remote_source.is_active is True
+
+    def test_initialize_is_online_false_deactivates(
+        self, remote_source, httpx_mock
+    ):
+        """is_online=False면 주소를 받아도 비활성으로 마운트한다.
+
+        오프라인 디바이스를 활성으로 두면 매 읽기마다 무의미한 P2P 타임아웃이
+        반복되므로, 오프라인 placeholder로 즉시 응답하도록 비활성화한다.
+        """
+        httpx_mock.add_response(
+            url="https://api.stardustfs.io/routing/550e8400-e29b-41d4-a716-446655440000",
+            json={
+                "connection_address": "10.100.9.213:9090",
+                "is_online": False,
+            },
+        )
+
+        remote_source.initialize()
+
+        assert remote_source.is_active is False
+
     def test_initialize_device_offline(self, remote_source, httpx_mock):
         """대상 디바이스 오프라인 시 비활성 상태."""
         httpx_mock.add_response(
@@ -98,6 +129,72 @@ class TestInitialize:
         remote_source.initialize()
 
         assert remote_source.is_active is False
+
+
+class TestRefresh:
+    """refresh() 재네고시에이션 테스트."""
+
+    _URL = (
+        "https://api.stardustfs.io/routing/"
+        "550e8400-e29b-41d4-a716-446655440000"
+    )
+
+    def test_offline_then_online_reactivates(self, remote_source, httpx_mock):
+        """오프라인으로 비활성됐다가 디바이스 재온라인 시 refresh로 재활성화."""
+        # 1차: 오프라인
+        httpx_mock.add_response(
+            url=self._URL,
+            json={"connection_address": "10.0.0.5:9090", "is_online": False},
+        )
+        remote_source.initialize()
+        assert remote_source.is_active is False
+
+        # 2차: 온라인 (force로 throttle 우회)
+        httpx_mock.add_response(
+            url=self._URL,
+            json={"connection_address": "10.0.0.5:9090", "is_online": True},
+        )
+        result = remote_source.refresh(force=True)
+        assert result is True
+        assert remote_source.is_active is True
+
+    def test_online_then_offline_deactivates(self, remote_source, httpx_mock):
+        """온라인이던 디바이스가 오프라인이 되면 refresh로 비활성화."""
+        httpx_mock.add_response(
+            url=self._URL,
+            json={"connection_address": "10.0.0.5:9090", "is_online": True},
+        )
+        remote_source.initialize()
+        assert remote_source.is_active is True
+
+        httpx_mock.add_response(
+            url=self._URL,
+            json={"connection_address": "10.0.0.5:9090", "is_online": False},
+        )
+        result = remote_source.refresh(force=True)
+        assert result is False
+        assert remote_source.is_active is False
+
+    def test_throttle_skips_frequent_calls(self, remote_source, httpx_mock):
+        """최소 간격 내 연속 refresh 재호출은 routing 요청 없이 상태를 반환한다."""
+        httpx_mock.add_response(
+            url=self._URL,
+            json={"connection_address": "10.0.0.5:9090", "is_online": False},
+        )
+        remote_source.initialize()
+        assert remote_source.is_active is False
+
+        # 첫 refresh: throttle 타임스탬프를 갱신 (응답 1건 등록)
+        httpx_mock.add_response(
+            url=self._URL,
+            json={"connection_address": "10.0.0.5:9090", "is_online": False},
+        )
+        remote_source.refresh()
+
+        # 두 번째 refresh: 최소 간격 내이므로 routing 요청 없이 건너뛴다.
+        # 추가 응답을 등록하지 않았으므로, 요청이 나가면 httpx_mock이 실패한다.
+        result = remote_source.refresh()
+        assert result is False
 
 
 # ------------------------------------------------------------------

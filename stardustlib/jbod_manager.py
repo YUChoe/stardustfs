@@ -160,12 +160,30 @@ class JBODManager:
 
         같은 계정이면 master_key가 동일하므로 원격에서 받은 암호문을
         로컬 encryption_engine으로 복호화할 수 있다.
+
+        비활성(오프라인) 프록시는 routing 재조회(refresh)로 한 번 재네고시에이션을
+        시도한다. 디바이스가 그사이 온라인이 되었으면 활성으로 전환되어 읽기가
+        진행된다.
         """
         remote = self._remote_devices.get(metadata.device_id)
-        if remote is None or not remote.is_active:
+        if remote is None:
             raise OSError(
-                f"원격 디바이스 미마운트/오프라인: {metadata.device_id}"
+                f"원격 디바이스 미마운트: {metadata.device_id}"
             )
+
+        # 비활성이면 재네고시에이션 1회 시도 (디바이스 재온라인 대응)
+        if not remote.is_active:
+            refresh = getattr(remote, "refresh", None)
+            if callable(refresh):
+                logger.info(
+                    "원격 디바이스 비활성 — 재네고시에이션 시도: %s",
+                    metadata.device_id,
+                )
+                refresh()
+            if not remote.is_active:
+                raise OSError(
+                    f"원격 디바이스 오프라인: {metadata.device_id}"
+                )
 
         encrypted_data = remote.read_from_source(
             metadata.physical_path, metadata.source_id
