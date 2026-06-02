@@ -29,6 +29,14 @@ _MAX_KEY_RETRIES = 3
 _MAX_UPLOAD_FAILURES = 3
 _MAX_CAS_RETRIES = 5  # 낙관적 잠금(CAS) 충돌 시 재병합·재시도 횟수
 _DEFAULT_RETENTION_DAYS = 30  # status에서 받지 못한 경우의 tombstone 보관기간 기본값
+# 버전 롱폴링: 서버 대기 한계(25s)보다 길게 잡아 서버가 먼저 응답하도록 한다
+_WAIT_HTTP_TIMEOUT = 35.0
+_WAIT_RETRY_DELAY = 5.0  # 롱폴 네트워크 오류 시 재시도 간격
+_WAIT_IDLE_DELAY = 1.0  # 롱폴이 즉시 changed=false 반환 시 busy loop 방지용 최소 간격
+
+
+class _WaitUnsupported(Exception):
+    """서버가 버전 롱폴링 엔드포인트를 지원하지 않음(404)."""
 
 
 class SyncClient:
@@ -53,6 +61,9 @@ class SyncClient:
         self._jbod_manager = jbod_manager  # tombstone 전파 시 물리 파일 삭제용 (선택)
         self._sync_task: asyncio.Task[None] | None = None
         self._running = False
+        # 버전 롱폴링(즉시 동기화) 태스크. 서버 미지원(404) 시 비활성화.
+        self._wait_task: asyncio.Task[None] | None = None
+        self._wait_enabled = True
         self._consecutive_failures = 0
         self._last_synced_version = 0
         # tombstone 보관기간(초). status 응답에서 갱신됨. 기본 30일.
@@ -106,6 +117,8 @@ class SyncClient:
             return
         self._running = True
         self._sync_task = asyncio.create_task(self._periodic_loop())
+        # 버전 롱폴링 루프(즉시 동기화) 시작 — 주기 폴링은 안전망으로 유지
+        self._wait_task = asyncio.create_task(self._version_wait_loop())
         logger.info(
             "Periodic sync started (interval=%ds).", self._interval_seconds
         )
@@ -419,10 +432,82 @@ class SyncClient:
             except asyncio.CancelledError:
                 pass
             self._sync_task = None
+        if self._wait_task is not None:
+            self._wait_task.cancel()
+            try:
+                await self._wait_task
+            except asyncio.CancelledError:
+                pass
+            self._wait_task = None
         await self._client.aclose()
         logger.info("Sync client stopped.")
 
     # --- 내부 메서드 ---
+
+    async def _version_wait_loop(self) -> None:
+        """서버 version 변경을 롱폴링으로 대기해 즉시 동기화한다.
+
+        주기 폴링(_periodic_loop)과 병행하며, 변경 통지를 받으면 폴링 주기를
+        기다리지 않고 즉시 다운로드·병합한다. 서버가 wait 엔드포인트를 지원하지
+        않으면(404) 비활성화하고 주기 폴링만 사용한다(하위 호환).
+        """
+        # 롱폴은 서버 대기(25s)를 견뎌야 하므로 별도의 긴 타임아웃 클라이언트 사용
+        async with httpx.AsyncClient(timeout=_WAIT_HTTP_TIMEOUT) as client:
+            while self._running and self._wait_enabled:
+                try:
+                    changed = await self._wait_for_version(client)
+                except _WaitUnsupported:
+                    logger.info(
+                        "서버가 버전 롱폴링 미지원(404) — 주기 폴링만 사용"
+                    )
+                    self._wait_enabled = False
+                    return
+                except (httpx.TimeoutException, httpx.ConnectError) as e:
+                    logger.debug("버전 롱폴 재시도: %s", e)
+                    await asyncio.sleep(_WAIT_RETRY_DELAY)
+                    continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning("버전 롱폴 오류: %s", e)
+                    await asyncio.sleep(_WAIT_RETRY_DELAY)
+                    continue
+
+                if changed:
+                    logger.info("버전 변경 통지 수신 — 즉시 동기화")
+                    await self._download_and_merge()
+                    self._run_orphan_gc()
+                else:
+                    # 변경 없음(정상 롱폴 타임아웃). 서버가 롱폴을 즉시 반환하는
+                    # 경우(프록시/구현 차이)에도 busy loop가 되지 않도록 최소 간격
+                    # 대기 후 재시도한다.
+                    await asyncio.sleep(_WAIT_IDLE_DELAY)
+
+    async def _wait_for_version(self, client: httpx.AsyncClient) -> bool:
+        """GET /sync/metadata/wait로 version 변경을 대기한다.
+
+        Returns:
+            서버 version이 known_version보다 커졌으면 True(변경), 타임아웃이면 False.
+
+        Raises:
+            _WaitUnsupported: 서버가 404(미지원)를 반환한 경우.
+            httpx.TimeoutException/ConnectError: 네트워크 오류.
+        """
+        token = await self._auth_client.get_valid_token()
+        response = await client.get(
+            f"{self._server_url}/sync/metadata/wait",
+            params={"known_version": self._last_synced_version},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        if response.status_code == 404:
+            raise _WaitUnsupported()
+        if response.status_code >= 400:
+            logger.warning(
+                "버전 롱폴 실패: HTTP %d", response.status_code
+            )
+            return False
+        data = response.json()
+        return bool(data.get("changed", False))
 
     def _run_orphan_gc(self, startup: bool = False) -> None:
         """orphan GC를 안전하게 실행한다 (동기화 자체를 막지 않음).

@@ -436,6 +436,11 @@ class TestPeriodicSync:
             method="PUT",
             status_code=200,
         )
+        httpx_mock.add_response(
+            url="http://test-server/sync/metadata/wait?known_version=0",
+            method="GET",
+            json={"version": 0, "changed": False},
+        )
 
         await sc.start_periodic_sync()
         assert sc._running is True
@@ -470,6 +475,11 @@ class TestPeriodicSync:
             method="PUT",
             status_code=200,
         )
+        httpx_mock.add_response(
+            url="http://test-server/sync/metadata/wait?known_version=0",
+            method="GET",
+            json={"version": 0, "changed": False},
+        )
 
         await sc.start_periodic_sync()
         task1 = sc._sync_task
@@ -477,3 +487,63 @@ class TestPeriodicSync:
         task2 = sc._sync_task
         assert task1 is task2
         await sc.stop()
+
+
+class TestVersionWait:
+    """버전 롱폴링(_wait_for_version) 테스트."""
+
+    @pytest.mark.asyncio
+    async def test_wait_changed_true(self, sync_client, httpx_mock):
+        """changed=true 응답이면 True 반환."""
+        sync_client._last_synced_version = 5
+        httpx_mock.add_response(
+            url="http://test-server/sync/metadata/wait?known_version=5",
+            method="GET",
+            json={"version": 6, "changed": True},
+        )
+        async with httpx.AsyncClient() as client:
+            result = await sync_client._wait_for_version(client)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_wait_changed_false(self, sync_client, httpx_mock):
+        """changed=false(타임아웃) 응답이면 False 반환."""
+        sync_client._last_synced_version = 5
+        httpx_mock.add_response(
+            url="http://test-server/sync/metadata/wait?known_version=5",
+            method="GET",
+            json={"version": 5, "changed": False},
+        )
+        async with httpx.AsyncClient() as client:
+            result = await sync_client._wait_for_version(client)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_wait_unsupported_404(self, sync_client, httpx_mock):
+        """404면 _WaitUnsupported를 발생시킨다(구버전 서버)."""
+        from stardustlib.sync_client import _WaitUnsupported
+
+        sync_client._last_synced_version = 0
+        httpx_mock.add_response(
+            url="http://test-server/sync/metadata/wait?known_version=0",
+            method="GET",
+            status_code=404,
+        )
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(_WaitUnsupported):
+                await sync_client._wait_for_version(client)
+
+    @pytest.mark.asyncio
+    async def test_wait_server_error_returns_false(
+        self, sync_client, httpx_mock
+    ):
+        """5xx면 False(다음 사이클 재시도)."""
+        sync_client._last_synced_version = 2
+        httpx_mock.add_response(
+            url="http://test-server/sync/metadata/wait?known_version=2",
+            method="GET",
+            status_code=500,
+        )
+        async with httpx.AsyncClient() as client:
+            result = await sync_client._wait_for_version(client)
+        assert result is False
