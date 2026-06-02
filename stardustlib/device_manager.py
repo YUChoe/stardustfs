@@ -328,6 +328,11 @@ class DeviceManager:
                         "여전히 도달 불가할 수 있음)",
                         self._connection_address,
                     )
+                    # 보정된 주소를 서버에 즉시 반영한다. register()는 보정 전
+                    # 초기 주소로 등록했으므로, heartbeat 주기(최대 60초)를
+                    # 기다리지 않고 갱신해 다른 디바이스가 바로 올바른 주소를
+                    # 받도록 한다.
+                    await self._send_heartbeat()
                 else:
                     # 공인 IP 확보 실패 — UPnP 외부 IP를 그대로 등록하되 경고
                     self._connection_address = f"{external_ip}:{self._p2p_port}"

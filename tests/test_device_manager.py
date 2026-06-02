@@ -438,3 +438,35 @@ class TestQueryReflexiveIp:
         ):
             result = await device_manager.query_reflexive_ip()
         assert result is None
+
+
+class TestHeartbeatPublishesAddress:
+    """_send_heartbeat가 현재 connection_address를 서버에 전송하는지 검증."""
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_sends_current_address(
+        self, device_manager
+    ):
+        """보정된 connection_address가 heartbeat payload로 전송된다.
+
+        UPnP 보정 후 _send_heartbeat를 호출하면 즉시 갱신되는 흐름의 핵심.
+        """
+        device_manager._device_id = "dev-123"
+        # UPnP 보정이 일어난 상황을 모사: 주소를 공인 IP로 교체
+        device_manager._connection_address = "113.10.5.125:9090"
+
+        captured = {}
+
+        async def fake_put(url, json=None, headers=None):
+            captured["url"] = url
+            captured["json"] = json
+            return httpx.Response(
+                200,
+                request=httpx.Request("PUT", url),
+            )
+
+        with patch.object(device_manager._client, "put", side_effect=fake_put):
+            await device_manager._send_heartbeat()
+
+        assert captured["json"]["connection_address"] == "113.10.5.125:9090"
+        assert "dev-123/heartbeat" in captured["url"]
