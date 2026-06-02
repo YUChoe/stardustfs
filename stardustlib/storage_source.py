@@ -108,6 +108,14 @@ class StorageSource(ABC):
         """전체 공간(바이트)을 반환한다."""
         ...
 
+    def list_physical_files(self) -> list[str]:
+        """소스 데이터 루트 직속의 물리 파일명 목록을 반환한다 (orphan GC용).
+
+        물리 파일은 데이터 루트에 평평한 '<uuid>_<name>' 형식으로 저장된다.
+        하위 디렉토리는 제외한다. 기본 구현은 빈 목록(원격 소스 등 미지원).
+        """
+        return []
+
 
 class DirectorySource(StorageSource):
     """로컬 디렉토리를 스토리지 소스로 사용하는 구현체.
@@ -249,6 +257,21 @@ class DirectorySource(StorageSource):
         except OSError as e:
             self._deactivate(f"list_dir failed for {physical_path}: {e}")
             raise
+
+    def list_physical_files(self) -> list[str]:
+        """소스 루트 직속의 물리 파일명 목록을 반환한다 (orphan GC용)."""
+        self._check_active()
+        try:
+            return [
+                name
+                for name in os.listdir(self._path)
+                if os.path.isfile(os.path.join(self._path, name))
+            ]
+        except OSError as e:
+            logger.warning(
+                "list_physical_files 실패 (%s): %s", self._source_id, e
+            )
+            return []
 
     def get_available_space(self) -> int:
         """사용 가능한 디스크 공간(바이트)을 반환한다."""
@@ -465,6 +488,21 @@ class LoopbackSource(StorageSource):
         if not os.path.isdir(full_path):
             return []
         return os.listdir(full_path)
+
+    def list_physical_files(self) -> list[str]:
+        """동반 디렉토리 직속의 물리 파일명 목록을 반환한다 (orphan GC용)."""
+        self._check_active()
+        try:
+            return [
+                name
+                for name in os.listdir(self._companion_dir)
+                if os.path.isfile(os.path.join(self._companion_dir, name))
+            ]
+        except OSError as e:
+            logger.warning(
+                "list_physical_files 실패 (%s): %s", self._source_id, e
+            )
+            return []
 
     def get_available_space(self) -> int:
         """가용 공간 = 예약 크기 - 추적된 사용량. O(1)."""

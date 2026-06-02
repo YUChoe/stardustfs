@@ -278,27 +278,38 @@ class MetadataStore:
         file_size: int,
         modified_at: float,
         device_id: str | None = None,
+        source_id: str | None = None,
+        physical_path: str | None = None,
     ) -> None:
         """파일 메타데이터를 갱신한다.
 
         version을 1 증가시키고 sync_status를 "pending"으로 설정한다.
         device_id는 이 변경을 수행한 디바이스 ID (없으면 기존 값 유지).
+        source_id/physical_path는 소유권 이전(takeover) 시 물리 위치를 함께
+        갱신하기 위해 사용한다 (없으면 기존 값 유지).
         """
         conn = self._get_conn()
+        set_clauses = [
+            "file_size = ?",
+            "modified_at = ?",
+            "version = version + 1",
+            "sync_status = 'pending'",
+        ]
+        params: list = [file_size, modified_at]
         if device_id is not None:
-            conn.execute(
-                "UPDATE files SET file_size = ?, modified_at = ?, "
-                "version = version + 1, sync_status = 'pending', device_id = ? "
-                "WHERE virtual_path = ?",
-                (file_size, modified_at, device_id, virtual_path),
-            )
-        else:
-            conn.execute(
-                "UPDATE files SET file_size = ?, modified_at = ?, "
-                "version = version + 1, sync_status = 'pending' "
-                "WHERE virtual_path = ?",
-                (file_size, modified_at, virtual_path),
-            )
+            set_clauses.append("device_id = ?")
+            params.append(device_id)
+        if source_id is not None:
+            set_clauses.append("source_id = ?")
+            params.append(source_id)
+        if physical_path is not None:
+            set_clauses.append("physical_path = ?")
+            params.append(physical_path)
+        params.append(virtual_path)
+        conn.execute(
+            f"UPDATE files SET {', '.join(set_clauses)} WHERE virtual_path = ?",
+            tuple(params),
+        )
         conn.commit()
 
     def increment_version(self, virtual_path: str, device_id: str) -> None:
@@ -448,6 +459,29 @@ class MetadataStore:
             sync_status=row["sync_status"],
             deleted=bool(row["deleted"]),
         )
+
+    def live_physical_paths_for_device(
+        self, device_id: str
+    ) -> set[tuple[str, str]]:
+        """orphan GC용 보존 집합을 반환한다.
+
+        삭제되지 않은(deleted=0) 레코드 중, 현재 디바이스 소유(device_id 일치)
+        이거나 소유자 미지정(device_id IS NULL, 레거시)인 것의
+        (source_id, physical_path) 집합을 반환한다.
+
+        이 집합에 포함된 물리 파일은 활성 metadata가 참조하므로 GC 대상에서
+        제외(보존)해야 한다.
+        """
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "SELECT source_id, physical_path FROM files "
+            "WHERE deleted = 0 AND (device_id = ? OR device_id IS NULL)",
+            (device_id,),
+        )
+        return {
+            (row["source_id"], row["physical_path"])
+            for row in cursor.fetchall()
+        }
 
     # --- 디렉토리 메타데이터 ---
 

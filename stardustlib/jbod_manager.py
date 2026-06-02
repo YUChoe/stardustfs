@@ -5,6 +5,7 @@
 """
 
 import logging
+import re
 import time
 import uuid
 
@@ -15,6 +16,10 @@ from stardustlib.models import EntryInfo, FileInfo
 from stardustlib.storage_source import StorageSource
 
 logger = logging.getLogger(__name__)
+
+# 물리 파일명 형식: <32자리 hex UUID>_<원본 파일명>. orphan GC는 이 형식의
+# 파일만 대상으로 하여 metadata DB 등 비관리 파일을 건드리지 않는다.
+_MANAGED_FILE_RE = re.compile(r"^[0-9a-f]{32}_")
 
 
 class JBODManager:
@@ -49,6 +54,15 @@ class JBODManager:
         }
         # device_id → 원격 디바이스 프록시 (RemoteSource). 크로스 디바이스 읽기 라우팅용.
         self._remote_devices: dict = {}
+        # orphan GC 디바운스: 소유권 이전/병합 감지 시 set, 사이클당 1회 스캔
+        self._gc_needed: bool = False
+
+    def mark_gc_needed(self) -> None:
+        """orphan GC가 필요함을 표시한다 (다음 사이클에 1회 스캔).
+
+        소유권 이전 또는 동기화 병합에서 소유권 변경을 감지했을 때 호출한다.
+        """
+        self._gc_needed = True
 
     def register_remote_device(self, device_id: str, remote) -> None:
         """원격 디바이스 프록시(RemoteSource)를 device_id로 등록한다.
@@ -213,14 +227,12 @@ class JBODManager:
         existing = self.metadata_store.lookup(virtual_path)
 
         if existing is not None:
-            # 원격 디바이스 소유 파일은 원격 쓰기를 하지 않는다 (읽기 전용 라우팅)
+            # 원격 디바이스 소유 파일 수정 → 로컬 소유권 이전(takeover, 3a)
             owner = existing.device_id
             if owner is not None and owner != self.device_id:
-                raise OSError(
-                    f"원격 디바이스 소유 파일은 수정할 수 없습니다: "
-                    f"{virtual_path} (owner={owner})"
-                )
-            # 기존 파일 덮어쓰기
+                self._takeover_write(virtual_path, encrypted, len(data))
+                return
+            # 기존 파일 덮어쓰기 (로컬 소유 또는 레거시 NULL)
             source = self._get_source_by_id(existing.source_id)
             if source is None or not source.is_active:
                 raise OSError(
@@ -269,6 +281,116 @@ class JBODManager:
                 if source.exists(physical_path):
                     source.delete(physical_path)
                 raise
+
+    def _takeover_write(
+        self, virtual_path: str, encrypted: bytes, plain_size: int
+    ) -> None:
+        """원격 소유 파일 수정 시 로컬 소유권 이전(3a).
+
+        로컬 소스에 새 내용을 기록하고 metadata의 device_id/source_id/
+        physical_path를 로컬로 갱신한다. 가상 경로는 유지된다. 원래 소유
+        디바이스의 물리 파일은 orphan이 되며 그 디바이스가 동기화 후 정리한다.
+
+        Raises:
+            InsufficientStorageError: 로컬 소스 공간 부족 시.
+        """
+        source = self.select_source(len(encrypted))
+        new_physical_path = self._generate_physical_path(virtual_path)
+
+        self.metadata_store.begin_transaction()
+        try:
+            source.write(new_physical_path, encrypted)
+            self.metadata_store.update(
+                virtual_path,
+                file_size=plain_size,
+                modified_at=time.time(),
+                device_id=self.device_id,
+                source_id=source.source_id,
+                physical_path=new_physical_path,
+            )
+            self.metadata_store.commit()
+        except OSError as e:
+            self.metadata_store.rollback()
+            if source.exists(new_physical_path):
+                source.delete(new_physical_path)
+            if "insufficient space" in str(e).lower():
+                raise InsufficientStorageError(str(e)) from e
+            raise
+        except Exception:
+            self.metadata_store.rollback()
+            if source.exists(new_physical_path):
+                source.delete(new_physical_path)
+            raise
+
+        # 사이클당 1회 GC를 위해 플래그만 set (파일마다 스캔하지 않음)
+        self._gc_needed = True
+        logger.info(
+            "소유권 이전 완료: %s → device=%s source=%s",
+            virtual_path, self.device_id, source.source_id,
+        )
+
+    def gc_orphan_files_if_needed(self) -> int:
+        """이전(takeover)/병합 감지로 플래그가 섰을 때만 orphan GC를 1회 수행한다.
+
+        다중 파일 동시 수정 시에도 사이클당 전체 스캔은 1회뿐이다.
+        """
+        if not self._gc_needed:
+            return 0
+        self._gc_needed = False
+        return self.gc_orphan_files()
+
+    def gc_orphan_files(self) -> int:
+        """로컬 소스의 고아 물리 파일을 삭제한다 (orphan GC).
+
+        활성 metadata가 현재 디바이스 소유(또는 레거시 NULL)로 참조하는 물리
+        파일은 보존하고, 그 외(소유권이 다른 디바이스로 이전되어 더 이상 참조되지
+        않는) 물리 파일을 삭제한다.
+
+        안전장치: device_id가 없으면(None) 보존 집합을 신뢰할 수 없으므로 전체를
+        건너뛴다(전체 삭제 위험 방지). 원격 소스는 스캔하지 않는다.
+
+        Returns:
+            삭제한 물리 파일 수.
+        """
+        if self.device_id is None:
+            logger.debug("device_id 없음, orphan GC 건너뜀")
+            return 0
+
+        live = self.metadata_store.live_physical_paths_for_device(self.device_id)
+        removed = 0
+        for source in self.sources:
+            if not source.is_active or source.is_remote:
+                continue
+            try:
+                names = source.list_physical_files()
+            except Exception as e:
+                logger.warning(
+                    "orphan GC: 물리 파일 목록 조회 실패 (%s): %s",
+                    source.source_id, e,
+                )
+                continue
+            for name in names:
+                # 우리가 만든 관리 파일(<hex32>_...)만 GC 대상. metadata DB,
+                # 사용자 직접 파일 등 비관리 파일은 절대 건드리지 않는다.
+                if not _MANAGED_FILE_RE.match(name):
+                    continue
+                if (source.source_id, name) in live:
+                    continue
+                try:
+                    source.delete(name)
+                    removed += 1
+                    logger.info(
+                        "orphan 물리 파일 삭제: source=%s file=%s",
+                        source.source_id, name,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "orphan 파일 삭제 실패 (%s/%s): %s",
+                        source.source_id, name, e,
+                    )
+        if removed:
+            logger.info("orphan GC 완료: %d개 물리 파일 삭제", removed)
+        return removed
 
     def delete_file(self, virtual_path: str) -> None:
         """파일을 삭제하고 메타데이터를 제거한다.

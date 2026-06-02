@@ -207,16 +207,28 @@ def test_router_remote_unregistered_raises():
         shutil.rmtree(d, ignore_errors=True)
 
 
-def test_router_remote_write_rejected():
-    """원격 소유 파일에 write_file은 OSError (읽기 전용)."""
+def test_router_remote_write_takes_over_ownership():
+    """원격 소유 파일을 수정하면 로컬 소유권으로 이전된다 (3a)."""
     d = tempfile.mkdtemp()
     jbod, store = _make_jbod(d, "dev-local")
     try:
         now = time.time()
         store.insert("/r.txt", "loop-001", "phys/r.txt", 10, now, now,
                      device_id="dev-remote")
-        with pytest.raises(OSError):
-            jbod.write_file("/r.txt", b"try overwrite")
+
+        # 원격 소유 파일 수정 → OSError 대신 로컬 소유권 이전
+        jbod.write_file("/r.txt", b"local edit")
+
+        rec = store.lookup("/r.txt")
+        assert rec is not None
+        # 소유권이 로컬로 이전됨
+        assert rec.device_id == "dev-local"
+        # 로컬 소스로 물리 위치 변경
+        assert rec.source_id == "loop-local"
+        # 가상 경로 유지, 내용 반영
+        assert jbod.read_file("/r.txt") == b"local edit"
+        # GC 필요 플래그가 섰다(파일마다가 아니라 1회)
+        assert jbod._gc_needed is True
     finally:
         store.close()
         shutil.rmtree(d, ignore_errors=True)

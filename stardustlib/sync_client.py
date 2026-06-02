@@ -97,6 +97,9 @@ class SyncClient:
         await self._merge_server_metadata(server_db_blob)
         logger.info("Initial sync completed.")
 
+        # 시작 시 1회 orphan GC: 이전 세션에서 소유권을 잃은 물리 파일을 정리한다.
+        self._run_orphan_gc(startup=True)
+
     async def start_periodic_sync(self) -> None:
         """주기적 동기화 루프 시작."""
         if self._running:
@@ -421,6 +424,25 @@ class SyncClient:
 
     # --- 내부 메서드 ---
 
+    def _run_orphan_gc(self, startup: bool = False) -> None:
+        """orphan GC를 안전하게 실행한다 (동기화 자체를 막지 않음).
+
+        startup=True이면 플래그와 무관하게 1회 전체 스캔(이전 세션 정리),
+        그 외에는 이번 사이클에 소유권 이전/감지가 있었을 때만 1회 스캔한다.
+        """
+        jbod = self._jbod_manager
+        if jbod is None:
+            return
+        try:
+            if startup:
+                if hasattr(jbod, "gc_orphan_files"):
+                    jbod.gc_orphan_files()
+            else:
+                if hasattr(jbod, "gc_orphan_files_if_needed"):
+                    jbod.gc_orphan_files_if_needed()
+        except Exception as e:
+            logger.warning("orphan GC 실패(무시하고 계속): %s", e)
+
     async def _periodic_loop(self) -> None:
         """interval_seconds마다 upload_metadata()를 호출하는 루프."""
         logger.info("_periodic_loop started, interval=%ds", self._interval_seconds)
@@ -429,6 +451,7 @@ class SyncClient:
             logger.info("Periodic sync cycle: initial sync on start")
             await self._download_and_merge()
             await self.upload_metadata()
+            self._run_orphan_gc()
         except Exception as e:
             logger.error("Periodic sync initial error: %s", e)
 
@@ -441,6 +464,8 @@ class SyncClient:
                 # 양방향 동기화: 다운로드(병합) → 업로드
                 await self._download_and_merge()
                 await self.upload_metadata()
+                # 사이클 종료 후 필요 시에만 orphan GC (사이클당 1회)
+                self._run_orphan_gc()
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -569,6 +594,9 @@ class SyncClient:
                     "Merge: updated from server: %s (server_v=%d > local_v=%d)",
                     server_rec.virtual_path, server_version, local_version,
                 )
+            # 소유권 이전 감지: 내가 소유하던 레코드가 다른 디바이스 소유로 바뀌면
+            # 내 로컬 물리 파일이 orphan이 된다 → 다음 사이클에 GC 필요.
+            self._detect_ownership_loss(local_rec, server_rec)
             self._update_from_server(server_rec)
         elif local_version > server_version:
             # 로컬이 더 최신 → 다음 업로드 시 반영 (아무 작업 안 함)
@@ -576,6 +604,27 @@ class SyncClient:
         else:
             # version 동일 → 변경 없음
             pass
+
+    def _detect_ownership_loss(
+        self, local_rec: FileMetadata, server_rec: FileMetadata
+    ) -> None:
+        """소유권 이전으로 로컬 물리 파일이 orphan이 되는지 감지한다.
+
+        로컬 레코드가 이 디바이스 소유였는데(local device_id == 내 device_id),
+        서버 레코드에서 다른 디바이스 소유로 바뀌었다면, 내 로컬 물리 파일은 더
+        이상 metadata가 가리키지 않는 orphan이 된다. JBODManager에 GC 필요
+        플래그를 세운다(다음 사이클 1회 스캔).
+        """
+        jbod = self._jbod_manager
+        if jbod is None:
+            return
+        my_device = getattr(jbod, "device_id", None)
+        if my_device is None:
+            return
+        if server_rec.deleted:
+            return  # 삭제는 기존 tombstone 물리 삭제 경로가 처리
+        if local_rec.device_id == my_device and server_rec.device_id != my_device:
+            jbod.mark_gc_needed()
 
     def _handle_conflict(
         self, server_rec: FileMetadata, local_rec: FileMetadata
