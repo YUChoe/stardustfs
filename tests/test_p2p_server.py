@@ -13,7 +13,7 @@ from aiohttp import web
 from stardustlib.auth_client import AuthClient
 from stardustlib.jbod_manager import JBODManager
 from stardustlib.p2p_server import P2PServer
-from stardustlib.storage_source import DirectorySource
+from stardustlib.storage_source import DirectorySource, LoopbackSource
 
 
 @pytest.fixture
@@ -605,6 +605,56 @@ class TestDispatch:
             f.write(b"x")
         status, result = p2p_server.dispatch(
             "exists", {"physical_path": "e.bin", "source_id": "vol1"}
+        )
+        assert status == 200
+        assert result["exists"] is True
+
+
+class TestDispatchLoopback:
+    """LoopbackSource에서 dispatch가 동반 디렉토리 경로로 올바르게 동작하는지 검증.
+
+    회귀: LoopbackSource는 실제 파일을 path + '.d' 동반 디렉토리에 저장한다.
+    dispatch가 source.path 기준으로 os.path.isfile을 검사하면 항상 404가 났다
+    (실서버 릴레이 read에서 발견된 버그).
+    """
+
+    @pytest.fixture
+    def loopback_p2p(self, tmp_path):
+        img = str(tmp_path / "vol.img")
+        source = LoopbackSource("loop-001", img, 10 * 1024 * 1024)
+        source.initialize()
+        store = MagicMock()
+        jbod = JBODManager(sources=[source], metadata_store=store)
+        auth = MagicMock(spec=AuthClient)
+        auth.user_id = "u1"
+        return P2PServer(jbod, auth, 9999, "http://localhost:8000"), source
+
+    def test_dispatch_read_loopback(self, loopback_p2p):
+        """동반 디렉토리에 기록한 파일을 dispatch read로 읽는다."""
+        server, source = loopback_p2p
+        data = b"loopback relayed content"
+        source.write("abc_file.txt", data)
+
+        status, result = server.dispatch(
+            "read", {"physical_path": "abc_file.txt", "source_id": "loop-001"}
+        )
+        assert status == 200
+        assert base64.b64decode(result["data"]) == data
+
+    def test_dispatch_read_loopback_missing(self, loopback_p2p):
+        """없는 파일은 404."""
+        server, _source = loopback_p2p
+        status, result = server.dispatch(
+            "read", {"physical_path": "nope.txt", "source_id": "loop-001"}
+        )
+        assert status == 404
+
+    def test_dispatch_exists_loopback(self, loopback_p2p):
+        """exists도 동반 디렉토리 기준으로 동작한다."""
+        server, source = loopback_p2p
+        source.write("present.txt", b"x")
+        status, result = server.dispatch(
+            "exists", {"physical_path": "present.txt", "source_id": "loop-001"}
         )
         assert status == 200
         assert result["exists"] is True

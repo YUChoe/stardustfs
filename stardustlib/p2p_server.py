@@ -195,14 +195,13 @@ class P2PServer:
             return source
 
         physical_path = body.get("physical_path", "")
-        err = self._validate_path_err(physical_path, source.path)
+        err = self._validate_path_err(physical_path, self._source_data_root(source))
         if err is not None:
             return err
 
-        full_path = os.path.join(source.path, physical_path)
-        if not os.path.isfile(full_path):
-            return 404, {"error": "File not found"}
-
+        # 파일 존재 확인은 소스에 위임한다. LoopbackSource는 실제 데이터를
+        # 동반 디렉토리(path + '.d')에 저장하므로 source.path로 직접 isfile을
+        # 검사하면 안 된다(항상 404). source.read의 FileNotFoundError로 판별.
         try:
             data = source.read(physical_path)
         except FileNotFoundError:
@@ -213,8 +212,14 @@ class P2PServer:
 
     def _op_write(self, body: dict) -> tuple[int, dict]:
         """파일 쓰기 로직."""
+        source = self._select_source_or_error(body)
+        if isinstance(source, tuple):
+            source = self._jbod_manager.sources[0] if self._jbod_manager.sources else None
+            if source is None:
+                return 404, {"error": "No source available"}
+
         physical_path = body.get("physical_path", "")
-        err = self._validate_path_err(physical_path)
+        err = self._validate_path_err(physical_path, self._source_data_root(source))
         if err is not None:
             return err
 
@@ -227,25 +232,25 @@ class P2PServer:
         if len(data) > MAX_WRITE_SIZE:
             return 413, {"error": "Payload too large (max 100MB)"}
 
-        source = self._jbod_manager.sources[0]
-        full_path = os.path.join(source.path, physical_path)
-        parent = os.path.dirname(full_path)
-        if parent and not os.path.isdir(parent):
-            os.makedirs(parent, exist_ok=True)
-
+        # 상위 디렉토리 생성은 소스 구현에 위임한다(LoopbackSource는 동반
+        # 디렉토리에 기록하며 내부에서 부모를 생성).
         source.write(physical_path, data)
         return 200, {"bytes_written": len(data)}
 
     def _op_delete(self, body: dict) -> tuple[int, dict]:
         """파일 삭제 로직."""
+        source = self._select_source_or_error(body)
+        if isinstance(source, tuple):
+            source = self._jbod_manager.sources[0] if self._jbod_manager.sources else None
+            if source is None:
+                return 404, {"error": "No source available"}
+
         physical_path = body.get("physical_path", "")
-        err = self._validate_path_err(physical_path)
+        err = self._validate_path_err(physical_path, self._source_data_root(source))
         if err is not None:
             return err
 
-        source = self._jbod_manager.sources[0]
-        full_path = os.path.join(source.path, physical_path)
-        if not os.path.exists(full_path):
+        if not source.exists(physical_path):
             return 404, {"error": "File not found"}
 
         try:
@@ -262,11 +267,11 @@ class P2PServer:
             return source
 
         physical_path = body.get("physical_path", "")
-        err = self._validate_path_err(physical_path, source.path)
+        err = self._validate_path_err(physical_path, self._source_data_root(source))
         if err is not None:
             return err
 
-        full_path = os.path.join(source.path, physical_path)
+        full_path = os.path.join(self._source_data_root(source), physical_path)
         if not os.path.isdir(full_path):
             return 404, {"error": "Directory not found"}
 
@@ -280,7 +285,7 @@ class P2PServer:
             return source
 
         physical_path = body.get("physical_path", "")
-        err = self._validate_path_err(physical_path, source.path)
+        err = self._validate_path_err(physical_path, self._source_data_root(source))
         if err is not None:
             return err
 
@@ -289,24 +294,34 @@ class P2PServer:
 
     def _op_mkdir(self, body: dict) -> tuple[int, dict]:
         """디렉토리 생성 로직."""
+        source = self._select_source_or_error(body)
+        if isinstance(source, tuple):
+            source = self._jbod_manager.sources[0] if self._jbod_manager.sources else None
+            if source is None:
+                return 404, {"error": "No source available"}
+
         physical_path = body.get("physical_path", "")
-        err = self._validate_path_err(physical_path)
+        err = self._validate_path_err(physical_path, self._source_data_root(source))
         if err is not None:
             return err
 
-        source = self._jbod_manager.sources[0]
         source.mkdir(physical_path)
         return 200, {"status": "created"}
 
     def _op_rmdir(self, body: dict) -> tuple[int, dict]:
         """디렉토리 삭제 로직."""
+        source = self._select_source_or_error(body)
+        if isinstance(source, tuple):
+            source = self._jbod_manager.sources[0] if self._jbod_manager.sources else None
+            if source is None:
+                return 404, {"error": "No source available"}
+
         physical_path = body.get("physical_path", "")
-        err = self._validate_path_err(physical_path)
+        err = self._validate_path_err(physical_path, self._source_data_root(source))
         if err is not None:
             return err
 
-        source = self._jbod_manager.sources[0]
-        full_path = os.path.join(source.path, physical_path)
+        full_path = os.path.join(self._source_data_root(source), physical_path)
         if not os.path.isdir(full_path):
             return 404, {"error": "Directory not found"}
 
@@ -453,6 +468,18 @@ class P2PServer:
             )
 
         return data
+
+    def _source_data_root(self, source) -> str:
+        """소스의 실제 데이터 루트를 반환한다.
+
+        LoopbackSource는 동반 디렉토리(path + '.d')에 실제 파일을 저장하므로
+        traversal 검증의 기준 루트도 그 디렉토리여야 한다. 그 외 소스는
+        source.path를 사용한다.
+        """
+        companion = getattr(source, "_companion_dir", None)
+        if companion:
+            return companion
+        return source.path
 
     def _select_source_or_error(self, body: dict):
         """요청 body의 source_id로 소스를 선택한다.
