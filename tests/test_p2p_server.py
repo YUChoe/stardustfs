@@ -546,3 +546,65 @@ async def test_space_info(client):
         assert "total" in data
         assert data["available"] > 0
         assert data["total"] > 0
+
+
+class TestDispatch:
+    """dispatch(op, payload) — 릴레이 워커용 작업 디스패치."""
+
+    def test_dispatch_read(self, p2p_server, tmp_source_dir):
+        """read op가 파일 데이터를 base64로 반환한다."""
+        data = b"dispatch read"
+        with open(os.path.join(tmp_source_dir, "d.bin"), "wb") as f:
+            f.write(data)
+
+        status, result = p2p_server.dispatch(
+            "read", {"physical_path": "d.bin", "source_id": "vol1"}
+        )
+        assert status == 200
+        assert base64.b64decode(result["data"]) == data
+
+    def test_dispatch_read_not_found(self, p2p_server):
+        """없는 파일은 404."""
+        status, result = p2p_server.dispatch(
+            "read", {"physical_path": "missing.bin"}
+        )
+        assert status == 404
+        assert "error" in result
+
+    def test_dispatch_write_then_read(self, p2p_server, tmp_source_dir):
+        """write op로 기록 후 read로 동일 데이터를 읽는다."""
+        payload_b64 = base64.b64encode(b"written via dispatch").decode("ascii")
+        status, result = p2p_server.dispatch(
+            "write", {"physical_path": "w.bin", "data": payload_b64}
+        )
+        assert status == 200
+        assert result["bytes_written"] == len(b"written via dispatch")
+
+        status2, result2 = p2p_server.dispatch(
+            "read", {"physical_path": "w.bin"}
+        )
+        assert status2 == 200
+        assert base64.b64decode(result2["data"]) == b"written via dispatch"
+
+    def test_dispatch_unknown_op(self, p2p_server):
+        """알 수 없는 op는 400."""
+        status, result = p2p_server.dispatch("frobnicate", {})
+        assert status == 400
+        assert "error" in result
+
+    def test_dispatch_path_traversal(self, p2p_server):
+        """traversal 경로는 400."""
+        status, result = p2p_server.dispatch(
+            "read", {"physical_path": "../escape.bin"}
+        )
+        assert status == 400
+
+    def test_dispatch_exists(self, p2p_server, tmp_source_dir):
+        """exists op."""
+        with open(os.path.join(tmp_source_dir, "e.bin"), "wb") as f:
+            f.write(b"x")
+        status, result = p2p_server.dispatch(
+            "exists", {"physical_path": "e.bin", "source_id": "vol1"}
+        )
+        assert status == 200
+        assert result["exists"] is True

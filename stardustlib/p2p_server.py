@@ -98,41 +98,123 @@ class P2PServer:
         body = await self._parse_and_verify(request, allow_share_token=True)
         if isinstance(body, web.Response):
             return body
-
-        source = self._select_source(body)
-        if isinstance(source, web.Response):
-            return source
-
-        physical_path = body.get("physical_path", "")
-        err = self._validate_path(physical_path, source.path)
-        if err is not None:
-            return err
-
-        full_path = os.path.join(source.path, physical_path)
-
-        if not os.path.isfile(full_path):
-            return web.json_response(
-                {"error": "File not found"}, status=404
-            )
-
-        try:
-            data = source.read(physical_path)
-        except FileNotFoundError:
-            return web.json_response(
-                {"error": "File not found"}, status=404
-            )
-
-        encoded = base64.b64encode(data).decode("ascii")
-        return web.json_response({"data": encoded})
+        status, result = self._op_read(body)
+        return web.json_response(result, status=status)
 
     async def handle_write(self, request: web.Request) -> web.Response:
         """POST /p2p/write: 파일 쓰기."""
         body = await self._parse_and_verify(request)
         if isinstance(body, web.Response):
             return body
+        status, result = self._op_write(body)
+        return web.json_response(result, status=status)
+
+    async def handle_delete(self, request: web.Request) -> web.Response:
+        """POST /p2p/delete: 파일 삭제."""
+        body = await self._parse_and_verify(request)
+        if isinstance(body, web.Response):
+            return body
+        status, result = self._op_delete(body)
+        return web.json_response(result, status=status)
+
+    async def handle_list(self, request: web.Request) -> web.Response:
+        """POST /p2p/list: 디렉토리 목록."""
+        body = await self._parse_and_verify(request)
+        if isinstance(body, web.Response):
+            return body
+        status, result = self._op_list(body)
+        return web.json_response(result, status=status)
+
+    async def handle_exists(self, request: web.Request) -> web.Response:
+        """POST /p2p/exists: 경로 존재 여부."""
+        body = await self._parse_and_verify(request)
+        if isinstance(body, web.Response):
+            return body
+        status, result = self._op_exists(body)
+        return web.json_response(result, status=status)
+
+    async def handle_mkdir(self, request: web.Request) -> web.Response:
+        """POST /p2p/mkdir: 디렉토리 생성."""
+        body = await self._parse_and_verify(request)
+        if isinstance(body, web.Response):
+            return body
+        status, result = self._op_mkdir(body)
+        return web.json_response(result, status=status)
+
+    async def handle_rmdir(self, request: web.Request) -> web.Response:
+        """POST /p2p/rmdir: 디렉토리 삭제."""
+        body = await self._parse_and_verify(request)
+        if isinstance(body, web.Response):
+            return body
+        status, result = self._op_rmdir(body)
+        return web.json_response(result, status=status)
+
+    async def handle_space(self, request: web.Request) -> web.Response:
+        """POST /p2p/space: 용량 정보."""
+        body = await self._parse_and_verify(request)
+        if isinstance(body, web.Response):
+            return body
+        status, result = self._op_space(body)
+        return web.json_response(result, status=status)
+
+    # --- 작업 디스패치 (릴레이 워커가 인증 없이 직접 호출) ---
+
+    def dispatch(self, op: str, payload: dict) -> tuple[int, dict]:
+        """op 이름으로 작업 로직을 실행하고 (status, result)를 반환한다.
+
+        릴레이 워커가 사용한다. 인가는 중앙 서버(릴레이)가 user_id 일치로
+        이미 보장하므로 여기서는 토큰 검증을 하지 않는다.
+        share_token이 payload에 있어도 dispatch 경로에서는 무시한다(릴레이는
+        같은 유저 디바이스 간만 허용되므로 공유 토큰 경로가 필요 없음).
+        """
+        op_map = {
+            "read": self._op_read,
+            "write": self._op_write,
+            "delete": self._op_delete,
+            "list": self._op_list,
+            "exists": self._op_exists,
+            "mkdir": self._op_mkdir,
+            "rmdir": self._op_rmdir,
+            "space": self._op_space,
+        }
+        handler = op_map.get(op)
+        if handler is None:
+            return 400, {"error": f"Unknown op: {op}"}
+        try:
+            return handler(payload)
+        except Exception as e:
+            logger.error("Relay dispatch op=%s 실패: %s", op, e, exc_info=True)
+            return 500, {"error": "Internal error"}
+
+    # --- 작업 로직 (handle_* 와 dispatch 가 공유) ---
+
+    def _op_read(self, body: dict) -> tuple[int, dict]:
+        """파일 읽기 로직."""
+        source = self._select_source_or_error(body)
+        if isinstance(source, tuple):
+            return source
 
         physical_path = body.get("physical_path", "")
-        err = self._validate_path(physical_path)
+        err = self._validate_path_err(physical_path, source.path)
+        if err is not None:
+            return err
+
+        full_path = os.path.join(source.path, physical_path)
+        if not os.path.isfile(full_path):
+            return 404, {"error": "File not found"}
+
+        try:
+            data = source.read(physical_path)
+        except FileNotFoundError:
+            return 404, {"error": "File not found"}
+
+        encoded = base64.b64encode(data).decode("ascii")
+        return 200, {"data": encoded}
+
+    def _op_write(self, body: dict) -> tuple[int, dict]:
+        """파일 쓰기 로직."""
+        physical_path = body.get("physical_path", "")
+        err = self._validate_path_err(physical_path)
         if err is not None:
             return err
 
@@ -140,144 +222,104 @@ class P2PServer:
         try:
             data = base64.b64decode(data_b64)
         except Exception:
-            return web.json_response(
-                {"error": "Invalid base64 data"}, status=400
-            )
+            return 400, {"error": "Invalid base64 data"}
 
         if len(data) > MAX_WRITE_SIZE:
-            return web.json_response(
-                {"error": "Payload too large (max 100MB)"}, status=413
-            )
+            return 413, {"error": "Payload too large (max 100MB)"}
 
         source = self._jbod_manager.sources[0]
-        # 상위 디렉토리 자동 생성
         full_path = os.path.join(source.path, physical_path)
         parent = os.path.dirname(full_path)
         if parent and not os.path.isdir(parent):
             os.makedirs(parent, exist_ok=True)
 
         source.write(physical_path, data)
-        return web.json_response({"bytes_written": len(data)})
+        return 200, {"bytes_written": len(data)}
 
-    async def handle_delete(self, request: web.Request) -> web.Response:
-        """POST /p2p/delete: 파일 삭제."""
-        body = await self._parse_and_verify(request)
-        if isinstance(body, web.Response):
-            return body
-
+    def _op_delete(self, body: dict) -> tuple[int, dict]:
+        """파일 삭제 로직."""
         physical_path = body.get("physical_path", "")
-        err = self._validate_path(physical_path)
+        err = self._validate_path_err(physical_path)
         if err is not None:
             return err
 
         source = self._jbod_manager.sources[0]
         full_path = os.path.join(source.path, physical_path)
-
         if not os.path.exists(full_path):
-            return web.json_response(
-                {"error": "File not found"}, status=404
-            )
+            return 404, {"error": "File not found"}
 
         try:
             source.delete(physical_path)
         except FileNotFoundError:
-            return web.json_response(
-                {"error": "File not found"}, status=404
-            )
+            return 404, {"error": "File not found"}
 
-        return web.json_response({"status": "deleted"})
+        return 200, {"status": "deleted"}
 
-    async def handle_list(self, request: web.Request) -> web.Response:
-        """POST /p2p/list: 디렉토리 목록."""
-        body = await self._parse_and_verify(request)
-        if isinstance(body, web.Response):
-            return body
-
-        source = self._select_source(body)
-        if isinstance(source, web.Response):
+    def _op_list(self, body: dict) -> tuple[int, dict]:
+        """디렉토리 목록 로직."""
+        source = self._select_source_or_error(body)
+        if isinstance(source, tuple):
             return source
 
         physical_path = body.get("physical_path", "")
-        err = self._validate_path(physical_path, source.path)
+        err = self._validate_path_err(physical_path, source.path)
         if err is not None:
             return err
 
         full_path = os.path.join(source.path, physical_path)
-
         if not os.path.isdir(full_path):
-            return web.json_response(
-                {"error": "Directory not found"}, status=404
-            )
+            return 404, {"error": "Directory not found"}
 
         entries = source.list_dir(physical_path)
-        return web.json_response({"entries": entries})
+        return 200, {"entries": entries}
 
-    async def handle_exists(self, request: web.Request) -> web.Response:
-        """POST /p2p/exists: 경로 존재 여부."""
-        body = await self._parse_and_verify(request)
-        if isinstance(body, web.Response):
-            return body
-
-        source = self._select_source(body)
-        if isinstance(source, web.Response):
+    def _op_exists(self, body: dict) -> tuple[int, dict]:
+        """경로 존재 여부 로직."""
+        source = self._select_source_or_error(body)
+        if isinstance(source, tuple):
             return source
 
         physical_path = body.get("physical_path", "")
-        err = self._validate_path(physical_path, source.path)
+        err = self._validate_path_err(physical_path, source.path)
         if err is not None:
             return err
 
         exists = source.exists(physical_path)
-        return web.json_response({"exists": exists})
+        return 200, {"exists": exists}
 
-    async def handle_mkdir(self, request: web.Request) -> web.Response:
-        """POST /p2p/mkdir: 디렉토리 생성."""
-        body = await self._parse_and_verify(request)
-        if isinstance(body, web.Response):
-            return body
-
+    def _op_mkdir(self, body: dict) -> tuple[int, dict]:
+        """디렉토리 생성 로직."""
         physical_path = body.get("physical_path", "")
-        err = self._validate_path(physical_path)
+        err = self._validate_path_err(physical_path)
         if err is not None:
             return err
 
         source = self._jbod_manager.sources[0]
         source.mkdir(physical_path)
-        return web.json_response({"status": "created"})
+        return 200, {"status": "created"}
 
-    async def handle_rmdir(self, request: web.Request) -> web.Response:
-        """POST /p2p/rmdir: 디렉토리 삭제."""
-        body = await self._parse_and_verify(request)
-        if isinstance(body, web.Response):
-            return body
-
+    def _op_rmdir(self, body: dict) -> tuple[int, dict]:
+        """디렉토리 삭제 로직."""
         physical_path = body.get("physical_path", "")
-        err = self._validate_path(physical_path)
+        err = self._validate_path_err(physical_path)
         if err is not None:
             return err
 
         source = self._jbod_manager.sources[0]
         full_path = os.path.join(source.path, physical_path)
-
         if not os.path.isdir(full_path):
-            return web.json_response(
-                {"error": "Directory not found"}, status=404
-            )
+            return 404, {"error": "Directory not found"}
 
         source.rmdir(physical_path)
-        return web.json_response({"status": "removed"})
+        return 200, {"status": "removed"}
 
-    async def handle_space(self, request: web.Request) -> web.Response:
-        """POST /p2p/space: 용량 정보."""
-        body = await self._parse_and_verify(request)
-        if isinstance(body, web.Response):
-            return body
-
+    def _op_space(self, body: dict) -> tuple[int, dict]:
+        """용량 정보 로직."""
         source = self._jbod_manager.sources[0]
-        return web.json_response({
+        return 200, {
             "available": source.get_available_space(),
             "total": source.get_total_space(),
-        })
+        }
 
     # --- 내부 헬퍼 ---
 
@@ -412,43 +454,37 @@ class P2PServer:
 
         return data
 
-    def _select_source(self, body: dict):
+    def _select_source_or_error(self, body: dict):
         """요청 body의 source_id로 소스를 선택한다.
 
         source_id가 있으면 그 소스를, 없으면 첫 소스(구버전 호환)를 반환한다.
-        존재하지 않는 source_id이거나 소스가 하나도 없으면 에러 Response를 반환한다.
+        실패 시 (status, result) 튜플을 반환한다.
         """
         source_id = body.get("source_id")
         if source_id:
             src = self._jbod_manager._get_source_by_id(source_id)
             if src is None:
-                return web.json_response(
-                    {"error": "Source not found"}, status=404
-                )
+                return 404, {"error": "Source not found"}
             return src
         if self._jbod_manager.sources:
             return self._jbod_manager.sources[0]
-        return web.json_response({"error": "No source available"}, status=404)
+        return 404, {"error": "No source available"}
 
-    def _validate_path(
+    def _validate_path_err(
         self, physical_path: str, source_root: str | None = None
-    ) -> web.Response | None:
+    ) -> tuple[int, dict] | None:
         """Path traversal 방지 검증.
 
-        ".." 세그먼트 포함 또는 정규화 후 소스 루트 외부 참조 시 400 반환.
-        source_root가 None이면 첫 소스 루트(_source_root)를 사용한다.
+        ".." 세그먼트 포함 또는 정규화 후 소스 루트 외부 참조 시 (400, ...)을
+        반환한다. source_root가 None이면 첫 소스 루트를 사용한다.
         유효하면 None 반환.
         """
         if not physical_path:
-            return web.json_response(
-                {"error": "Missing physical_path"}, status=400
-            )
+            return 400, {"error": "Missing physical_path"}
 
         # ".." 세그먼트 검사
         if ".." in physical_path.replace("\\", "/").split("/"):
-            return web.json_response(
-                {"error": "Path traversal detected"}, status=400
-            )
+            return 400, {"error": "Path traversal detected"}
 
         # 정규화 후 소스 루트 내부인지 확인
         root = source_root if source_root is not None else self._source_root
@@ -457,13 +493,17 @@ class P2PServer:
             os.path.join(source_root_norm, physical_path)
         )
 
-        # 소스 루트로 시작하는지 확인 (os.sep 추가로 정확한 접두사 매칭)
         if not (
             resolved == source_root_norm
             or resolved.startswith(source_root_norm + os.sep)
         ):
-            return web.json_response(
-                {"error": "Path traversal detected"}, status=400
-            )
+            return 400, {"error": "Path traversal detected"}
 
         return None
+
+    # 하위 호환 별칭 (기존 테스트가 직접 참조)
+    def _validate_path(
+        self, physical_path: str, source_root: str | None = None
+    ) -> tuple[int, dict] | None:
+        """_validate_path_err의 별칭 (유효 시 None, 거부 시 (status, dict))."""
+        return self._validate_path_err(physical_path, source_root)

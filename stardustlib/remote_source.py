@@ -85,6 +85,8 @@ class RemoteSource(StorageSource):
         # 재네고시에이션(refresh) throttle: 마지막 시도 시각, 최소 간격(초)
         self._last_refresh_at: float = 0.0
         self._refresh_min_interval: float = 30.0
+        # 직접 연결 실패 시 릴레이 fallback 사용 여부
+        self._relay_enabled: bool = True
 
     @property
     def device_id(self) -> str:
@@ -353,15 +355,17 @@ class RemoteSource(StorageSource):
         try:
             response = await self._client.post(url, json=request_body)
         except httpx.TimeoutException as e:
-            raise OSError(
-                f"RemoteSource '{self._source_id}': "
-                f"P2P request timed out ({endpoint}): {e}"
-            ) from e
+            logger.info(
+                "직접 P2P 타임아웃(%s) — 릴레이 fallback 시도: %s",
+                endpoint, self._device_id,
+            )
+            return await self._relay_fallback(endpoint, payload, e)
         except (httpx.ConnectError, httpx.NetworkError) as e:
-            raise OSError(
-                f"RemoteSource '{self._source_id}': "
-                f"P2P connection failed ({endpoint}): {e}"
-            ) from e
+            logger.info(
+                "직접 P2P 연결 실패(%s) — 릴레이 fallback 시도: %s",
+                endpoint, self._device_id,
+            )
+            return await self._relay_fallback(endpoint, payload, e)
 
         # 401 시 토큰 갱신 후 1회 재시도
         if response.status_code == 401 and retry:
@@ -384,3 +388,58 @@ class RemoteSource(StorageSource):
             )
 
         return response.json()
+
+    # endpoint("/p2p/read") → op("read") 매핑
+    _ENDPOINT_OP = {
+        "/p2p/read": "read",
+        "/p2p/write": "write",
+        "/p2p/delete": "delete",
+        "/p2p/list": "list",
+        "/p2p/exists": "exists",
+        "/p2p/mkdir": "mkdir",
+        "/p2p/rmdir": "rmdir",
+        "/p2p/space": "space",
+    }
+
+    async def _relay_fallback(
+        self,
+        endpoint: str,
+        payload: dict[str, Any],
+        direct_error: Exception,
+    ) -> dict[str, Any]:
+        """직접 연결 실패 시 중앙 서버 릴레이로 동일 작업을 전달한다.
+
+        릴레이가 비활성이거나 릴레이도 실패하면 원래의 직접 연결 오류 맥락을
+        담아 OSError를 발생시킨다(조용한 건너뛰기 금지).
+        """
+        if not self._relay_enabled:
+            raise OSError(
+                f"RemoteSource '{self._source_id}': "
+                f"P2P direct failed ({endpoint}): {direct_error}"
+            ) from direct_error
+
+        op = self._ENDPOINT_OP.get(endpoint)
+        if op is None:
+            raise OSError(
+                f"RemoteSource '{self._source_id}': "
+                f"relay unsupported endpoint {endpoint}"
+            ) from direct_error
+
+        from stardustlib.relay_client import RelayClient
+
+        relay = RelayClient(
+            self._auth_client,
+            self._server_url,
+            self._device_id,
+            self._io,
+        )
+        try:
+            # 이미 _io 이벤트 루프 컨텍스트에서 실행 중이므로 비동기 메서드를
+            # 직접 await한다 (동기 래퍼는 같은 루프 재진입이라 사용 불가).
+            return await relay.request_async(op, payload)
+        except OSError as relay_error:
+            raise OSError(
+                f"RemoteSource '{self._source_id}': "
+                f"P2P direct failed ({endpoint}: {direct_error}); "
+                f"relay also failed: {relay_error}"
+            ) from relay_error

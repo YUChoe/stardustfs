@@ -319,12 +319,24 @@ async def startup_v2(config: dict, config_path: str) -> None:
     from stardustlib.p2p_server import P2PServer
 
     p2p_server = None
+    relay_worker = None
     p2p_enabled = p2p_config.get("enabled", False)
 
     if p2p_enabled:
         p2p_server = P2PServer(jbod_manager, auth_client, p2p_port, server_url)
         await p2p_server.start()
         await device_mgr.setup_upnp()
+
+        # 릴레이 워커 시작 (직접 연결 불가 환경의 fallback 수신).
+        # device_id가 확보된 경우에만 시작한다.
+        device_id = device_mgr.device_id
+        if p2p_config.get("relay_enabled", True) and device_id:
+            from stardustlib.relay_worker import RelayWorker
+
+            relay_worker = RelayWorker(
+                p2p_server, auth_client, server_url, device_id
+            )
+            await relay_worker.start()
 
     await device_mgr.start_heartbeat()
     await sync_client.start_periodic_sync()
@@ -347,6 +359,8 @@ async def startup_v2(config: dict, config_path: str) -> None:
         # 정리
         await sync_client.stop()
         await device_mgr.stop()
+        if relay_worker is not None:
+            await relay_worker.stop()
         if p2p_server is not None:
             await p2p_server.stop()
         await auth_client.close()

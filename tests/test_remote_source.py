@@ -271,6 +271,8 @@ class TestRead:
 
     def test_read_timeout(self, remote_source, httpx_mock):
         _activate(remote_source)
+        # 릴레이 비활성: 직접 연결 timeout이 곧바로 OSError가 되는지 검증
+        remote_source._relay_enabled = False
 
         httpx_mock.add_exception(
             httpx.TimeoutException("timed out"),
@@ -303,6 +305,101 @@ class TestRead:
 
         with pytest.raises(OSError, match="HTTP 404"):
             remote_source.read("dir/missing.enc")
+
+
+class TestRelayFallback:
+    """직접 연결 실패 시 릴레이 fallback 테스트."""
+
+    _RELAY_REQ = "https://api.stardustfs.io/relay/request"
+
+    def test_direct_timeout_falls_back_to_relay(
+        self, remote_source, httpx_mock
+    ):
+        """직접 연결 timeout이면 릴레이로 전환해 read에 성공한다."""
+        _activate(remote_source)
+        file_data = b"relayed bytes"
+        encoded = base64.b64encode(file_data).decode("ascii")
+
+        # 직접 연결: timeout
+        httpx_mock.add_exception(
+            httpx.TimeoutException("timed out"),
+            url="http://192.168.1.100:9090/p2p/read",
+        )
+        # 릴레이: 요청 적재 → request_id
+        httpx_mock.add_response(
+            url=self._RELAY_REQ,
+            method="POST",
+            json={"request_id": "req-1"},
+        )
+        # 릴레이: 응답 long-poll → 대상 처리 결과
+        httpx_mock.add_response(
+            url="https://api.stardustfs.io/relay/response/req-1",
+            method="GET",
+            json={"status": 200, "result": {"data": encoded}},
+        )
+
+        result = remote_source.read("dir/file.enc")
+        assert result == file_data
+
+    def test_direct_connect_error_falls_back_to_relay(
+        self, remote_source, httpx_mock
+    ):
+        """직접 연결 실패(ConnectError)도 릴레이로 전환한다."""
+        _activate(remote_source)
+
+        httpx_mock.add_exception(
+            httpx.ConnectError("refused"),
+            url="http://192.168.1.100:9090/p2p/exists",
+        )
+        httpx_mock.add_response(
+            url=self._RELAY_REQ,
+            method="POST",
+            json={"request_id": "req-2"},
+        )
+        httpx_mock.add_response(
+            url="https://api.stardustfs.io/relay/response/req-2",
+            method="GET",
+            json={"status": 200, "result": {"exists": True}},
+        )
+
+        assert remote_source.exists("dir/file.enc") is True
+
+    def test_relay_op_error_raises(self, remote_source, httpx_mock):
+        """릴레이로 갔으나 대상이 오류 상태를 반환하면 OSError."""
+        _activate(remote_source)
+
+        httpx_mock.add_exception(
+            httpx.TimeoutException("timed out"),
+            url="http://192.168.1.100:9090/p2p/read",
+        )
+        httpx_mock.add_response(
+            url=self._RELAY_REQ,
+            method="POST",
+            json={"request_id": "req-3"},
+        )
+        httpx_mock.add_response(
+            url="https://api.stardustfs.io/relay/response/req-3",
+            method="GET",
+            json={"status": 404, "result": {"error": "File not found"}},
+        )
+
+        with pytest.raises(OSError, match="status=404"):
+            remote_source.read("dir/missing.enc")
+
+    def test_relay_disabled_raises_direct_error(
+        self, remote_source, httpx_mock
+    ):
+        """릴레이 비활성 시 직접 연결 실패가 곧바로 OSError."""
+        _activate(remote_source)
+        remote_source._relay_enabled = False
+
+        httpx_mock.add_exception(
+            httpx.ConnectError("refused"),
+            url="http://192.168.1.100:9090/p2p/read",
+        )
+
+        with pytest.raises(OSError, match="connection failed|direct failed"):
+            remote_source.read("dir/file.enc")
 
 
 class TestWrite:
