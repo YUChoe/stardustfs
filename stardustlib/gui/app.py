@@ -1,17 +1,20 @@
 """StardustFS Tkinter GUI.
 
-파일 탐색기(목록/업로드/다운로드/폴더/삭제/이동/복사) + 디바이스 + daemon 제어 +
-로그인/로그아웃. 네트워크/파일 작업은 워커 스레드에서 수행하고 결과를 메인 스레드로
-전달한다(actions/worker 참조).
+파일 탐색기(목록/업로드/다운로드/폴더/삭제/이동/복사) + 디바이스 + 스토리지 소스
+관리 + daemon 제어 + 로그인/로그아웃. i18n(ko/en), 시스템 트레이 최소화(선택 의존
+pystray) 지원. 창 닫기(X)는 트레이로 숨기고, 트레이 '종료'로만 실제 종료한다.
+
+네트워크/파일 작업은 워커 스레드에서 수행하고 결과를 메인 스레드로 전달한다.
 """
 
 from __future__ import annotations
 
 import os
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from stardustlib.gui import actions
+from stardustlib.gui import actions, i18n, tray
 from stardustlib.gui.worker import Worker
 
 
@@ -33,67 +36,140 @@ class StardustApp:
         self.vpath = "/"
         self.worker = Worker()
         self._rows: dict[str, dict] = {}
-        self._auto_started = False  # 구동 시 daemon 1회 자동 시작용
+        self._auto_started = False
+        self.lang = i18n.detect_lang()
+        self.t = i18n.get_text(self.lang)
 
-        root.title("StardustFS")
-        root.geometry("780x520")
-        self._build_widgets()
+        root.title(self.t["app_title"])
+        root.geometry("800x540")
+        self._build_menu()
+        self.body = ttk.Frame(root)
+        self.body.pack(fill="both", expand=True)
+        self._build_body()
+        self._setup_tray()
+
         self.root.after(80, self._tick)
         self.root.after(200, self._refresh_daemon)
         if self.config_path:
             self.refresh()
         else:
-            self._set_status("설정 파일을 선택하세요 (설정...).")
+            self._set_status(self.t["select_config_hint"])
+
+    # --- 메뉴 / 트레이 ---
+
+    def _build_menu(self) -> None:
+        menubar = tk.Menu(self.root)
+        lang_menu = tk.Menu(menubar, tearoff=0)
+        lang_menu.add_command(label=self.t["lang_ko"],
+                              command=lambda: self._set_language("ko"))
+        lang_menu.add_command(label=self.t["lang_en"],
+                              command=lambda: self._set_language("en"))
+        menubar.add_cascade(label=self.t["menu_language"], menu=lang_menu)
+        self.root.config(menu=menubar)
+
+    def _setup_tray(self) -> None:
+        self.tray_icon = tray.build_icon(
+            self.t["app_title"],
+            lambda: self.t["tray_open"],
+            lambda: self.t["tray_quit"],
+            lambda: self.root.after(0, self._show_window),
+            lambda: self.root.after(0, self._quit),
+        )
+        if self.tray_icon is not None:
+            threading.Thread(
+                target=self.tray_icon.run, daemon=True, name="stardust-tray"
+            ).start()
+            # 창 닫기(X) → 트레이로 숨김(종료 아님)
+            self.root.protocol("WM_DELETE_WINDOW", self._hide_window)
+        else:
+            # 트레이 미사용: 창 닫기 = 종료
+            self.root.protocol("WM_DELETE_WINDOW", self._quit)
+
+    def _hide_window(self) -> None:
+        self.root.withdraw()
+        self._set_status(self.t["tray_minimised"])
+
+    def _show_window(self) -> None:
+        self.root.deiconify()
+        self.root.lift()
+
+    def _quit(self) -> None:
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        self.root.destroy()
+
+    def _set_language(self, lang: str) -> None:
+        if lang == self.lang:
+            return
+        self.lang = lang
+        self.t = i18n.get_text(lang)
+        self.root.title(self.t["app_title"])
+        self._build_menu()
+        self.body.destroy()
+        self.body = ttk.Frame(self.root)
+        self.body.pack(fill="both", expand=True)
+        self._build_body()
+        if self.config_path:
+            self.refresh()
+        else:
+            self._set_status(self.t["select_config_hint"])
 
     # --- 위젯 구성 ---
 
-    def _build_widgets(self) -> None:
-        top = ttk.Frame(self.root, padding=6)
+    def _build_body(self) -> None:
+        t = self.t
+        top = ttk.Frame(self.body, padding=6)
         top.pack(fill="x")
-        ttk.Button(top, text="새 설정...", command=self._new_config).pack(side="left")
-        ttk.Button(top, text="설정...", command=self._choose_config).pack(side="left", padx=4)
-        self.cfg_label = ttk.Label(top, text=self.config_path or "(미선택)")
+        ttk.Button(top, text=t["new_config"], command=self._new_config).pack(side="left")
+        ttk.Button(top, text=t["choose_config"], command=self._choose_config).pack(side="left", padx=4)
+        self.cfg_label = ttk.Label(top, text=self.config_path or "—")
         self.cfg_label.pack(side="left", padx=6)
-        ttk.Button(top, text="로그인", command=self._login).pack(side="right")
-        ttk.Button(top, text="로그아웃", command=self._logout).pack(side="right", padx=4)
+        ttk.Button(top, text=t["login"], command=self._login).pack(side="right")
+        ttk.Button(top, text=t["logout"], command=self._logout).pack(side="right", padx=4)
 
-        dframe = ttk.Frame(self.root, padding=(6, 0))
+        dframe = ttk.Frame(self.body, padding=(6, 0))
         dframe.pack(fill="x")
-        self.daemon_label = ttk.Label(dframe, text="daemon: ?")
+        self.daemon_label = ttk.Label(dframe, text=t["daemon_unknown"])
         self.daemon_label.pack(side="left")
-        ttk.Button(dframe, text="daemon 시작", command=self._daemon_start).pack(side="left", padx=4)
-        ttk.Button(dframe, text="daemon 정지", command=self._daemon_stop).pack(side="left")
-        ttk.Button(dframe, text="디바이스", command=self._devices).pack(side="right")
-        ttk.Button(dframe, text="스토리지", command=self._sources).pack(side="right", padx=4)
+        ttk.Button(dframe, text=t["daemon_start"], command=self._daemon_start).pack(side="left", padx=4)
+        ttk.Button(dframe, text=t["daemon_stop"], command=self._daemon_stop).pack(side="left")
+        ttk.Button(dframe, text=t["devices"], command=self._devices).pack(side="right")
+        ttk.Button(dframe, text=t["storage"], command=self._sources).pack(side="right", padx=4)
 
-        pframe = ttk.Frame(self.root, padding=6)
+        pframe = ttk.Frame(self.body, padding=6)
         pframe.pack(fill="x")
-        ttk.Button(pframe, text="↑ 상위", command=self._up).pack(side="left")
+        ttk.Button(pframe, text=t["up"], command=self._up).pack(side="left")
         self.path_var = tk.StringVar(value=self.vpath)
         entry = ttk.Entry(pframe, textvariable=self.path_var)
         entry.pack(side="left", fill="x", expand=True, padx=6)
         entry.bind("<Return>", lambda _e: self._go())
-        ttk.Button(pframe, text="이동", command=self._go).pack(side="left")
-        ttk.Button(pframe, text="새로고침", command=self.refresh).pack(side="left", padx=4)
+        ttk.Button(pframe, text=t["go"], command=self._go).pack(side="left")
+        ttk.Button(pframe, text=t["refresh"], command=self.refresh).pack(side="left", padx=4)
 
         cols = ("type", "name", "size", "owner")
-        self.tree = ttk.Treeview(self.root, columns=cols, show="headings", selectmode="browse")
-        for c, w in (("type", 60), ("name", 380), ("size", 110), ("owner", 110)):
-            self.tree.heading(c, text=c)
+        self.tree = ttk.Treeview(self.body, columns=cols, show="headings", selectmode="browse")
+        for c, head, w in (
+            ("type", t["col_type"], 60), ("name", t["col_name"], 380),
+            ("size", t["col_size"], 110), ("owner", t["col_owner"], 110),
+        ):
+            self.tree.heading(c, text=head)
             self.tree.column(c, width=w, anchor="w")
         self.tree.pack(fill="both", expand=True, padx=6)
         self.tree.bind("<Double-1>", self._on_double)
 
-        tb = ttk.Frame(self.root, padding=6)
+        tb = ttk.Frame(self.body, padding=6)
         tb.pack(fill="x")
         for text, cmd in (
-            ("업로드", self._upload), ("다운로드", self._download),
-            ("새 폴더", self._mkdir), ("삭제", self._delete),
-            ("이동/이름변경", self._move), ("복사", self._copy),
+            (t["upload"], self._upload), (t["download"], self._download),
+            (t["mkdir"], self._mkdir), (t["delete"], self._delete),
+            (t["move"], self._move), (t["copy"], self._copy),
         ):
             ttk.Button(tb, text=text, command=cmd).pack(side="left", padx=2)
 
-        self.status = ttk.Label(self.root, text="", relief="sunken", anchor="w", padding=4)
+        self.status = ttk.Label(self.body, text="", relief="sunken", anchor="w", padding=4)
         self.status.pack(fill="x", side="bottom")
 
     # --- 워커 브리지 ---
@@ -102,53 +178,47 @@ class StardustApp:
         self.worker.poll()
         self.root.after(80, self._tick)
 
-    def _submit(self, fn, on_ok=None, busy: str = "처리 중...") -> None:
+    def _submit(self, fn, on_ok=None, busy: str | None = None) -> None:
         if not self.config_path:
-            messagebox.showwarning("StardustFS", "먼저 설정 파일을 선택하세요.")
+            messagebox.showwarning(self.t["app_title"], self.t["need_config"])
             return
-        self._set_status(busy)
+        self._set_status(busy or self.t["busy_browse"])
 
         def done(ok, payload):
             if ok:
-                self._set_status("준비됨")
+                self._set_status(self.t["ready"])
                 if on_ok:
                     on_ok(payload)
             else:
-                self._set_status(f"오류: {payload}")
-                messagebox.showerror("오류", str(payload))
+                self._set_status(self.t["err_status"].format(msg=payload))
+                messagebox.showerror(self.t["err"], str(payload))
 
         self.worker.submit(fn, done)
 
     def _set_status(self, text: str) -> None:
         self.status.config(text=text)
 
-    # --- 동작 ---
+    # --- 설정 ---
 
     def _new_config(self) -> None:
         import socket
 
-        base = filedialog.askdirectory(
-            title="설정/저장 폴더 선택 (비어 있는 폴더 권장)"
-        )
+        t = self.t
+        base = filedialog.askdirectory(title=t["nc_pick_dir"])
         if not base:
             return
         server_url = simpledialog.askstring(
-            "새 설정", "서버 URL (비우면 오프라인 전용):",
+            t["new_config"], t["nc_server"],
             initialvalue="https://stardustfs.noizze.net",
         )
         if server_url is None:
             return
         device_name = simpledialog.askstring(
-            "새 설정", "디바이스 이름:", initialvalue=socket.gethostname()
+            t["new_config"], t["nc_device"], initialvalue=socket.gethostname()
         )
         if not device_name:
             return
-        generate_key = messagebox.askyesno(
-            "암호화 키",
-            "이 디바이스에서 새 암호화 키를 생성할까요?\n\n"
-            "예 = 첫 디바이스(새 키 생성)\n"
-            "아니오 = 기존 계정(로그인 후 서버 백업에서 복원)",
-        )
+        generate_key = messagebox.askyesno(t["nc_key_title"], t["nc_key_q"])
 
         def make():
             return actions.create_config(
@@ -158,32 +228,27 @@ class StardustApp:
 
         def done(ok, payload):
             if not ok:
-                messagebox.showerror("오류", str(payload))
+                messagebox.showerror(t["err"], str(payload))
                 return
             self.config_path = payload
             self.cfg_label.config(text=payload)
             self.vpath = "/"
             self.path_var.set("/")
-            self._auto_started = False  # 새 설정에 대해 자동 시작 재허용
+            self._auto_started = False
             self.refresh()
             self._refresh_daemon()
-            if generate_key:
-                messagebox.showinfo(
-                    "새 설정", "설정과 새 키를 생성했습니다. 로그인 후 사용하세요."
-                )
-            else:
-                messagebox.showinfo(
-                    "새 설정",
-                    "설정을 생성했습니다. '로그인'에서 키 백업 암호까지 입력하면 "
-                    "서버 백업에서 키가 복원됩니다.",
-                )
+            messagebox.showinfo(
+                t["new_config"],
+                t["nc_done_new"] if generate_key else t["nc_done_restore"],
+            )
 
-        self._set_status("설정 생성 중...")
+        self._set_status(t["nc_busy"])
         self.worker.submit(make, done)
 
     def _choose_config(self) -> None:
         path = filedialog.askopenfilename(
-            title="설정 파일 선택", filetypes=[("JSON", "*.json"), ("모든 파일", "*.*")]
+            title=self.t["choose_config"],
+            filetypes=[("JSON", "*.json"), ("*", "*.*")],
         )
         if path:
             self.config_path = path
@@ -194,12 +259,14 @@ class StardustApp:
             self.refresh()
             self._refresh_daemon()
 
+    # --- 탐색 ---
+
     def refresh(self) -> None:
         self.vpath = self.path_var.get() or "/"
         cfg = self.config_path
         vp = self.vpath
-        # 목록 + 용량을 한 세션에서 조회(스토리지 초기화 1회).
-        self._submit(lambda: actions.browse(cfg, vp), self._show_browse, "조회 중...")
+        self._submit(lambda: actions.browse(cfg, vp), self._show_browse,
+                     self.t["busy_browse"])
 
     def _populate(self, rows: list[dict]) -> None:
         self.tree.delete(*self.tree.get_children())
@@ -213,10 +280,10 @@ class StardustApp:
 
     def _show_browse(self, d: dict) -> None:
         self._populate(d["rows"])
-        self._set_status(
-            f"용량: 사용 {_human(d['used'])} / 총 {_human(d['total'])} "
-            f"(가용 {_human(d['available'])}) · 보류 {d['pending']}"
-        )
+        self._set_status(self.t["cap"].format(
+            used=_human(d["used"]), total=_human(d["total"]),
+            avail=_human(d["available"]), pending=d["pending"],
+        ))
 
     def _selected(self) -> dict | None:
         sel = self.tree.selection()
@@ -232,97 +299,107 @@ class StardustApp:
             self.refresh()
 
     def _up(self) -> None:
-        cur = self.vpath.rstrip("/")
-        parent = cur.rsplit("/", 1)[0] or "/"
+        parent = self.vpath.rstrip("/").rsplit("/", 1)[0] or "/"
         self.path_var.set(parent)
         self.refresh()
 
     def _go(self) -> None:
         self.refresh()
 
+    # --- 전송/쓰기 ---
+
     def _upload(self) -> None:
-        local = filedialog.askopenfilename(title="업로드할 파일")
+        local = filedialog.askopenfilename(title=self.t["upload_pick"])
         if not local:
             return
         remote = self._join(os.path.basename(local))
         cfg = self.config_path
         self._submit(
             lambda: actions.put_file(cfg, local, remote),
-            lambda _n: self.refresh(), f"업로드 중: {os.path.basename(local)}",
+            lambda _n: self.refresh(),
+            self.t["uploading"].format(name=os.path.basename(local)),
         )
 
     def _download(self) -> None:
         row = self._selected()
         if not row or row["type"] != "file":
-            messagebox.showinfo("StardustFS", "다운로드할 파일을 선택하세요.")
+            messagebox.showinfo(self.t["app_title"], self.t["download_pick"])
             return
         remote = self._join(row["name"])
         local = filedialog.asksaveasfilename(
-            title="저장 위치", initialfile=row["name"]
+            title=self.t["save_to"], initialfile=row["name"]
         )
         if not local:
             return
         cfg = self.config_path
         self._submit(
             lambda: actions.get_file(cfg, remote, local),
-            lambda n: self._set_status(f"다운로드 완료: {local} ({_human(n)})"),
-            f"다운로드 중: {row['name']}",
+            lambda n: self._set_status(
+                self.t["download_done"].format(path=local, size=_human(n))
+            ),
+            self.t["downloading"].format(name=row["name"]),
         )
 
     def _mkdir(self) -> None:
-        name = simpledialog.askstring("새 폴더", "폴더 이름:")
+        name = simpledialog.askstring(self.t["mkdir"], self.t["mkdir_prompt"])
         if not name:
             return
         cfg = self.config_path
         path = self._join(name)
         self._submit(lambda: actions.mkdir(cfg, path), lambda _r: self.refresh(),
-                     "폴더 생성 중...")
+                     self.t["mkdir_busy"])
 
     def _delete(self) -> None:
         row = self._selected()
         if not row:
             return
-        if not messagebox.askyesno("삭제", f"'{row['name']}'을(를) 삭제할까요?"):
+        if not messagebox.askyesno(
+            self.t["delete"], self.t["delete_confirm"].format(name=row["name"])
+        ):
             return
         cfg = self.config_path
         path = self._join(row["name"])
         recursive = row["type"] == "dir"
         self._submit(lambda: actions.remove(cfg, path, recursive),
-                     lambda _r: self.refresh(), "삭제 중...")
+                     lambda _r: self.refresh(), self.t["delete_busy"])
 
     def _move(self) -> None:
         row = self._selected()
         if not row:
             return
         src = self._join(row["name"])
-        dst = simpledialog.askstring("이동/이름변경", "대상 가상 경로:", initialvalue=src)
+        dst = simpledialog.askstring(self.t["move"], self.t["move_prompt"],
+                                     initialvalue=src)
         if not dst or dst == src:
             return
         cfg = self.config_path
         self._submit(lambda: actions.move(cfg, src, dst), lambda _r: self.refresh(),
-                     "이동 중...")
+                     self.t["move_busy"])
 
     def _copy(self) -> None:
         row = self._selected()
         if not row or row["type"] != "file":
-            messagebox.showinfo("StardustFS", "복사할 파일을 선택하세요.")
+            messagebox.showinfo(self.t["app_title"], self.t["copy_pick"])
             return
         src = self._join(row["name"])
-        dst = simpledialog.askstring("복사", "대상 가상 경로:",
+        dst = simpledialog.askstring(self.t["copy"], self.t["copy_prompt"],
                                      initialvalue=self._join("copy-" + row["name"]))
         if not dst:
             return
         cfg = self.config_path
         self._submit(lambda: actions.copy(cfg, src, dst), lambda _r: self.refresh(),
-                     "복사 중...")
+                     self.t["copy_busy"])
+
+    # --- 스토리지 소스 ---
 
     def _sources(self) -> None:
         if not self.config_path:
-            messagebox.showwarning("StardustFS", "먼저 설정 파일을 선택하세요.")
+            messagebox.showwarning(self.t["app_title"], self.t["need_config"])
             return
+        t = self.t
         cfg = self.config_path
         win = tk.Toplevel(self.root)
-        win.title("스토리지 소스")
+        win.title(t["sources_title"])
         win.geometry("580x300")
         tree = ttk.Treeview(win, columns=("id", "type", "path", "size"),
                             show="headings")
@@ -340,30 +417,30 @@ class StardustApp:
                     s.get("id"), s.get("type"), s.get("path"), size))
 
         def add_dir():
-            d = filedialog.askdirectory(title="디렉토리 소스로 추가할 폴더")
+            d = filedialog.askdirectory(title=t["src_pick_dir"])
             if not d:
                 return
             try:
                 actions.add_source(cfg, "directory", d)
             except Exception as e:  # noqa: BLE001
-                messagebox.showerror("오류", str(e))
+                messagebox.showerror(t["err"], str(e))
                 return
             reload()
             self.refresh()
 
         def add_loop():
             path = filedialog.asksaveasfilename(
-                title="루프백 이미지 경로", defaultextension=".img")
+                title=t["src_loop_path"], defaultextension=".img")
             if not path:
                 return
-            mb = simpledialog.askinteger("루프백", "크기(MB):",
+            mb = simpledialog.askinteger("loopback", t["src_loop_size_prompt"],
                                          initialvalue=100, minvalue=10)
             if not mb:
                 return
             try:
                 actions.add_source(cfg, "loopback", path, size=mb * 1024 * 1024)
             except Exception as e:  # noqa: BLE001
-                messagebox.showerror("오류", str(e))
+                messagebox.showerror(t["err"], str(e))
                 return
             reload()
             self.refresh()
@@ -374,10 +451,7 @@ class StardustApp:
                 return
             sid = tree.item(sel[0], "values")[0]
             if not messagebox.askyesno(
-                "제거",
-                f"소스 '{sid}'를 설정에서 제거할까요?\n물리 데이터는 삭제되지 "
-                "않으나 해당 소스의 파일은 접근 불가가 되며, 실행 중인 daemon은 "
-                "재시작해야 반영됩니다.",
+                t["src_remove"], t["src_remove_confirm"].format(id=sid)
             ):
                 return
             actions.remove_source(cfg, sid)
@@ -386,56 +460,63 @@ class StardustApp:
 
         bar = ttk.Frame(win, padding=6)
         bar.pack(fill="x")
-        ttk.Button(bar, text="디렉토리 추가", command=add_dir).pack(side="left")
-        ttk.Button(bar, text="루프백 추가", command=add_loop).pack(side="left", padx=4)
-        ttk.Button(bar, text="제거", command=remove).pack(side="left")
-        ttk.Button(bar, text="닫기", command=win.destroy).pack(side="right")
+        ttk.Button(bar, text=t["src_add_dir"], command=add_dir).pack(side="left")
+        ttk.Button(bar, text=t["src_add_loop"], command=add_loop).pack(side="left", padx=4)
+        ttk.Button(bar, text=t["src_remove"], command=remove).pack(side="left")
+        ttk.Button(bar, text=t["close"], command=win.destroy).pack(side="right")
         reload()
+
+    # --- 디바이스 ---
 
     def _devices(self) -> None:
         cfg = self.config_path
         self._submit(lambda: actions.devices_list(cfg), self._show_devices,
-                     "디바이스 조회 중...")
+                     self.t["devices_busy"])
 
     def _show_devices(self, devs: list[dict]) -> None:
+        t = self.t
         win = tk.Toplevel(self.root)
-        win.title("내 디바이스")
-        win.geometry("420x260")
+        win.title(t["devices_title"])
+        win.geometry("440x260")
         tree = ttk.Treeview(win, columns=("id", "name", "online", "self"),
                             show="headings")
-        for c, w in (("id", 90), ("name", 160), ("online", 80), ("self", 60)):
+        for c, w in (("id", 90), ("name", 170), ("online", 80), ("self", 60)):
             tree.heading(c, text=c)
             tree.column(c, width=w)
         tree.pack(fill="both", expand=True)
         for d in devs:
             tree.insert("", "end", values=(
-                d["id"], d["name"], "online" if d["online"] else "offline",
-                "this" if d["self"] else "",
+                d["id"], d["name"],
+                t["online"] if d["online"] else t["offline"],
+                t["this_device"] if d["self"] else "",
             ))
+
+    # --- 로그인 ---
 
     def _login(self) -> None:
         if not self.config_path:
-            messagebox.showwarning("StardustFS", "먼저 설정 파일을 선택하세요.")
+            messagebox.showwarning(self.t["app_title"], self.t["need_config"])
             return
-        email = simpledialog.askstring("로그인", "이메일:")
+        t = self.t
+        email = simpledialog.askstring(t["login"], t["login_email"])
         if not email:
             return
-        password = simpledialog.askstring("로그인", "비밀번호:", show="*")
+        password = simpledialog.askstring(t["login"], t["login_password"], show="*")
         if password is None:
             return
-        key_pw = simpledialog.askstring(
-            "로그인", "마스터키 백업 암호(선택, 없으면 비움):", show="*"
-        ) or None
+        key_pw = simpledialog.askstring(t["login"], t["login_keypw"], show="*") or None
         cfg = self.config_path
         self._submit(
             lambda: actions.login(cfg, email, password, key_pw),
-            lambda _r: self._set_status(f"로그인 성공: {email}"), "로그인 중...",
+            lambda _r: self._set_status(t["login_ok"].format(email=email)),
+            t["login_busy"],
         )
 
     def _logout(self) -> None:
         cfg = self.config_path
         self._submit(lambda: actions.logout(cfg),
-                     lambda _r: self._set_status("로그아웃 완료"), "로그아웃 중...")
+                     lambda _r: self._set_status(self.t["logout_ok"]),
+                     self.t["logout_busy"])
 
     # --- daemon ---
 
@@ -447,32 +528,34 @@ class StardustApp:
 
     def _on_daemon(self, ok, payload) -> None:
         if not ok:
-            self.daemon_label.config(text="daemon: ?")
+            self.daemon_label.config(text=self.t["daemon_unknown"])
             return
         if payload.get("running"):
             self.daemon_label.config(
-                text=f"daemon: 실행 중 (pid={payload.get('pid')})"
+                text=self.t["daemon_running"].format(pid=payload.get("pid"))
             )
         elif payload.get("stale"):
-            self.daemon_label.config(text="daemon: stale(비정상 종료?)")
+            self.daemon_label.config(text=self.t["daemon_stale"])
         else:
-            self.daemon_label.config(text="daemon: 미실행")
-            # 구동 시 미실행이면 1회 자동 시작 (이후/수동 정지 시 재시작 안 함)
+            self.daemon_label.config(text=self.t["daemon_stopped"])
             if self.config_path and not self._auto_started:
                 self._auto_started = True
-                self._set_status("daemon 자동 시작 중...")
+                self._set_status(self.t["daemon_starting"])
                 self._daemon_start()
 
     def _daemon_start(self) -> None:
         cfg = self.config_path
-        self._submit(lambda: actions.daemon_start(cfg),
-                     lambda pid: self._set_status(f"daemon 시작(pid={pid})"),
-                     "daemon 시작 중...")
+        self._submit(
+            lambda: actions.daemon_start(cfg),
+            lambda pid: self._set_status(self.t["daemon_started"].format(pid=pid)),
+            self.t["daemon_start_busy"],
+        )
 
     def _daemon_stop(self) -> None:
         cfg = self.config_path
         self._submit(lambda: actions.daemon_stop(cfg),
-                     lambda _r: self._set_status("daemon 정지 요청"), "daemon 정지 중...")
+                     lambda _r: self._set_status(self.t["daemon_stop_req"]),
+                     self.t["daemon_stop_busy"])
 
 
 def run_gui(config_path: str | None) -> None:
