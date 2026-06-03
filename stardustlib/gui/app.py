@@ -9,6 +9,7 @@ pystray) 지원. 창 닫기(X)는 트레이로 숨기고, 트레이 '종료'로�
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import tkinter as tk
@@ -16,6 +17,8 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from stardustlib.gui import actions, i18n, tray
 from stardustlib.gui.worker import Worker
+
+logger = logging.getLogger(__name__)
 
 
 def _human(n: int) -> str:
@@ -82,8 +85,16 @@ class StardustApp:
             # 창 닫기(X) → 트레이로 숨김(종료 아님)
             self.root.protocol("WM_DELETE_WINDOW", self._hide_window)
         else:
-            # 트레이 미사용: 창 닫기 = 종료
+            # 트레이 미사용(pystray/Pillow 미설치 등): 창 닫기 = 종료. 사유를 노출.
             self.root.protocol("WM_DELETE_WINDOW", self._quit)
+            why = tray.reason()
+            logger.warning(
+                "시스템 트레이 비활성(%s). 창 닫기=종료. 트레이를 쓰려면 "
+                "pystray/Pillow 설치: pip install -r requirements.txt", why,
+            )
+            self.root.after(
+                600, lambda: self._set_status(self.t["tray_disabled_hint"])
+            )
 
     def _hide_window(self) -> None:
         self.root.withdraw()
@@ -276,6 +287,7 @@ class StardustApp:
             self.vpath = "/"
             self.path_var.set("/")
             self._auto_started = False
+            self.worker.submit(lambda: actions.invalidate(None), lambda *_a: None)
             self.refresh()
             self._refresh_daemon()
             self._refresh_login_state()
@@ -298,6 +310,7 @@ class StardustApp:
             self.vpath = "/"
             self.path_var.set("/")
             self._auto_started = False
+            self.worker.submit(lambda: actions.invalidate(None), lambda *_a: None)
             self.refresh()
             self._refresh_daemon()
             self._refresh_login_state()
@@ -306,10 +319,34 @@ class StardustApp:
 
     def refresh(self) -> None:
         self.vpath = self.path_var.get() or "/"
+        if not self.config_path:
+            self._populate([])
+            self._set_status(self.t["select_config_hint"])
+            return
+        # 로그인하지 않았으면 파일 목록을 보여주지 않는다(코어 초기화도 하지 않음).
+        if not self._logged_in():
+            self._populate([])
+            self._set_status(self.t["login_required"])
+            return
         cfg = self.config_path
         vp = self.vpath
         self._submit(lambda: actions.browse(cfg, vp), self._show_browse,
                      self.t["busy_browse"])
+
+    def _logged_in(self) -> bool:
+        if not self.config_path:
+            return False
+        try:
+            return actions.is_logged_in(self.config_path)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _after_write(self) -> None:
+        """쓰기 작업 후: 캐시 세션 무효화(용량 갱신) + 새로고침."""
+        cfg = self.config_path
+        if cfg:
+            self.worker.submit(lambda: actions.invalidate(cfg), lambda *_a: None)
+        self.refresh()
 
     def _populate(self, rows: list[dict]) -> None:
         self.tree.delete(*self.tree.get_children())
@@ -359,7 +396,7 @@ class StardustApp:
         cfg = self.config_path
         self._submit(
             lambda: actions.put_file(cfg, local, remote),
-            lambda _n: self.refresh(),
+            lambda _n: self._after_write(),
             self.t["uploading"].format(name=os.path.basename(local)),
         )
 
@@ -389,7 +426,7 @@ class StardustApp:
             return
         cfg = self.config_path
         path = self._join(name)
-        self._submit(lambda: actions.mkdir(cfg, path), lambda _r: self.refresh(),
+        self._submit(lambda: actions.mkdir(cfg, path), lambda _r: self._after_write(),
                      self.t["mkdir_busy"])
 
     def _delete(self) -> None:
@@ -404,7 +441,7 @@ class StardustApp:
         path = self._join(row["name"])
         recursive = row["type"] == "dir"
         self._submit(lambda: actions.remove(cfg, path, recursive),
-                     lambda _r: self.refresh(), self.t["delete_busy"])
+                     lambda _r: self._after_write(), self.t["delete_busy"])
 
     def _move(self) -> None:
         row = self._selected()
@@ -416,7 +453,7 @@ class StardustApp:
         if not dst or dst == src:
             return
         cfg = self.config_path
-        self._submit(lambda: actions.move(cfg, src, dst), lambda _r: self.refresh(),
+        self._submit(lambda: actions.move(cfg, src, dst), lambda _r: self._after_write(),
                      self.t["move_busy"])
 
     def _copy(self) -> None:
@@ -430,7 +467,7 @@ class StardustApp:
         if not dst:
             return
         cfg = self.config_path
-        self._submit(lambda: actions.copy(cfg, src, dst), lambda _r: self.refresh(),
+        self._submit(lambda: actions.copy(cfg, src, dst), lambda _r: self._after_write(),
                      self.t["copy_busy"])
 
     # --- 스토리지 소스 ---
@@ -558,6 +595,7 @@ class StardustApp:
     def _after_login(self, msg: str) -> None:
         self._set_status(msg)
         self._refresh_login_state()
+        self.refresh()  # 로그인 후 파일 목록 표시
 
     def _logout(self) -> None:
         cfg = self.config_path
@@ -565,6 +603,7 @@ class StardustApp:
         def done(_r):
             self._set_status(self.t["logout_ok"])
             self._refresh_login_state()
+            self.refresh()  # 로그아웃 후 목록 숨김
 
         self._submit(lambda: actions.logout(cfg), done, self.t["logout_busy"])
 

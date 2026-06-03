@@ -89,27 +89,53 @@ def _rows_for(session, base: str) -> list[dict]:
     return rows
 
 
-def browse(config_path: str, vpath: str) -> dict:
-    """목록 + 용량 + 보류 수를 한 세션에서 함께 조회한다.
+# 오프라인 조회용 세션 캐시. 워커 스레드 단일 실행 가정(sqlite 연결은 스레드별).
+# 매 새로고침마다 _build_core(스토리지 초기화)가 반복 실행/로깅되는 것을 막는다.
+_offline_cache: dict[str, "object"] = {}
 
-    refresh를 단일 세션으로 처리해 _build_core(스토리지 초기화)가 한 번만 실행되게
-    한다(이전에는 목록/용량을 각각 열어 초기화 로그가 2번 출력됐다).
+
+def _offline_session(config_path: str):
+    session = _offline_cache.get(config_path)
+    if session is None:
+        session = CLISession.open(config_path)
+        _offline_cache[config_path] = session
+    return session
+
+
+def invalidate(config_path: str | None = None) -> None:
+    """캐시된 오프라인 세션을 닫고 버린다(설정/소스 변경·쓰기 후 호출).
+
+    반드시 세션을 생성한 워커 스레드에서 호출해야 한다(sqlite 스레드 제약).
+    config_path=None이면 전체.
+    """
+    keys = [config_path] if config_path else list(_offline_cache)
+    for k in keys:
+        session = _offline_cache.pop(k, None)
+        if session is not None:
+            try:
+                session.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def browse(config_path: str, vpath: str) -> dict:
+    """목록 + 용량 + 보류 수를 캐시된 단일 오프라인 세션에서 조회한다.
+
+    세션을 재사용해 새로고침/탐색마다 스토리지 초기화가 반복되지 않는다. 파일 목록은
+    매 조회 시 메타데이터를 새로 읽으므로 daemon 동기화 결과가 반영된다.
     """
     base = _vpath(vpath)
-    session = CLISession.open(config_path)
-    try:
-        rows = _rows_for(session, base)
-        total = session.jbod.get_total_space()
-        available = session.jbod.get_available_space()
-        return {
-            "rows": rows,
-            "total": total,
-            "used": total - available,
-            "available": available,
-            "pending": len(session.metadata.get_pending_files()),
-        }
-    finally:
-        session.close()
+    session = _offline_session(config_path)
+    rows = _rows_for(session, base)
+    total = session.jbod.get_total_space()
+    available = session.jbod.get_available_space()
+    return {
+        "rows": rows,
+        "total": total,
+        "used": total - available,
+        "available": available,
+        "pending": len(session.metadata.get_pending_files()),
+    }
 
 
 # --- 스토리지 소스 관리 (config 편집) ---

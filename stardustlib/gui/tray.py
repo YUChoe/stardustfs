@@ -14,14 +14,24 @@ from __future__ import annotations
 from collections.abc import Callable
 
 
-def available() -> bool:
-    """트레이 사용 가능 여부(pystray + PIL 설치)."""
+def _probe_error() -> str | None:
+    """pystray/PIL import를 시도하고 실패 사유를 반환한다(성공이면 None)."""
     try:
         import pystray  # noqa: F401
         from PIL import Image  # noqa: F401
-    except Exception:  # noqa: BLE001
-        return False
-    return True
+    except Exception as e:  # noqa: BLE001
+        return f"{type(e).__name__}: {e}"
+    return None
+
+
+def available() -> bool:
+    """트레이 사용 가능 여부(pystray + PIL 설치)."""
+    return _probe_error() is None
+
+
+def reason() -> str | None:
+    """트레이를 쓸 수 없는 사유 문자열(사용 가능하면 None)."""
+    return _probe_error()
 
 
 def _make_image():

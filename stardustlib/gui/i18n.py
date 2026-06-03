@@ -12,6 +12,7 @@ _KO: dict[str, str] = {
     "err": "오류",
     "need_config": "먼저 설정 파일을 선택하세요.",
     "select_config_hint": "설정 파일을 선택하세요 (새 설정... 또는 설정...).",
+    "login_required": "로그인 후 파일을 볼 수 있습니다.",
     # 상단
     "new_config": "새 설정...",
     "choose_config": "설정...",
@@ -117,6 +118,8 @@ _KO: dict[str, str] = {
     "tray_open": "열기",
     "tray_quit": "종료",
     "tray_minimised": "트레이로 최소화되었습니다.",
+    "tray_disabled_hint": "트레이 비활성(pystray 미설치): 창 닫기 = 종료. "
+                          "설치: pip install -r requirements.txt",
 }
 
 _EN: dict[str, str] = {
@@ -125,6 +128,7 @@ _EN: dict[str, str] = {
     "err": "Error",
     "need_config": "Select a config file first.",
     "select_config_hint": "Select a config file (New Config... or Open Config...).",
+    "login_required": "Sign in to view your files.",
     "new_config": "New Config...",
     "choose_config": "Open Config...",
     "login": "Sign In",
@@ -218,6 +222,8 @@ _EN: dict[str, str] = {
     "tray_open": "Open",
     "tray_quit": "Quit",
     "tray_minimised": "Minimised to tray.",
+    "tray_disabled_hint": "Tray disabled (pystray not installed): closing the window "
+                          "quits. Install: pip install -r requirements.txt",
 }
 
 TRANSLATIONS: dict[str, dict[str, str]] = {"ko": _KO, "en": _EN}
