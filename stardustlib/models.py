@@ -10,15 +10,6 @@ from typing import Literal, TypeAlias, TypedDict
 # --- 설정 스키마 (Configuration Schema) ---
 
 
-class WebDAVConfig(TypedDict):
-    """WebDAV 서비스 설정."""
-
-    host: str       # 바인드 호스트 (고정: "127.0.0.1")
-    port: int       # 바인드 포트 (기본: 8080)
-    username: str   # Basic Auth 사용자명
-    password: str   # Basic Auth 비밀번호
-
-
 class DirectorySourceConfig(TypedDict):
     """디렉토리 소스 설정."""
 
@@ -43,7 +34,6 @@ class StardustConfig(TypedDict):
     """StardustFS 전체 설정 (v1)."""
 
     version: int                    # 설정 파일 버전 (현재 1)
-    webdav: WebDAVConfig            # WebDAV 서비스 설정
     sources: list[SourceConfig]     # 스토리지 소스 목록
     metadata_db: str                # SQLite DB 파일 경로
     key_file: str | None            # 암호화 키 파일 경로 (선택)
@@ -92,7 +82,6 @@ class StardustConfigV2(TypedDict):
 
     version: Literal[2]
     server: ServerConfig
-    webdav: WebDAVConfig
     sources: list[SourceConfigV2]
     sync: SyncConfig
     p2p: P2PConfig

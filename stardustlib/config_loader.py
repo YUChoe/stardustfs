@@ -53,7 +53,6 @@ class ConfigLoader:
         """설정 파일을 파싱하여 StardustConfig를 반환한다.
 
         - JSON 파싱 실패 시 예외 발생
-        - webdav.host는 보안상 항상 "127.0.0.1"로 강제
         """
         path = Path(self._config_path)
         if not path.exists():
@@ -70,10 +69,6 @@ class ConfigLoader:
                 e.doc,
                 e.pos,
             ) from e
-
-        # webdav.host 보안 강제
-        if "webdav" in data and isinstance(data["webdav"], dict):
-            data["webdav"]["host"] = "127.0.0.1"
 
         config: StardustConfig = data
         return config
@@ -113,17 +108,6 @@ class ConfigLoader:
         else:
             for i, source in enumerate(sources):
                 errors.extend(self._validate_source(i, source))
-
-        # webdav 검증
-        webdav = config.get("webdav")  # type: ignore[attr-defined]
-        if isinstance(webdav, dict):
-            port = webdav.get("port")
-            if not isinstance(port, int):
-                errors.append("webdav.port: 정수여야 합니다")
-            elif not (MIN_PORT <= port <= MAX_PORT):
-                errors.append(
-                    f"webdav.port: {MIN_PORT}~{MAX_PORT} 범위여야 합니다"
-                )
 
         # key_file 검증
         key_file = config.get("key_file")  # type: ignore[attr-defined]
@@ -169,17 +153,6 @@ class ConfigLoader:
         else:
             for i, source in enumerate(sources):
                 errors.extend(self._validate_source_v2(i, source))
-
-        # webdav 검증
-        webdav = data.get("webdav")
-        if isinstance(webdav, dict):
-            port = webdav.get("port")
-            if not isinstance(port, int):
-                errors.append("webdav.port: 정수여야 합니다")
-            elif not (MIN_PORT <= port <= MAX_PORT):
-                errors.append(
-                    f"webdav.port: {MIN_PORT}~{MAX_PORT} 범위여야 합니다"
-                )
 
         # key_file 검증 (server.url이 있으면 서버에서 복원 가능하므로 존재 체크 생략)
         key_file = data.get("key_file")
@@ -347,8 +320,9 @@ class ConfigLoader:
                 f"백업 파일 생성 실패: {backup_path}"
             ) from e
 
-        # v2 설정 구성
+        # v2 설정 구성 (레거시 webdav 섹션은 더 이상 사용하지 않으므로 제거)
         data: dict = dict(config)  # type: ignore[arg-type]
+        data.pop("webdav", None)
         data["version"] = 2
         data["server"] = {"url": None}
         data["sync"] = {

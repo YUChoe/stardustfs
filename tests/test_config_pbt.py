@@ -46,8 +46,6 @@ def _base_v2_config() -> dict:
         "server": {"url": None, "device_name": "dev"},
         "sync": {"interval_seconds": 30, "conflict_strategy": "copy"},
         "p2p": {"port": 9090, "enabled": False},
-        "webdav": {"host": "127.0.0.1", "port": 8080,
-                   "username": "u", "password": "p"},
         "sources": [
             {"type": "remote",
              "id": "r1",
@@ -172,8 +170,8 @@ def test_property2_migration_preserves_fields(port, db_name, username):
 
         # (1) version == 2
         assert v2["version"] == 2
-        # (2) 원본 필드 보존
-        assert v2["webdav"] == v1["webdav"]
+        # (2) 원본 필드 보존 (레거시 webdav는 제거됨)
+        assert "webdav" not in v2
         assert v2["sources"] == v1["sources"]
         assert v2["metadata_db"] == v1["metadata_db"]
         assert v2["key_file"] == v1["key_file"]

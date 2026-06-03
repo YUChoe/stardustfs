@@ -56,11 +56,11 @@ class TestMigrateV1ToV2:
     def test_preserves_existing_fields(
         self, config_file: Path, v1_config: dict
     ):
-        """기존 webdav, sources, metadata_db, key_file 필드가 보존된다."""
+        """기존 sources, metadata_db, key_file은 보존되고 레거시 webdav는 제거된다."""
         loader = ConfigLoader(str(config_file))
         result = loader.migrate_v1_to_v2(v1_config)
 
-        assert result["webdav"] == v1_config["webdav"]
+        assert "webdav" not in result
         assert result["sources"] == v1_config["sources"]
         assert result["metadata_db"] == v1_config["metadata_db"]
         assert result["key_file"] == v1_config["key_file"]

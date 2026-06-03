@@ -1,11 +1,5 @@
 {
-  "version": 1,
-  "webdav": {
-    "host": "127.0.0.1",
-    "port": 8080,
-    "username": "admin",
-    "password": "stardust"
-  },
+  "version": 2,
   "sources": [
     {
       "type": "loopback",
@@ -27,5 +21,17 @@
     }
   ],
   "metadata_db": "C:/Users/yonguk.choe/src/stardustfs/.dev-storage/metadata.db",
-  "key_file": "C:/Users/yonguk.choe/src/stardustfs/.dev-storage/master.key"
+  "key_file": "C:/Users/yonguk.choe/src/stardustfs/.dev-storage/master.key",
+  "server": {
+    "url": "https://stardustfs.noizze.net",
+    "device_name": "dev-desktop"
+  },
+  "sync": {
+    "interval_seconds": 30,
+    "conflict_strategy": "copy"
+  },
+  "p2p": {
+    "port": 9090,
+    "enabled": true
+  }
 }
