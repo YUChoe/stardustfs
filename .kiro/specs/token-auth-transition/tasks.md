@@ -28,15 +28,18 @@ inclusion: manual
 - [ ] C3. dispatcher 등록(login/logout은 자체 처리; login은 토큰 없이도 동작).
 - [ ] C4. 비밀번호 로그 미출력 확인(Property 1).
 
-## Phase D: 기존 경로 전환 (.env 제거)
-- [ ] D1. `CLISession.open_online()`에서 STARDUST_EMAIL/PASSWORD 제거 → 저장소 토큰
-      로딩. 토큰 없으면 온라인 명령 "login 필요" 규격 에러.
-- [ ] D2. `stardustfs.py startup_v2` 및 `online_recovery.py`의 env 로그인 → 저장소
-      토큰. 없으면 오프라인 강등(Requirement 9).
-- [ ] D3. key 백업/복원(`_backup_key_to_server`/`_restore_key_from_server`)의
-      STARDUST_KEY_PASSWORD → 저장소 key_password 우선, 없으면 대화형.
-- [ ] D4. 마이그레이션 부트스트랩: 저장소 없음 + .env 자격증명 시 login이 일회성으로
-      사용(Requirement 8).
+## Phase D: 기존 경로 전환 (.env 제거) — 완료
+- [x] D1. `CLISession.open_online()`에서 STARDUST_EMAIL/PASSWORD 제거 → 저장소 토큰
+      로딩(load_from_store)+유효성(get_valid_token). 토큰 없거나 무효면 online=False로
+      강등하고, dispatcher가 온라인 명령에 "login 필요"(비0) 반환.
+- [x] D2. `startup_v2`(daemon) 및 `online_recovery._attempt_recovery`의 env 로그인 →
+      저장소 토큰. 없으면 오프라인 모드/복구 실패(Requirement 9).
+- [x] D3. key 백업/복원의 STARDUST_KEY_PASSWORD → auth_client.key_password(저장소)
+      우선, 없으면 환경변수 폴백(마이그레이션).
+- [x] D4. 마이그레이션 부트스트랩: login이 .env(EMAIL/PASSWORD/KEY_PASSWORD)를 일회성
+      입력으로 사용(Phase C cmd_login의 env 폴백).
+- [x] test_online_recovery 갱신(login → load_from_store+get_valid_token), no-credentials
+      케이스 추가. 클라이언트 회귀 확인.
 
 ## Phase S: 서버 로그아웃 엔드포인트 (`../stardustfs-server`)
 - [ ] S1. `TokenService.revoke_refresh_token(user_id, refresh_token)`: `_hash_token`
@@ -48,14 +51,15 @@ inclusion: manual
 - [ ] S4. 배포 주의: 미배포 서버에서는 클라이언트 logout이 404를 받으므로 로컬
       삭제로 폴백(하위호환).
 
-## Phase E: 검증·문서
-- [ ] E1. 마이그레이션 테스트: .env 부트스트랩 → 저장소 생성, master.key/metadata
-      미변경 단언(Property 5).
-- [ ] E2. E2E(로컬 서버): login → devices/put/get(.env 미사용) → 만료 후 자동 갱신 →
-      logout → "login 필요".
-- [ ] E3. 양쪽 pytest 회귀 그린 유지.
-- [ ] E4. 문서 갱신: HANDOVER/CONFIGURATION/run-dev, `.env`에서 EMAIL/PASSWORD/
-      KEY_PASSWORD 제거 안내, login/logout 사용법.
+## Phase E: 검증·문서 — 완료
+- [x] E2. E2E(로컬 서버, scripts/e2e_cli_local.py 토큰 흐름으로 갱신): account
+      register → login(저장소 생성) → device 등록(저장소 토큰) → devices/put/ls/get
+      (env 자격증명 없이 저장소 토큰만) → logout(서버 취소+삭제) → devices "login 필요".
+      13 passed.
+- [x] E3. 회귀: 클라이언트 398 passed/1 skip, 서버 76 passed.
+- [x] E4. 문서: HANDOVER §7-1(토큰 인증 모델 + 마이그레이션 절차) 추가.
+- [ ] E1. 마이그레이션 단위 테스트(.env 부트스트랩 → 저장소 생성, master.key/metadata
+      미변경 Property 5)는 E2E로 대체 검증됨. 별도 단위 테스트는 선택(후속).
 
 ## 비범위 (이번 전환 제외)
 - 서버 device-bound 토큰 신설(디바이스별 발급/취소). 향후 필요 시 refresh 행에

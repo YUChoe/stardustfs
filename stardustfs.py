@@ -201,23 +201,31 @@ async def startup_v2(config: dict, config_path: str) -> None:
         await daemon.serve(config["metadata_db"], _cleanup)
         return
 
-    # (2) 인증
+    # (2) 인증 — 저장된 토큰 사용(비밀번호 미사용). 토큰 없거나 무효면 오프라인 모드.
     from stardustlib.auth_client import AuthClient
+    from stardustlib.credential_store import CredentialStore
 
-    email = os.environ.get("STARDUST_EMAIL", "")
-    password = os.environ.get("STARDUST_PASSWORD", "")
-
-    auth_client = AuthClient(server_url)
+    credential_store = CredentialStore(config["metadata_db"])  # type: ignore[index]
+    auth_client = AuthClient(server_url, credential_store=credential_store)
     offline_mode = False
 
-    try:
-        await auth_client.login(email, password)
-    except AuthenticationError as e:
-        logger.warning("인증 실패, 오프라인 모드로 전환: %s", e)
+    if not auth_client.load_from_store():
+        logger.warning(
+            "저장된 자격증명이 없습니다. 'stardustfs login' 후 daemon을 "
+            "실행하세요. 오프라인 모드로 시작합니다."
+        )
         offline_mode = True
-    except Exception as e:
-        logger.warning("인증 중 예외 발생, 오프라인 모드로 전환: %s", e)
-        offline_mode = True
+    else:
+        try:
+            await auth_client.get_valid_token()
+        except AuthenticationError as e:
+            logger.warning(
+                "토큰 만료/무효(%s), 재로그인 필요. 오프라인 모드로 전환.", e
+            )
+            offline_mode = True
+        except Exception as e:  # noqa: BLE001 — 네트워크 등 → 오프라인
+            logger.warning("토큰 확인 중 예외(%s), 오프라인 모드로 전환.", e)
+            offline_mode = True
 
     # (3) key_file 복원 (필요 시)
     key_file_path = config.get("key_file")  # type: ignore[attr-defined]
@@ -620,12 +628,15 @@ async def _restore_key_from_server(
     from stardustlib.exceptions import KeyNotFoundError
     from stardustlib.key_backup_engine import KeyBackupEngine
 
-    key_password = os.environ.get("STARDUST_KEY_PASSWORD", "")
+    # key_password: 자격증명 저장소(login 시 보관) 우선, 없으면 환경변수(마이그레이션)
+    key_password = getattr(auth_client, "key_password", None) or os.environ.get(
+        "STARDUST_KEY_PASSWORD", ""
+    )
     if not key_password:
         raise RuntimeError(
-            "key_file이 존재하지 않고 STARDUST_KEY_PASSWORD 환경변수가 "
-            "설정되지 않았습니다. 새 디바이스에서는 key 복원을 위해 "
-            "STARDUST_KEY_PASSWORD를 설정해야 합니다."
+            "key_file이 존재하지 않고 key 백업 암호도 없습니다. "
+            "'stardustfs login --key-password ...'로 저장하거나 "
+            "STARDUST_KEY_PASSWORD를 설정한 뒤 다시 실행하세요."
         )
 
     logger.info("key_file 미존재, 서버에서 key 백업 다운로드 시도...")
@@ -675,11 +686,14 @@ async def _backup_key_to_server(
 
     from stardustlib.key_backup_engine import KeyBackupEngine
 
-    key_password = os.environ.get("STARDUST_KEY_PASSWORD", "")
+    # key_password: 자격증명 저장소 우선, 없으면 환경변수(마이그레이션)
+    key_password = getattr(auth_client, "key_password", None) or os.environ.get(
+        "STARDUST_KEY_PASSWORD", ""
+    )
     if not key_password:
         logger.warning(
-            "STARDUST_KEY_PASSWORD 미설정, key 백업 건너뜀. "
-            "다른 디바이스에서 key를 복원하려면 백업이 필요합니다."
+            "key 백업 암호 미설정, key 백업 건너뜀. 'stardustfs login "
+            "--key-password ...'로 저장하면 다른 디바이스에서 복원할 수 있습니다."
         )
         return
 

@@ -104,14 +104,13 @@ class OnlineRecoveryManager:
         5. P2P 서버 시작
         6. heartbeat 시작
         """
-        import os
-
-        email = os.environ.get("STARDUST_EMAIL", "")
-        password = os.environ.get("STARDUST_PASSWORD", "")
-
-        # (1) 인증 재시도
+        # (1) 인증 재시도 — 저장된 토큰을 재로딩하고 유효성 확인(필요 시 갱신).
+        #     비밀번호는 사용하지 않는다. 토큰 없거나 무효면 복구 실패(재로그인 필요).
+        if not self._auth_client.load_from_store():
+            logger.debug("Recovery: 저장된 자격증명 없음 (login 필요)")
+            return False
         try:
-            await self._auth_client.login(email, password)
+            await self._auth_client.get_valid_token()
         except AuthenticationError as e:
             logger.debug("Recovery auth failed: %s", e)
             return False

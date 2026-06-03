@@ -13,7 +13,6 @@ read_file/write_file의 원격 경로는 remote_source의 전용 이벤트 루�
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 
 from stardustlib.config_loader import ConfigLoader
@@ -81,7 +80,9 @@ class CLISession:
             _restore_key_from_server,
         )
         from stardustlib.auth_client import AuthClient
+        from stardustlib.credential_store import CredentialStore
         from stardustlib.device_manager import DeviceManager
+        from stardustlib.exceptions import AuthenticationError
 
         config = ConfigLoader(config_path).load()
         server = config.get("server")
@@ -92,14 +93,24 @@ class CLISession:
             jbod, metadata, _enc, _db = _build_core(config)
             return cls(jbod, metadata)
 
-        auth = AuthClient(server_url)
-        email = os.environ.get("STARDUST_EMAIL", "")
-        password = os.environ.get("STARDUST_PASSWORD", "")
-
+        # 저장된 토큰으로 인증 (비밀번호는 사용하지 않음). 토큰 없거나 무효면
+        # 오프라인 세션으로 강등 → 온라인 명령은 dispatcher에서 'login 필요' 처리.
+        store = CredentialStore(config["metadata_db"])
+        auth = AuthClient(server_url, credential_store=store)
+        if not auth.load_from_store():
+            logger.warning(
+                "저장된 자격증명이 없습니다. 'stardustfs login'을 먼저 실행하세요."
+            )
+            await auth.close()
+            jbod, metadata, _enc, _db = _build_core(config)
+            return cls(jbod, metadata)
         try:
-            await auth.login(email, password)
-        except Exception as e:  # noqa: BLE001 — 오프라인 강등
-            logger.warning("인증 실패, 오프라인 세션으로 강등: %s", e)
+            await auth.get_valid_token()
+        except AuthenticationError as e:
+            logger.warning(
+                "토큰이 만료/무효합니다 (%s). 'stardustfs login'을 다시 실행하세요.",
+                e,
+            )
             await auth.close()
             jbod, metadata, _enc, _db = _build_core(config)
             return cls(jbod, metadata)

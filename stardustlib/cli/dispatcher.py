@@ -141,6 +141,14 @@ async def _run_online(handler, args, needs_sync: bool) -> int:
     """
     session = await CLISession.open_online(args.config, sync=needs_sync)
     try:
+        # 온라인이 필요한데 토큰이 없거나 무효라 강등된 경우
+        if not session.online:
+            print(
+                "오류: 로그인이 필요합니다. 'stardustfs login --config ...'을 "
+                "먼저 실행하세요.",
+                file=sys.stderr,
+            )
+            return 1
         result = handler(session, args)
         if inspect.isawaitable(result):
             result = await result

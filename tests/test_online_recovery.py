@@ -14,7 +14,9 @@ from stardustlib.online_recovery import OnlineRecoveryManager
 @pytest.fixture
 def auth_client():
     mock = AsyncMock()
-    mock.login = AsyncMock()
+    # 저장된 토큰 기반 인증(Phase D): load_from_store(동기) + get_valid_token(비동기)
+    mock.load_from_store = MagicMock(return_value=True)
+    mock.get_valid_token = AsyncMock(return_value="access-token")
     mock.close = AsyncMock()
     return mock
 
@@ -54,11 +56,11 @@ async def test_recovery_success(auth_client, device_mgr, sync_client, p2p_server
         check_interval=1,
     )
 
-    with patch.dict("os.environ", {"STARDUST_EMAIL": "a@b.c", "STARDUST_PASSWORD": "pw"}):
-        result = await mgr._attempt_recovery()
+    result = await mgr._attempt_recovery()
 
     assert result is True
-    auth_client.login.assert_awaited_once_with("a@b.c", "pw")
+    auth_client.load_from_store.assert_called_once()
+    auth_client.get_valid_token.assert_awaited()
     device_mgr.register.assert_awaited_once()
     sync_client.upload_metadata.assert_awaited_once()
     sync_client.initial_sync.assert_awaited_once()
@@ -69,18 +71,36 @@ async def test_recovery_success(auth_client, device_mgr, sync_client, p2p_server
 
 @pytest.mark.asyncio
 async def test_recovery_auth_failure(auth_client, device_mgr, sync_client, p2p_server):
-    """인증 실패 시 False를 반환하고 이후 단계를 호출하지 않는다."""
-    auth_client.login.side_effect = AuthenticationError("timeout")
+    """토큰 무효(갱신 실패) 시 False를 반환하고 이후 단계를 호출하지 않는다."""
+    auth_client.get_valid_token.side_effect = AuthenticationError("expired")
 
     mgr = OnlineRecoveryManager(
         auth_client, device_mgr, sync_client, p2p_server,
         check_interval=1,
     )
 
-    with patch.dict("os.environ", {"STARDUST_EMAIL": "a@b.c", "STARDUST_PASSWORD": "pw"}):
-        result = await mgr._attempt_recovery()
+    result = await mgr._attempt_recovery()
 
     assert result is False
+    device_mgr.register.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recovery_no_credentials(
+    auth_client, device_mgr, sync_client, p2p_server
+):
+    """저장된 자격증명이 없으면 False를 반환한다(login 필요)."""
+    auth_client.load_from_store = MagicMock(return_value=False)
+
+    mgr = OnlineRecoveryManager(
+        auth_client, device_mgr, sync_client, p2p_server,
+        check_interval=1,
+    )
+
+    result = await mgr._attempt_recovery()
+
+    assert result is False
+    auth_client.get_valid_token.assert_not_awaited()
     device_mgr.register.assert_not_awaited()
 
 
@@ -160,7 +180,7 @@ async def test_recovery_no_p2p_server(auth_client, device_mgr, sync_client):
 async def test_stop_cancels_task(auth_client, device_mgr, sync_client, p2p_server):
     """stop() 호출 시 백그라운드 태스크가 취소된다."""
     # 인증 실패로 루프가 계속 재시도하도록 설정
-    auth_client.login.side_effect = AuthenticationError("offline")
+    auth_client.get_valid_token.side_effect = AuthenticationError("offline")
 
     mgr = OnlineRecoveryManager(
         auth_client, device_mgr, sync_client, p2p_server,
