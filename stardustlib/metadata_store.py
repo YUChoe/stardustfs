@@ -100,6 +100,7 @@ class MetadataStore:
         conn.commit()
         self._migrate_to_v2()
         self._migrate_to_v3()
+        self._migrate_to_v4()
         self._initialized = True
         logger.info("Metadata Store 초기화 완료: %s", self._db_path)
 
@@ -225,9 +226,44 @@ class MetadataStore:
             logger.error("v3 스키마 마이그레이션 실패, 롤백 수행: %s", e)
             raise
 
+    def _migrate_to_v4(self) -> None:
+        """v3 → v4 스키마 마이그레이션을 수행한다.
+
+        - files 테이블에 replication_status 컬럼 추가 (none|pending|replicated)
+        - schema_version을 4로 갱신
+        이미 컬럼이 존재하면 아무 작업도 하지 않는다. 기존 레코드는 DEFAULT 'none'.
+        """
+        conn = self._get_conn()
+
+        cursor = conn.execute("PRAGMA table_info(files)")
+        columns = [row["name"] for row in cursor.fetchall()]
+        if "replication_status" in columns:
+            return
+
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN replication_status "
+                "TEXT NOT NULL DEFAULT 'none'"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_version (id, version, migrated_at) "
+                "VALUES (1, 4, ?)",
+                (time.time(),),
+            )
+            conn.commit()
+            logger.info(
+                "MetadataStore v4 스키마 마이그레이션 완료 (replication_status)"
+            )
+        except Exception as e:
+            conn.rollback()
+            logger.error("v4 스키마 마이그레이션 실패, 롤백 수행: %s", e)
+            raise
+
     # --- 파일 메타데이터 CRUD ---
 
     _VALID_SYNC_STATUSES = ("synced", "pending", "conflict")
+    _VALID_REPLICATION_STATUSES = ("none", "pending", "replicated")
     def insert(
         self,
         virtual_path: str,
@@ -343,6 +379,33 @@ class MetadataStore:
             (status, virtual_path),
         )
         conn.commit()
+
+    def set_replication_status(self, virtual_path: str, status: str) -> None:
+        """replication_status를 변경한다 (none|pending|replicated).
+
+        Raises:
+            ValueError: 유효하지 않은 status 값.
+        """
+        if status not in self._VALID_REPLICATION_STATUSES:
+            raise ValueError(
+                f"유효하지 않은 replication_status: {status!r}. "
+                f"허용값: {self._VALID_REPLICATION_STATUSES}"
+            )
+        conn = self._get_conn()
+        conn.execute(
+            "UPDATE files SET replication_status = ? WHERE virtual_path = ?",
+            (status, virtual_path),
+        )
+        conn.commit()
+
+    def get_replication_status(self, virtual_path: str) -> str | None:
+        """파일의 replication_status를 반환한다(레코드 없으면 None)."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT replication_status FROM files WHERE virtual_path = ?",
+            (virtual_path,),
+        ).fetchone()
+        return row["replication_status"] if row is not None else None
 
     def get_pending_files(self) -> list[FileMetadata]:
         """sync_status가 "pending"인 모든 파일 목록을 반환한다.

@@ -17,7 +17,7 @@ import tempfile
 import time
 
 import pytest
-from hypothesis import given, settings
+from hypothesis import assume, given, settings
 from hypothesis import strategies as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -62,6 +62,9 @@ def _set_record(store: MetadataStore, path: str, deleted: int, modified_at: floa
 def test_property9_gc_only_expired_tombstones(records, retention_days):
     """GC는 만료된 tombstone만 제거하고 활성 레코드는 보존한다."""
     retention_seconds = retention_days * 86400
+    # 나이가 정확히 보관기간 경계와 같으면, 테스트의 now와 purge 내부 time.time()의
+    # 미세한 차이로 결과가 모호해진다(정수 나이에서 유일한 경계점). 해당 예제 제외.
+    assume(all(age != retention_seconds for _d, age in records))
     now = time.time()
     d = tempfile.mkdtemp()
     store = _make_store(d)
