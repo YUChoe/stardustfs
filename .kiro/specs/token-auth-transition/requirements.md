@@ -62,9 +62,10 @@ inclusion: manual
   않는다(refresh 회전 유실 방지).
 
 ### Requirement 5: 로그아웃
-- WHEN 사용자가 `logout`을 실행하면, THE 시스템은 SHALL 자격증명 저장소를 삭제한다.
-- THE 시스템은 SHALL 서버측 refresh 토큰 취소를 best-effort로 시도하되, 실패해도
-  로컬 삭제는 완료한다.
+- WHEN 사용자가 `logout`을 실행하면, THE 클라이언트는 SHALL `POST /auth/logout`으로
+  서버측 refresh 토큰 취소를 시도한 뒤 자격증명 저장소를 삭제한다.
+- IF 서버 취소 호출이 실패하면(네트워크 등), THE 클라이언트는 SHALL 경고를 남기고
+  로컬 삭제는 완료한다(로컬 자격은 반드시 제거).
 
 ### Requirement 6: 저장소 파일 권한
 - WHEN 자격증명 저장소를 생성/갱신하면, THE 시스템은 SHALL 소유자 전용 권한으로
@@ -87,3 +88,13 @@ inclusion: manual
 ### Requirement 9: 오프라인 시나리오
 - IF 서버 도달 불가이고 저장소에 유효 토큰이 없으면, THE daemon은 SHALL 기존과 같이
   오프라인 모드로 강등한다(master.key가 로컬에 있어야 동작).
+
+### Requirement 10: 서버 로그아웃/취소 엔드포인트 (서버 변경)
+- WHEN 클라이언트가 `POST /auth/logout`에 유효한 refresh_token을 제시하면, THE
+  서버는 SHALL 해당 토큰을 `is_revoked=1`로 표시하고 200을 반환한다.
+- IF 토큰이 이미 폐기되었거나 존재하지 않으면, THE 서버는 SHALL 멱등하게 200을
+  반환한다(정보 노출 방지).
+- THE 서버는 SHALL access_token(Authorization) 인증을 요구하고, 본문의
+  refresh_token이 해당 사용자 소유일 때만 취소한다.
+- 비범위: 디바이스별 토큰 연결(refresh_tokens.device_id) 및 디바이스별 취소는
+  이번 전환에서 제외(후속). refresh_tokens는 user-scoped 유지.

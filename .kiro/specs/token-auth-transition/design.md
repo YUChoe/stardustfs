@@ -45,7 +45,8 @@ inclusion: manual
 - `login` (오프라인 분류, 자체 처리): email/password를 (flag > 환경변수 > 대화형
   프롬프트) 순으로 수집 → `AuthClient.login` → 저장소 기록. key_password도 동일하게
   수집해 저장소에 보관(없으면 건너뜀). `getpass`로 비밀번호 입력 에코 방지.
-- `logout`: 서버측 취소 best-effort 후 `CredentialStore.clear()`.
+- `logout`: 저장소의 refresh_token으로 `POST /auth/logout` 호출(서버 취소) 후
+  `CredentialStore.clear()`. 서버 호출 실패해도 로컬 삭제는 수행.
 - `CLISession.open_online()`: `STARDUST_EMAIL/PASSWORD` 직접 읽기를 제거하고,
   `CredentialStore`에서 토큰을 로딩한 `AuthClient`를 구성한다. 토큰이 없으면 온라인
   명령은 "login 필요" 규격 에러.
@@ -55,6 +56,18 @@ inclusion: manual
   저장소 토큰 사용. 토큰 없으면 오프라인 모드로 강등(Requirement 9).
 - key 백업/복원(`_backup_key_to_server`/`_restore_key_from_server`)의
   `STARDUST_KEY_PASSWORD` 직접 읽기를 저장소 key_password 우선, 없으면 대화형으로 변경.
+
+### 서버: 로그아웃 엔드포인트 (변경: `../stardustfs-server`)
+기존 user-scoped 토큰 모델을 유지하되, 단일 refresh 토큰 취소만 추가한다.
+
+- `POST /auth/logout` (신규, `app/routers/auth.py`): Authorization access_token 인증.
+  본문 `{"refresh_token": "..."}`. `_hash_token`으로 해시 계산 후 `refresh_tokens`에서
+  `user_id == 현재 사용자 AND token_hash == 해시`인 행을 `is_revoked=1`로 갱신.
+  존재하지 않거나 이미 폐기여도 200(멱등). `TokenService.revoke_refresh_token(
+  user_id, refresh_token)` 추가.
+- 스키마 변경 없음(`refresh_tokens.is_revoked` 기존 컬럼 사용). DB 마이그레이션 불필요.
+- refresh 검증 경로(`refresh_tokens.is_revoked`)가 이미 폐기 토큰을 거부하므로, 취소
+  후 해당 refresh는 재사용 불가.
 
 ## Data Models
 
@@ -105,6 +118,7 @@ inclusion: manual
 - 파일 락 타임아웃: 갱신 건너뛰고 기존 access_token 사용(만료면 401로 이어져 재로그인
   유도). WARNING 로그.
 - 네트워크 오류: 기존 토큰 보존, 오프라인 강등(예외 전파 금지).
+- logout 서버 호출 실패: 경고 로그 후 로컬 저장소는 반드시 삭제(로컬 자격 잔존 금지).
 
 ## Testing Strategy
 
@@ -116,8 +130,11 @@ inclusion: manual
   (mock 서버 카운트)임을 검증.
 - 마이그레이션: 저장소 없음 + .env 자격증명 → `login` 부트스트랩 → 저장소 생성,
   master.key/metadata 미변경 단언.
+- 서버(`POST /auth/logout`): 유효 refresh 취소 후 그 토큰으로 `/auth/refresh`가
+  실패(401)함을 검증, 멱등성(이미 폐기/미존재 시 200), 타 사용자 토큰 취소 거부.
 - E2E(로컬 서버): `login` → `devices`/`put`/`get`(저장소 토큰 사용, .env 미사용) →
-  토큰 만료 시뮬레이션 후 자동 갱신 → `logout` → 온라인 명령이 "login 필요" 반환.
+  토큰 만료 시뮬레이션 후 자동 갱신 → `logout`(서버 취소) → 같은 refresh로 재접근
+  불가 + 온라인 명령이 "login 필요" 반환.
 - 회귀: 기존 클라이언트/서버 pytest 그린 유지.
 
 ## 마이그레이션 절차 (기존 사용자)

@@ -23,7 +23,8 @@ inclusion: manual
 ## Phase C: login / logout 명령
 - [ ] C1. `login` 명령: email/password 수집(flag > env > getpass 대화형) → login →
       저장소 기록. key_password 동일 방식 수집·저장(선택).
-- [ ] C2. `logout` 명령: 서버측 취소 best-effort → CredentialStore.clear().
+- [ ] C2. `logout` 명령: 저장소 refresh_token으로 `POST /auth/logout` 호출(서버 취소)
+      → CredentialStore.clear(). 서버 실패 시 경고 후 로컬 삭제는 수행.
 - [ ] C3. dispatcher 등록(login/logout은 자체 처리; login은 토큰 없이도 동작).
 - [ ] C4. 비밀번호 로그 미출력 확인(Property 1).
 
@@ -36,6 +37,16 @@ inclusion: manual
       STARDUST_KEY_PASSWORD → 저장소 key_password 우선, 없으면 대화형.
 - [ ] D4. 마이그레이션 부트스트랩: 저장소 없음 + .env 자격증명 시 login이 일회성으로
       사용(Requirement 8).
+
+## Phase S: 서버 로그아웃 엔드포인트 (`../stardustfs-server`)
+- [ ] S1. `TokenService.revoke_refresh_token(user_id, refresh_token)`: `_hash_token`
+      해시로 `refresh_tokens`에서 본인 소유 행을 is_revoked=1 갱신(멱등).
+- [ ] S2. `POST /auth/logout` 라우트: access_token 인증 + 본문 refresh_token →
+      revoke. 항상 200(멱등, 정보 노출 방지). 스키마 변경 없음.
+- [ ] S3. 서버 테스트: 취소 후 해당 refresh로 /auth/refresh 401, 멱등성, 타 사용자
+      토큰 취소 거부. 서버 pytest 그린 유지.
+- [ ] S4. 배포 주의: 미배포 서버에서는 클라이언트 logout이 404를 받으므로 로컬
+      삭제로 폴백(하위호환).
 
 ## Phase E: 검증·문서
 - [ ] E1. 마이그레이션 테스트: .env 부트스트랩 → 저장소 생성, master.key/metadata
