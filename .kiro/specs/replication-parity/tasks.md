@@ -49,10 +49,20 @@ pytest 그린 유지, 전송/복구는 로컬 서버 E2E로 검증.
       소유자 격리 테스트.
 
 ## Phase 5: UDP 홀펀칭 (선택, 직접 연결 확대)
-- [ ] 5.1 서버 랑데부 엔드포인트(양쪽 reflexive 주소 교환 + 동시 오픈 신호).
-- [ ] 5.2 `holepunch.py`: 순수 파이썬 UDP 동시 오픈(C 의존 없이). 성공 시 직접 경로,
-      실패 시 릴레이 fallback.
-- [ ] 5.3 symmetric/CGNAT은 릴레이로 귀결됨을 테스트로 확인(보장된 fallback).
+- [x] 5.1 서버 랑데부(UDP): app/rendezvous.py — register로 reflexive UDP 주소 학습,
+      connect로 같은 사용자 두 디바이스에 서로 주소 + punch 신호 교환. 토큰은
+      decode_token으로 검증(같은 user_id만 중개). main.py lifespan 옵트인
+      (rendezvous_enabled 기본 False, 테스트 영향 없음). 테스트 5종.
+- [x] 5.2 `holepunch.py`: 순수 파이썬 UDP 동시 오픈(표준 socket/asyncio, 무-C).
+      단일 소켓으로 register→request_peer→punch. 성공 시 직접 UDP 경로, 실패 시
+      호출자가 릴레이 fallback. 테스트 5종(동시 오픈 성공/무응답 실패/랑데부 왕복).
+- [x] 5.3 punch 실패(symmetric/CGNAT/이중 NAT)는 호출자가 릴레이로 귀결
+      (test_punch_fails_without_peer → False 반환 = fallback 트리거). 릴레이는 기존
+      보장된 fallback.
+- [~] (이관) 데이터 전송의 HTTP→UDP 통합은 별도 범위 — 현 P2P 전송은 httpx HTTP(TCP)
+      라 punch로 연 UDP 매핑을 재사용할 수 없다. 홀펀칭은 직접 도달성 판정/랑데부
+      인프라로 제공하고, 실제 전송 전환(UDP 데이터 채널)은 미착수. daemon 자동
+      랑데부 등록도 전송 전환과 함께 후속.
 
 ## Phase 6: 건강성 / 재복제 / 호혜 집행
 - [ ] 6.1 홀더 heartbeat로 online 복제 수 집계, <3 지속(기본 24h) 시 재복제 큐잉.
