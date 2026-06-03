@@ -31,6 +31,8 @@ _HANDLERS = {
     "mkdir": (commands.cmd_mkdir, True, True),
     "mv": (commands.cmd_mv, True, True),
     "cp": (commands.cmd_cp, True, True),
+    "backup": (commands.cmd_backup, True, True),
+    "restore": (commands.cmd_restore, True, True),
 }
 
 # 인증 계열: 세션 없이 config + 자격증명 저장소로 동작. (args) -> int 코루틴.
@@ -86,6 +88,16 @@ def add_subcommands(subparsers, parent=None) -> None:
     p_cp = subparsers.add_parser("cp", help="파일 복사", **kw)
     p_cp.add_argument("src", help="원본 가상 경로")
     p_cp.add_argument("dst", help="대상 가상 경로")
+
+    # 리플리케이션 계열
+    p_backup = subparsers.add_parser(
+        "backup", help="파일을 암호화 복제(≥3 홀더)", **kw
+    )
+    p_backup.add_argument("path", help="가상 경로")
+    p_restore = subparsers.add_parser(
+        "restore", help="복제본에서 파일 복구", **kw
+    )
+    p_restore.add_argument("path", help="가상 경로")
 
     # 인증 계열
     p_login = subparsers.add_parser("login", help="이메일/비밀번호 로그인(토큰 저장)", **kw)

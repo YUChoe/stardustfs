@@ -368,3 +368,62 @@ async def cmd_cp(session, args) -> int:
     await session.upload_if_online()
     echo(f"복사 완료: {src} -> {dst}{_note_propagation(session)}")
     return 0
+
+
+# --- 리플리케이션 계열 (온라인 + 동기화) ---
+#
+# backup: 암호화 청크를 ≥3 홀더에 복제. restore: 복제본에서 복구.
+# 종료 코드: 0 성공(replicated/복구) / 3 없음 / 4 복제 미완료·복구 실패.
+
+
+async def cmd_backup(session, args) -> int:
+    """파일을 암호화 청크로 분할해 ≥3 홀더에 복제한다."""
+    from stardustlib.replication_manager import ReplicationError
+
+    path = _vpath(args.path)
+    mgr = session.make_replication_manager()
+    try:
+        result = mgr.replicate(path)
+    except FileNotFoundError:
+        _err(f"오류: 없는 경로: {path}")
+        return 3
+    except ReplicationError as e:
+        _err(f"오류: 복제 실패: {e}")
+        return 4
+    finally:
+        mgr.close()
+
+    if result.status == "replicated":
+        echo(
+            f"복제 완료: {path} — 청크 {result.chunk_count}개, "
+            f"각 ≥{result.min_replicas} 홀더"
+        )
+        return 0
+    echo(
+        f"복제 미완료(pending): {path} — 청크별 복제수 "
+        f"{result.replicas_per_chunk} (목표 {result.min_replicas}). "
+        "홀더 확보 후 다시 시도하세요."
+    )
+    return 4
+
+
+async def cmd_restore(session, args) -> int:
+    """복제본에서 파일을 복구해 로컬에 기록한다."""
+    from stardustlib.replication_manager import RecoveryError, ReplicationError
+
+    path = _vpath(args.path)
+    mgr = session.make_replication_manager()
+    try:
+        nbytes = mgr.recover(path)
+    except RecoveryError as e:
+        _err(f"오류: 복구 실패: {e} (누락 청크 {len(e.missing_chunks)}개)")
+        return 4
+    except ReplicationError as e:
+        _err(f"오류: 복구 실패: {e}")
+        return 4
+    finally:
+        mgr.close()
+
+    await session.upload_if_online()
+    echo(f"복구 완료: {path} ({nbytes} bytes){_note_propagation(session)}")
+    return 0

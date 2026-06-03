@@ -30,12 +30,23 @@ pytest 그린 유지, 전송/복구는 로컬 서버 E2E로 검증.
       (`tests/test_parity_store.py`, 12개).
 
 ## Phase 4: 복제 매니저 + 전송
-- [ ] 4.1 `replication_manager.replicate`: 청크 분할 → placement → 홀더 push → ack →
-      레지스트리 확정 → ≥3 확보 시 replicated, 아니면 pending(경고).
-- [ ] 4.2 `replication_manager.recover`: 레지스트리 조회 → 도달 가능한 홀더에서 fetch
-      (스웜) → join → 복호화 → 복원. 모든 홀더 실패 시 규격 에러(누락 chunk 명시).
-- [ ] 4.3 전송 fallback: 직접 → (Phase 5)홀펀칭 → 릴레이.
-- [ ] 4.4 CLI: `backup`/`restore`(또는 put/get에 복제 옵션) + 상태 표시.
+- [x] 4.1 `replication_manager.replicate`: 평문→암호문 blob 암호화 → 청크 분할 →
+      청크 등록 + placement → 홀더 직접 push → ack → record_replica →
+      모든 청크 ≥min_replicas(기본 3) 확보 시 replicated, 아니면 pending(경고).
+      file_ref/chunk_id는 가상경로 SHA-256(서버에 경로 비노출).
+- [x] 4.2 `replication_manager.recover`: GET /replication/chunks/{file_ref}로 청크
+      목록 조회 → 청크별 온라인·도달 가능한 홀더에서 fetch(스웜) → join → 복호화 →
+      jbod.write_file 복원. 도달 불가 청크가 있으면 RecoveryError(누락 chunk_id 명시).
+      서버 추가: ReplicationService.list_chunks + GET /replication/chunks/{file_ref}.
+- [~] 4.3 전송 fallback: 직접 push/fetch 구현. 홀더 도달 불가 시 해당 홀더만 실패
+      처리하고 다음 홀더로 진행(스웜으로 복구 가능). 교차 사용자 릴레이 fallback은
+      릴레이 허브가 같은 user_id 간만 허용하므로 서버 확장 필요 → Phase 6로 이관.
+      홀펀칭은 Phase 5.
+- [x] 4.4 CLI: `backup`/`restore` 명령(온라인+동기화). 종료 코드 0/3/4, pending 경고.
+- [x] 4.5 단위 테스트: replicate→recover 라운드트립(암호화 일치, Property 3),
+      홀더<3 → pending, 홀더 실패 건너뛰기, 누락/오프라인 복구 RecoveryError,
+      홀더 1곳만 도달 가능 시 복구 성공(스웜), file_ref 경로 비노출. 서버 list_chunks
+      소유자 격리 테스트.
 
 ## Phase 5: UDP 홀펀칭 (선택, 직접 연결 확대)
 - [ ] 5.1 서버 랑데부 엔드포인트(양쪽 reflexive 주소 교환 + 동시 오픈 신호).

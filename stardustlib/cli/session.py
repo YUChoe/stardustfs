@@ -49,8 +49,22 @@ class CLISession:
         self.auth = None
         self.device_mgr = None
         self.sync_client = None
+        self.server_url: str | None = None
         self.my_devices: list[dict] | None = None
         self.self_device_id: str | None = None
+
+    def make_replication_manager(self):
+        """리플리케이션 매니저를 생성한다(온라인 세션 전용).
+
+        호출자가 close()로 정리한다.
+        """
+        if not self.online or self.auth is None or not self.server_url:
+            raise RuntimeError("리플리케이션은 온라인 세션이 필요합니다")
+        from stardustlib.replication_manager import ReplicationManager
+
+        return ReplicationManager(
+            self.auth, self.server_url, self.metadata, self.jbod
+        )
 
     @classmethod
     def open(cls, config_path: str) -> "CLISession":
@@ -157,6 +171,7 @@ class CLISession:
         session.auth = auth
         session.device_mgr = device_mgr
         session.sync_client = sync_client
+        session.server_url = server_url
         session.my_devices = my_devices
         session.self_device_id = self_device_id
         return session
