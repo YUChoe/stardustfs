@@ -78,16 +78,26 @@ def read_status(metadata_db: str) -> dict:
     }
 
 
+def signal_stop(metadata_db: str) -> dict:
+    """정지 센티넬만 생성한다(대기 없음). daemon은 다음 틱(~1초)에 감지·종료한다.
+
+    반환: {signalled: bool, reason?: str}. 제어 파일이 없으면 not_running.
+    """
+    if not os.path.exists(_control_path(metadata_db)):
+        return {"signalled": False, "reason": "not_running"}
+    with open(_stop_path(metadata_db), "w", encoding="utf-8") as f:
+        f.write("stop")
+    return {"signalled": True}
+
+
 def request_stop(metadata_db: str) -> dict:
     """정지 센티넬을 만들고 daemon이 제어 파일을 지울 때까지 대기한다.
 
     반환: {stopped: bool, reason?: str}.
     """
-    if not os.path.exists(_control_path(metadata_db)):
-        return {"stopped": False, "reason": "not_running"}
-
-    with open(_stop_path(metadata_db), "w", encoding="utf-8") as f:
-        f.write("stop")
+    res = signal_stop(metadata_db)
+    if not res.get("signalled"):
+        return {"stopped": False, "reason": res.get("reason", "not_running")}
 
     deadline = time.time() + _STOP_WAIT_SECONDS
     while time.time() < deadline:

@@ -77,6 +77,21 @@ def test_source_add_remove(tmp_path):
     assert all(s["id"] != sid for s in actions.list_sources(cfg_path))
 
 
+def test_is_logged_in_reflects_credential_store(tmp_path):
+    import os as _os
+
+    base = tmp_path / "li"
+    cfg_path = actions.create_config(
+        str(base), "https://s.example", "dev", generate_key=True
+    )
+    assert actions.is_logged_in(cfg_path) is False
+    # 자격증명 저장소 파일이 생기면 True
+    cred = _os.path.join(str(base), "metadata.db.credentials.json")
+    with open(cred, "w", encoding="utf-8") as f:
+        f.write("{}")
+    assert actions.is_logged_in(cfg_path) is True
+
+
 def test_daemon_status_not_running(tmp_path):
     cfg = tmp_path / "config.json"
     cfg.write_text(

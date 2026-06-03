@@ -94,6 +94,12 @@ class StardustApp:
         self.root.lift()
 
     def _quit(self) -> None:
+        # 종료 시 daemon도 정지(센티넬만 즉시 생성, 대기 없음 — daemon이 ~1초 내 종료).
+        if self.config_path:
+            try:
+                actions.daemon_signal_stop(self.config_path)
+            except Exception:  # noqa: BLE001
+                pass
         if self.tray_icon is not None:
             try:
                 self.tray_icon.stop()
@@ -127,15 +133,19 @@ class StardustApp:
         ttk.Button(top, text=t["choose_config"], command=self._choose_config).pack(side="left", padx=4)
         self.cfg_label = ttk.Label(top, text=self.config_path or "—")
         self.cfg_label.pack(side="left", padx=6)
-        ttk.Button(top, text=t["login"], command=self._login).pack(side="right")
-        ttk.Button(top, text=t["logout"], command=self._logout).pack(side="right", padx=4)
+        self.login_btn = ttk.Button(top, text=t["login"], command=self._login)
+        self.login_btn.pack(side="right")
+        self.logout_btn = ttk.Button(top, text=t["logout"], command=self._logout)
+        self.logout_btn.pack(side="right", padx=4)
 
         dframe = ttk.Frame(self.body, padding=(6, 0))
         dframe.pack(fill="x")
         self.daemon_label = ttk.Label(dframe, text=t["daemon_unknown"])
         self.daemon_label.pack(side="left")
-        ttk.Button(dframe, text=t["daemon_start"], command=self._daemon_start).pack(side="left", padx=4)
-        ttk.Button(dframe, text=t["daemon_stop"], command=self._daemon_stop).pack(side="left")
+        self.daemon_start_btn = ttk.Button(dframe, text=t["daemon_start"], command=self._daemon_start)
+        self.daemon_start_btn.pack(side="left", padx=4)
+        self.daemon_stop_btn = ttk.Button(dframe, text=t["daemon_stop"], command=self._daemon_stop)
+        self.daemon_stop_btn.pack(side="left")
         ttk.Button(dframe, text=t["devices"], command=self._devices).pack(side="right")
         ttk.Button(dframe, text=t["storage"], command=self._sources).pack(side="right", padx=4)
 
@@ -172,6 +182,9 @@ class StardustApp:
         self.status = ttk.Label(self.body, text="", relief="sunken", anchor="w", padding=4)
         self.status.pack(fill="x", side="bottom")
 
+        self._refresh_login_state()
+        self._set_daemon_buttons(None)
+
     # --- 워커 브리지 ---
 
     def _tick(self) -> None:
@@ -197,6 +210,34 @@ class StardustApp:
 
     def _set_status(self, text: str) -> None:
         self.status.config(text=text)
+
+    @staticmethod
+    def _enable(btn, on: bool) -> None:
+        btn.state(["!disabled"] if on else ["disabled"])
+
+    def _refresh_login_state(self) -> None:
+        """로그인 여부에 따라 로그인/로그아웃 버튼 활성 상태를 갱신한다."""
+        if not self.config_path:
+            self._enable(self.login_btn, False)
+            self._enable(self.logout_btn, False)
+            return
+        try:
+            logged = actions.is_logged_in(self.config_path)
+        except Exception:  # noqa: BLE001
+            self._enable(self.login_btn, False)
+            self._enable(self.logout_btn, False)
+            return
+        self._enable(self.login_btn, not logged)
+        self._enable(self.logout_btn, logged)
+
+    def _set_daemon_buttons(self, running) -> None:
+        """daemon 상태(running True/False, None=미상/설정없음)에 따라 시작/정지 버튼."""
+        if running is None:
+            self._enable(self.daemon_start_btn, False)
+            self._enable(self.daemon_stop_btn, False)
+            return
+        self._enable(self.daemon_start_btn, not running)
+        self._enable(self.daemon_stop_btn, running)
 
     # --- 설정 ---
 
@@ -237,6 +278,7 @@ class StardustApp:
             self._auto_started = False
             self.refresh()
             self._refresh_daemon()
+            self._refresh_login_state()
             messagebox.showinfo(
                 t["new_config"],
                 t["nc_done_new"] if generate_key else t["nc_done_restore"],
@@ -258,6 +300,7 @@ class StardustApp:
             self._auto_started = False
             self.refresh()
             self._refresh_daemon()
+            self._refresh_login_state()
 
     # --- 탐색 ---
 
@@ -508,15 +551,22 @@ class StardustApp:
         cfg = self.config_path
         self._submit(
             lambda: actions.login(cfg, email, password, key_pw),
-            lambda _r: self._set_status(t["login_ok"].format(email=email)),
+            lambda _r: self._after_login(t["login_ok"].format(email=email)),
             t["login_busy"],
         )
 
+    def _after_login(self, msg: str) -> None:
+        self._set_status(msg)
+        self._refresh_login_state()
+
     def _logout(self) -> None:
         cfg = self.config_path
-        self._submit(lambda: actions.logout(cfg),
-                     lambda _r: self._set_status(self.t["logout_ok"]),
-                     self.t["logout_busy"])
+
+        def done(_r):
+            self._set_status(self.t["logout_ok"])
+            self._refresh_login_state()
+
+        self._submit(lambda: actions.logout(cfg), done, self.t["logout_busy"])
 
     # --- daemon ---
 
@@ -529,15 +579,19 @@ class StardustApp:
     def _on_daemon(self, ok, payload) -> None:
         if not ok:
             self.daemon_label.config(text=self.t["daemon_unknown"])
+            self._set_daemon_buttons(None)
             return
         if payload.get("running"):
             self.daemon_label.config(
                 text=self.t["daemon_running"].format(pid=payload.get("pid"))
             )
+            self._set_daemon_buttons(True)
         elif payload.get("stale"):
             self.daemon_label.config(text=self.t["daemon_stale"])
+            self._set_daemon_buttons(False)
         else:
             self.daemon_label.config(text=self.t["daemon_stopped"])
+            self._set_daemon_buttons(False)
             if self.config_path and not self._auto_started:
                 self._auto_started = True
                 self._set_status(self.t["daemon_starting"])

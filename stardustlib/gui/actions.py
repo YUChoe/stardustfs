@@ -320,6 +320,12 @@ def daemon_stop(config_path: str) -> dict:
     return daemon.request_stop(config["metadata_db"])
 
 
+def daemon_signal_stop(config_path: str) -> dict:
+    """정지 신호만 보내고 대기하지 않는다(GUI 종료 시 UI 멈춤 방지)."""
+    config = ConfigLoader(config_path).load()
+    return daemon.signal_stop(config["metadata_db"])
+
+
 def daemon_start(config_path: str) -> int:
     """daemon을 백그라운드 프로세스로 시작하고 pid를 반환한다."""
     proc = subprocess.Popen(

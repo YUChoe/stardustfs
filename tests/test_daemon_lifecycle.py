@@ -47,6 +47,20 @@ def test_request_stop_when_not_running(tmp_path):
     assert result["reason"] == "not_running"
 
 
+def test_signal_stop_not_running(tmp_path):
+    db = str(tmp_path / "meta.db")
+    assert daemon.signal_stop(db) == {"signalled": False, "reason": "not_running"}
+
+
+def test_signal_stop_creates_sentinel(tmp_path):
+    db = str(tmp_path / "meta.db")
+    now = time.time()
+    daemon._write_control(daemon._control_path(db), now, now)
+    res = daemon.signal_stop(db)
+    assert res["signalled"] is True
+    assert os.path.exists(daemon._stop_path(db))
+
+
 def test_serve_lifecycle_start_status_stop(tmp_path):
     db = str(tmp_path / "meta.db")
     cleaned = {"done": False}
