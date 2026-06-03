@@ -93,17 +93,26 @@ stardust status                     # 동기화 상태, 보류 변경 수
       서버 접속·device 등록 부작용이 있어 prod 자동 실행 보류 — 로컬 서버
       (STARDUST_TEST_SERVER_URL) 또는 의도적 prod 실행으로 검증 필요
 
-### Phase 3 — 전송 계열 명령
-- [ ] `put`: 로컬 파일 읽기 → write_file(암호화·소스 선택·메타데이터 등록) → 동기화 트리거
-- [ ] `get`: get_file_info로 소유 device 확인 → read_file(로컬/원격 fetch) → 복호화본 로컬 저장
-- [ ] 대용량 스트리밍/진행률 표시 검토(부분 전송도 zero-knowledge 유지)
-- [ ] `rm`/`mkdir`/`mv`/`cp`: 해당 코어 메서드 연결
+### Phase 3 — 전송 계열 명령 (진행 중)
+- [x] `put`: 로컬 파일 읽기 → write_file(암호화·소스 선택·메타데이터) → upload_metadata 전파
+- [x] `get`: read_file(로컬/원격 fetch, 자가 브리지) → 복호화본 로컬 저장
+- [x] `rm`(-r)/`mkdir`/`mv`/`cp`: 코어 메서드 연결 + 전파
+- [x] 오프라인 라운드트립 검증: put→ls→get 바이트 일치(IDENTICAL), rm 후 목록 빔.
+      암호화 왕복 정상, 종료 코드 0
+- [ ] 대용량 스트리밍/진행률은 후순위(현재 전체 바이트 메모리 적재). 부분 전송도
+      zero-knowledge 유지 설계 필요
 
-### Phase 4 — 오프라인/에러 규격
-- [ ] 소유 device offline 시 graceful skip 금지 → 규격 에러(DeviceOfflineError 등) +
-      고정 종료 코드, 사용자 메시지(영국 영어)
-- [ ] 용량부족 InsufficientStorageError 등 기존 예외를 CLI 종료 코드로 매핑
-- [ ] 네트워크 실패(P2P/릴레이 모두 불가) 시 명확한 진단 출력
+### Phase 4 — 오프라인/에러 규격 (부분 완료)
+- [x] 규격 종료 코드 매핑: 0 성공 / 2 사용법 / 3 없음·로컬 I/O / 4 원격 오프라인·
+      도달 불가(OSError) / 5 용량 부족(InsufficientStorageError). graceful skip 금지
+- [x] 오프라인 세션(서버/인증 실패)에서 쓰기는 로컬 저장 + 전파 보류 안내(daemon
+      동기화 대기). 콘솔 출력은 UTF-8 직접 기록(format.echo)으로 cp949 인코딩
+      오류(em-dash 등) 회피
+- [ ] 사용자 메시지 영국 영어화는 후속(현재 한국어 안내)
+
+주의(Git Bash): 가상 경로 인자(`/foo`)는 MSYS 경로 변환으로 `C:/Program Files/
+Git/foo`가 되어 실패한다. 검증·사용 시 `MSYS_NO_PATHCONV=1` 필요. 후속 개선
+후보: CLI가 선행 슬래시 없는 상대 가상경로를 허용하고 내부에서 `/`를 보정.
 
 ### Phase 5 — WebDAV 제거
 - [ ] webdav_provider.py 및 wsgidav/cheroot 의존 제거(requirements.txt 정리)

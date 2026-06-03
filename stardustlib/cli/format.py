@@ -15,6 +15,15 @@ def _write(text: str) -> None:
     sys.stdout.buffer.flush()
 
 
+def echo(text: str = "") -> None:
+    """한 줄을 UTF-8로 표준출력에 기록한다 (Windows cp949 콘솔 인코딩 회피).
+
+    print()는 콘솔 코드페이지로 인코딩하므로 em-dash 등 비-cp949 문자에서
+    UnicodeEncodeError가 발생한다. CLI 메시지는 모두 이 함수를 사용한다.
+    """
+    _write(text + "\n")
+
+
 def print_json(obj) -> None:
     """객체를 들여쓰기된 JSON으로 출력한다."""
     _write(_json.dumps(obj, ensure_ascii=False, indent=2) + "\n")

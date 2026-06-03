@@ -7,7 +7,11 @@ df/ls/status는 오프라인(로컬 코어)으로 동작하고, devices는 온�
 
 from __future__ import annotations
 
-from stardustlib.cli.format import print_json, print_table
+import os
+import sys
+
+from stardustlib.cli.format import echo, print_json, print_table
+from stardustlib.exceptions import InsufficientStorageError
 
 
 def _join(base: str, name: str) -> str:
@@ -135,4 +139,137 @@ def cmd_devices(session, args) -> int:
         for d in session.my_devices
     ]
     print_table(rows, ["id", "name", "online", "self"])
+    return 0
+
+
+# --- 전송/쓰기 계열 (온라인 + 동기화) ---
+#
+# 종료 코드: 0 성공 / 3 없음·로컬 I/O 실패 / 4 원격 오프라인·도달 불가 / 5 용량 부족.
+# "실패 시 graceful 건너뛰기" 금지 — 예외를 규격 종료 코드로 매핑한다.
+
+
+def _err(message: str) -> None:
+    """오류 메시지를 표준오류에 UTF-8로 출력한다."""
+    sys.stderr.buffer.write((message + "\n").encode("utf-8"))
+
+
+def _note_propagation(session) -> str:
+    """전파 여부 안내 문구. 오프라인이면 daemon 동기화 대기임을 알린다."""
+    if session.sync_client is None:
+        return " (로컬 저장, 서버 미전파 — daemon 동기화 대기)"
+    return ""
+
+
+async def cmd_put(session, args) -> int:
+    """로컬 파일을 가상 경로로 업로드한다 (암호화·소스 저장·메타데이터·전파)."""
+    local = args.local
+    remote = args.remote or ("/" + os.path.basename(local))
+    try:
+        with open(local, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        _err(f"오류: 로컬 파일을 읽을 수 없습니다: {e}")
+        return 3
+
+    try:
+        session.jbod.write_file(remote, data)
+    except InsufficientStorageError as e:
+        _err(f"오류: 저장 공간 부족: {e}")
+        return 5
+    except OSError as e:
+        _err(f"오류: 업로드 실패: {e}")
+        return 4
+
+    await session.upload_if_online()
+    echo(f"업로드 완료: {local} -> {remote} ({len(data)} bytes)"
+          f"{_note_propagation(session)}")
+    return 0
+
+
+async def cmd_get(session, args) -> int:
+    """가상 경로의 파일을 로컬로 다운로드한다 (소유 device에서 fetch·복호화)."""
+    remote = args.remote
+    local = args.local or os.path.basename(remote.rstrip("/"))
+    try:
+        data = session.jbod.read_file(remote)
+    except FileNotFoundError:
+        _err(f"오류: 파일을 찾을 수 없습니다: {remote}")
+        return 3
+    except OSError as e:
+        _err(f"오류: 다운로드 실패 (원격 오프라인/도달 불가 가능): {e}")
+        return 4
+
+    try:
+        with open(local, "wb") as f:
+            f.write(data)
+    except OSError as e:
+        _err(f"오류: 로컬 저장 실패: {e}")
+        return 3
+
+    echo(f"다운로드 완료: {remote} -> {local} ({len(data)} bytes)")
+    return 0
+
+
+async def cmd_rm(session, args) -> int:
+    """파일 또는 디렉토리(-r)를 삭제한다 (tombstone·전파)."""
+    path = args.path
+    try:
+        if args.recursive:
+            session.jbod.delete_directory(path)
+        else:
+            session.jbod.delete_file(path)
+    except FileNotFoundError:
+        _err(f"오류: 없는 경로: {path}")
+        return 3
+    except OSError as e:
+        _err(f"오류: 삭제 실패: {e}")
+        return 4
+
+    await session.upload_if_online()
+    echo(f"삭제 완료: {path}{_note_propagation(session)}")
+    return 0
+
+
+async def cmd_mkdir(session, args) -> int:
+    """디렉토리를 생성한다 (전파)."""
+    session.jbod.create_directory(args.path)
+    await session.upload_if_online()
+    echo(f"디렉토리 생성: {args.path}{_note_propagation(session)}")
+    return 0
+
+
+async def cmd_mv(session, args) -> int:
+    """파일/디렉토리를 이동(이름변경)한다 (전파)."""
+    src, dst = args.src, args.dst
+    try:
+        if session.jbod.file_exists(src):
+            session.jbod.move_file(src, dst)
+        else:
+            session.jbod.move_directory(src, dst)
+    except FileNotFoundError:
+        _err(f"오류: 없는 경로: {src}")
+        return 3
+    except OSError as e:
+        _err(f"오류: 이동 실패: {e}")
+        return 4
+
+    await session.upload_if_online()
+    echo(f"이동 완료: {src} -> {dst}{_note_propagation(session)}")
+    return 0
+
+
+async def cmd_cp(session, args) -> int:
+    """파일을 복사한다 (전파)."""
+    src, dst = args.src, args.dst
+    try:
+        session.jbod.copy_file(src, dst)
+    except FileNotFoundError:
+        _err(f"오류: 없는 파일: {src}")
+        return 3
+    except OSError as e:
+        _err(f"오류: 복사 실패: {e}")
+        return 4
+
+    await session.upload_if_online()
+    echo(f"복사 완료: {src} -> {dst}{_note_propagation(session)}")
     return 0

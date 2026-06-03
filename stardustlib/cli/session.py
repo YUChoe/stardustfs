@@ -49,6 +49,7 @@ class CLISession:
         self.online: bool = False
         self.auth = None
         self.device_mgr = None
+        self.sync_client = None
         self.my_devices: list[dict] | None = None
         self.self_device_id: str | None = None
 
@@ -134,8 +135,9 @@ class CLISession:
             my_devices=my_devices, self_device_id=self_device_id,
         )
 
+        sync_client = None
         if sync:
-            await cls._sync_once(
+            sync_client = await cls._make_sync_client(
                 auth, server_url, metadata, db_key, jbod, device_name, config
             )
 
@@ -143,35 +145,48 @@ class CLISession:
         session.online = True
         session.auth = auth
         session.device_mgr = device_mgr
+        session.sync_client = sync_client
         session.my_devices = my_devices
         session.self_device_id = self_device_id
         return session
 
     @staticmethod
-    async def _sync_once(
+    async def _make_sync_client(
         auth, server_url, metadata, db_key, jbod, device_name, config
-    ) -> None:
-        """1회 메타데이터 동기화. 실패해도 로컬 DB로 진행한다."""
+    ):
+        """SyncClient를 만들고 1회 초기 동기화한다. 실패해도 클라이언트는 반환한다
+        (이후 upload_metadata로 전파 시도 가능). 동기화 실패 시 로컬 DB로 진행."""
         from stardustlib.conflict_resolver import ConflictResolver
         from stardustlib.sync_client import SyncClient
 
         interval = config.get("sync", {}).get("interval_seconds", 30)
+        resolver = ConflictResolver(metadata, device_name)
+        sync_client = SyncClient(
+            auth, server_url, metadata, resolver, interval,
+            encryption_key=db_key, jbod_manager=jbod,
+        )
         try:
-            resolver = ConflictResolver(metadata, device_name)
-            sync_client = SyncClient(
-                auth, server_url, metadata, resolver, interval,
-                encryption_key=db_key, jbod_manager=jbod,
-            )
             await sync_client.initial_sync()
         except Exception as e:  # noqa: BLE001 — 로컬 DB 폴백
-            logger.warning("메타데이터 동기화 실패, 로컬 DB 사용: %s", e)
+            logger.warning("초기 동기화 실패, 로컬 DB 사용: %s", e)
+        return sync_client
 
     def close(self) -> None:
         """동기 리소스를 정리한다 (오프라인 세션용)."""
         self._close_metadata()
 
+    async def upload_if_online(self) -> None:
+        """온라인 세션이면 pending 변경을 서버로 전파한다 (없으면 no-op)."""
+        if self.sync_client is not None:
+            await self.sync_client.upload_metadata()
+
     async def aclose(self) -> None:
         """비동기 리소스까지 정리한다 (온라인 세션용)."""
+        if self.sync_client is not None:
+            try:
+                await self.sync_client.stop()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("sync_client 종료 중 예외: %s", e)
         if self.device_mgr is not None:
             try:
                 await self.device_mgr.stop()
