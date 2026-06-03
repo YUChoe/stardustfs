@@ -65,9 +65,19 @@ pytest 그린 유지, 전송/복구는 로컬 서버 E2E로 검증.
       랑데부 등록도 전송 전환과 함께 후속.
 
 ## Phase 6: 건강성 / 재복제 / 호혜 집행
-- [ ] 6.1 홀더 heartbeat로 online 복제 수 집계, <3 지속(기본 24h) 시 재복제 큐잉.
-- [ ] 6.2 재복제 동시성 상한 + 백오프.
-- [ ] 6.3 호혜 쿼터 미충족 device의 신규 배치 제한(정책값 설정).
+- [x] 6.1 건강성 기반 재복제: ReplicationManager.ensure_replicas(virtual_path) +
+      _heal_chunk. 청크별 list_replicas로 online 복제 수 집계, <min_replicas면 온라인
+      홀더에서 청크를 받아(불변 청크 → 재암호화 없이 바이트 동일) 새 홀더로 복사 +
+      record. 온라인 소스 없는 청크는 unrecoverable 보고. 모두 충족 시 replicated,
+      아니면 pending. CLI `heal` 명령.
+- [x] 6.2 재복제 동시성 상한: asyncio.Semaphore(max_concurrent_repair=4)로 청크 단위
+      병렬 제한. 홀더 store 실패 시 다음 후보로 진행(백오프 대신 후보 순회).
+- [x] 6.3 호혜 쿼터 집행: placement가 avail=provided*0.5-hosted ≥ size 인 온라인
+      device만 후보로(미제공 device는 avail 0 → 제외). 정책값 RECIPROCITY_FRACTION=0.5.
+      테스트: 미제공 device 미배치 + (Phase 2) 용량·호혜·exclude.
+- [~] (이관) 교차 사용자 릴레이 fallback: 릴레이 허브가 같은 user_id 간만 중개하므로
+      타 사용자 홀더로의 replica 릴레이는 허브 인가 모델 재설계(보안 민감) 필요 →
+      별도 스펙으로 분리. 직접 push/fetch + 스웜(≥3) + 홀펀칭으로 도달성 확보.
 
 ## Phase 7: 검증 / 문서
 - [ ] 7.1 E2E(로컬 서버 + 다중 device): replicate → 소스 중지 → 다른 홀더 recover →

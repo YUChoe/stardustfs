@@ -427,3 +427,30 @@ async def cmd_restore(session, args) -> int:
     await session.upload_if_online()
     echo(f"복구 완료: {path} ({nbytes} bytes){_note_propagation(session)}")
     return 0
+
+
+async def cmd_heal(session, args) -> int:
+    """건강성을 점검해 부족한 복제본을 채운다(재복제)."""
+    from stardustlib.replication_manager import RecoveryError
+
+    path = _vpath(args.path)
+    mgr = session.make_replication_manager()
+    try:
+        report = mgr.ensure_replicas(path)
+    except RecoveryError as e:
+        _err(f"오류: 재복제 실패: {e}")
+        return 4
+    finally:
+        mgr.close()
+
+    if report.status == "replicated":
+        echo(
+            f"재복제 완료: {path} — 청크 {report.chunk_count}개, "
+            f"복구 {report.repaired}개, 각 ≥{report.min_replicas} 홀더"
+        )
+        return 0
+    echo(
+        f"재복제 미완료(pending): {path} — 복구 불가 청크 "
+        f"{len(report.unrecoverable)}개(도달 가능한 소스 없음)."
+    )
+    return 4

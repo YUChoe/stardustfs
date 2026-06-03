@@ -57,11 +57,14 @@ class _Cloud:
     """서버 레지스트리 + 홀더 저장소 인메모리 모형."""
 
     def __init__(self, holders: list[str], offline_addresses: set[str] | None = None,
-                 store_fail_addresses: set[str] | None = None) -> None:
+                 store_fail_addresses: set[str] | None = None,
+                 cap: int | None = None) -> None:
         # device_id == address 로 단순화
         self.holders = holders
         self.offline = offline_addresses or set()
         self.store_fail = store_fail_addresses or set()
+        # placement가 반환할 최대 후보 수(None=무제한, 실서버는 count로 제한).
+        self.cap = cap
         self.chunk_meta: dict[str, list[dict]] = {}
         self.registry: dict[str, list[str]] = {}
         self.holder_store: dict[str, dict[str, bytes]] = {}
@@ -75,10 +78,11 @@ class _Cloud:
             )
 
         async def placement(token, size, exclude):
-            return [
+            avail = [
                 {"device_id": h, "connection_address": h}
                 for h in cloud.holders if h not in exclude
             ]
+            return avail if cloud.cap is None else avail[: cloud.cap]
 
         async def holder_store(address, chunk_id, data, token):
             if address in cloud.store_fail:
@@ -207,6 +211,51 @@ def test_recover_succeeds_with_one_reachable_holder(key):
     n = mgr.recover("/f")
     assert n == len(content)
     assert jbod.read_file("/f") == content
+
+
+def test_ensure_replicas_tops_up_degraded_chunk(key):
+    """홀더 1곳 오프라인 → 새 홀더로 복제본을 채워 healthy 회복."""
+    content = ("z" * 400).encode("utf-8")
+    jbod = _FakeJbod(key)
+    jbod.put("/f", content)
+    meta = _FakeMeta({"/f"})
+    # cap=3: replicate는 h1~h3에 배치, h4는 재복제 예비.
+    mgr, cloud = _manager(jbod, meta, ["h1", "h2", "h3", "h4"], cap=3)
+    assert mgr.replicate("/f").status == "replicated"
+
+    cloud.offline = {"h1"}  # 1곳 오프라인 → 청크별 online 2 < 3
+    report = mgr.ensure_replicas("/f")
+    assert report.status == "replicated"
+    assert report.repaired == report.chunk_count  # 모든 청크가 1개씩 보충
+    assert report.unrecoverable == []
+    # h4가 각 청크의 새 홀더로 추가됨
+    for holders in cloud.registry.values():
+        assert "h4" in holders
+
+
+def test_ensure_replicas_noop_when_healthy(key):
+    jbod = _FakeJbod(key)
+    jbod.put("/f", b"data")
+    meta = _FakeMeta({"/f"})
+    mgr, _cloud = _manager(jbod, meta, ["h1", "h2", "h3"], cap=3)
+    mgr.replicate("/f")
+    report = mgr.ensure_replicas("/f")
+    assert report.status == "replicated"
+    assert report.repaired == 0
+
+
+def test_ensure_replicas_unrecoverable_when_no_online_source(key):
+    content = ("q" * 200).encode("utf-8")
+    jbod = _FakeJbod(key)
+    jbod.put("/f", content)
+    meta = _FakeMeta({"/f"})
+    mgr, cloud = _manager(jbod, meta, ["h1", "h2", "h3"], cap=3)
+    mgr.replicate("/f")
+    cloud.offline = {"h1", "h2", "h3"}  # 소스 없음 → 복구 불가
+    report = mgr.ensure_replicas("/f")
+    assert report.status == "pending"
+    assert len(report.unrecoverable) == report.chunk_count
+    assert meta.status["/f"] == "pending"
 
 
 def test_file_ref_does_not_leak_path(key):

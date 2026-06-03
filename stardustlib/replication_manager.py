@@ -16,6 +16,7 @@ chunk_id 명시).
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import logging
@@ -56,6 +57,17 @@ class ReplicationResult:
     replicas_per_chunk: list[int] = field(default_factory=list)
 
 
+@dataclass
+class HealReport:
+    """ensure_replicas(재복제) 결과."""
+
+    status: str  # replicated|pending
+    chunk_count: int
+    min_replicas: int
+    repaired: int = 0  # 복제본을 추가한 청크 수
+    unrecoverable: list[str] = field(default_factory=list)  # 도달 소스 없는 청크
+
+
 class ReplicationManager:
     """암호화 청크 복제/복구 오케스트레이터."""
 
@@ -69,6 +81,7 @@ class ReplicationManager:
         chunk_size: int = chunker.DEFAULT_CHUNK_SIZE,
         min_replicas: int = DEFAULT_MIN_REPLICAS,
         timeout: float = 10.0,
+        max_concurrent_repair: int = 4,
         io: _EventLoopThread | None = None,
     ) -> None:
         self._auth = auth_client
@@ -79,6 +92,7 @@ class ReplicationManager:
         self._chunk_size = chunk_size
         self._min_replicas = min_replicas
         self._timeout = timeout
+        self._max_concurrent_repair = max_concurrent_repair
         self._io = io or _EventLoopThread.get_instance()
         self._client = httpx.AsyncClient(timeout=timeout)
 
@@ -141,6 +155,26 @@ class ReplicationManager:
         plaintext = self._engine.decrypt(blob)
         self._jbod.write_file(virtual_path, plaintext)
         return len(plaintext)
+
+    def ensure_replicas(self, virtual_path: str) -> HealReport:
+        """건강성을 점검해 부족한 청크의 복제본을 채운다(재복제).
+
+        청크는 불변이므로 온라인 홀더에서 받아(재암호화 없이) 새 홀더로 복사한다.
+        온라인 홀더가 없는 청크는 unrecoverable로 보고한다. 모든 청크가
+        min_replicas를 충족하면 replicated, 아니면 pending으로 표시한다.
+        """
+        report = self._io.run_coroutine(
+            self._ensure_chunks(self._file_ref(virtual_path))
+        )
+        # 메타데이터가 있는 파일이면 상태를 갱신한다(복구 전용 호출은 없을 수 있음).
+        if self._meta.lookup(virtual_path) is not None:
+            self._meta.set_replication_status(virtual_path, report.status)
+        if report.status != "replicated":
+            logger.warning(
+                "재복제 후에도 미충족(pending): %s — 복구 불가 청크 %d개",
+                virtual_path, len(report.unrecoverable),
+            )
+        return report
 
     def close(self) -> None:
         """내부 httpx 클라이언트를 닫는다."""
@@ -207,6 +241,76 @@ class ReplicationManager:
                 f"도달 가능한 홀더가 없는 청크 {len(missing)}개", missing
             )
         return chunker.join(parts)
+
+    async def _ensure_chunks(self, file_ref: str) -> HealReport:
+        token = await self._token()
+        chunk_infos = await self._list_chunks(token, file_ref)
+        if not chunk_infos:
+            raise RecoveryError(
+                f"재복제할 청크가 없습니다: file_ref={file_ref}", []
+            )
+
+        sem = asyncio.Semaphore(self._max_concurrent_repair)
+
+        async def heal(info: dict) -> dict:
+            async with sem:  # 동시 재복제 상한
+                return await self._heal_chunk(token, info)
+
+        outcomes = await asyncio.gather(*[heal(i) for i in chunk_infos])
+        repaired = sum(1 for o in outcomes if o["added"] > 0)
+        unrecoverable = [o["chunk_id"] for o in outcomes if not o["healthy"]]
+        return HealReport(
+            status="replicated" if not unrecoverable else "pending",
+            chunk_count=len(chunk_infos),
+            min_replicas=self._min_replicas,
+            repaired=repaired,
+            unrecoverable=unrecoverable,
+        )
+
+    async def _heal_chunk(self, token: str, info: dict) -> dict:
+        """한 청크의 복제본을 min_replicas까지 채운다(불변 청크 복사)."""
+        chunk_id = info["chunk_id"]
+        holders = await self._list_replicas(token, chunk_id)
+        online = [
+            h for h in holders
+            if h.get("is_online") is not False and h.get("connection_address")
+        ]
+        current_devices = [h["device_id"] for h in holders if h.get("device_id")]
+        need = self._min_replicas - len(online)
+        if need <= 0:
+            return {"chunk_id": chunk_id, "added": 0, "healthy": True}
+
+        # 온라인 홀더에서 청크를 받아온다(재암호화 없이 그대로 복사).
+        data = None
+        for h in online:
+            data = await self._holder_fetch(
+                h["connection_address"], chunk_id, token
+            )
+            if data is not None:
+                break
+        if data is None:
+            # 도달 가능한 소스가 없어 복제 불가 — 데이터 자체는 다른 곳에 있을 수 있음.
+            return {"chunk_id": chunk_id, "added": 0, "healthy": False}
+
+        candidates = await self._placement(
+            token, len(data), exclude=current_devices
+        )
+        added = 0
+        for cand in candidates:
+            if added >= need:
+                break
+            address = cand.get("connection_address")
+            device_id = cand.get("device_id")
+            if not address or not device_id:
+                continue
+            if await self._holder_store(address, chunk_id, data, token):
+                if await self._record_replica(token, chunk_id, device_id):
+                    added += 1
+        return {
+            "chunk_id": chunk_id,
+            "added": added,
+            "healthy": (len(online) + added) >= self._min_replicas,
+        }
 
     async def _fetch_from_any_holder(
         self, token: str, chunk_id: str

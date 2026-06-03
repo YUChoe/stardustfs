@@ -33,6 +33,7 @@ _HANDLERS = {
     "cp": (commands.cmd_cp, True, True),
     "backup": (commands.cmd_backup, True, True),
     "restore": (commands.cmd_restore, True, True),
+    "heal": (commands.cmd_heal, True, True),
 }
 
 # 인증 계열: 세션 없이 config + 자격증명 저장소로 동작. (args) -> int 코루틴.
@@ -98,6 +99,10 @@ def add_subcommands(subparsers, parent=None) -> None:
         "restore", help="복제본에서 파일 복구", **kw
     )
     p_restore.add_argument("path", help="가상 경로")
+    p_heal = subparsers.add_parser(
+        "heal", help="부족한 복제본 재복제(건강성 회복)", **kw
+    )
+    p_heal.add_argument("path", help="가상 경로")
 
     # 인증 계열
     p_login = subparsers.add_parser("login", help="이메일/비밀번호 로그인(토큰 저장)", **kw)
