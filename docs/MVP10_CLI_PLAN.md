@@ -80,11 +80,18 @@ stardust status                     # 동기화 상태, 보류 변경 수
 (`ls /` ≠ 가상 루트). 가상 루트는 인자 생략(기본값 `/`) 또는 `MSYS_NO_PATHCONV=1`
 사용. CLI 코드 자체는 정상이며 이는 셸 동작이다.
 
-### Phase 2 — 조회 계열 명령
-- [ ] `ls`: list_directory 결과를 크기·소유 device·online 여부와 함께 출력
-- [ ] `devices`: device_manager 조회 + online/offline 표시
-- [ ] `df`: get_total_space/get_available_space
-- [ ] `status`: sync_client의 보류 변경/마지막 동기화 시각
+### Phase 2 — 조회 계열 명령 (진행 중)
+- [x] 온라인 setup: `CLISession.open_online()` — 로그인 → device 등록/조회 →
+      remote 마운트 → (선택) 1회 동기화. 단일 asyncio.run setup→op→teardown.
+      서버 미설정/인증 실패 시 오프라인 강등.
+- [x] `ls`: 크기 + 소유 device_id 컬럼(로컬 메타데이터 기준, self는 'this').
+      online 여부 매핑(device 이름)은 devices에서 제공
+- [x] `devices`: device_manager.list_devices() + online/offline + self 표시(온라인)
+- [x] `df`: get_total_space/get_available_space (Phase 1 완료)
+- [x] `status`: 보류 변경 수(get_pending_files) + 루트 엔트리 수 + online
+- [ ] 검증 메모: df/ls/status는 오프라인 스모크 통과(429 passed 유지). `devices`는
+      서버 접속·device 등록 부작용이 있어 prod 자동 실행 보류 — 로컬 서버
+      (STARDUST_TEST_SERVER_URL) 또는 의도적 prod 실행으로 검증 필요
 
 ### Phase 3 — 전송 계열 명령
 - [ ] `put`: 로컬 파일 읽기 → write_file(암호화·소스 선택·메타데이터 등록) → 동기화 트리거
