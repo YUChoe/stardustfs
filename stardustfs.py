@@ -17,35 +17,61 @@ except ImportError:
 from stardustlib.initializer import initialize_system
 
 
-def main() -> None:
-    """메인 엔트리포인트. --config 인자를 처리하고 서버를 시작한다."""
-    parser = argparse.ArgumentParser(description="StardustFS WebDAV Server")
-    parser.add_argument(
-        "--config",
-        "-c",
-        required=True,
-        help="JSON 설정 파일 경로",
-    )
-    args = parser.parse_args()
-
-    # 로깅 설정
+def _setup_logging() -> None:
+    """표준 로깅 포맷을 설정하고 외부 라이브러리 로그를 억제한다."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s.%(msecs)03d %(levelname)s [%(filename)s:%(lineno)d] %(message)s",
         datefmt="%H:%M:%S",
     )
-
-    # 불필요한 로그 억제
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("wsgidav").setLevel(logging.WARNING)
 
-    # 설정 로드 (Phase 1)
+
+def main() -> None:
+    """메인 엔트리포인트.
+
+    서브커맨드 없음 또는 `daemon`이면 상주 데몬을 시작한다(기존 동작 호환).
+    단발 CLI 명령(ls/df/...)이면 해당 명령을 실행한다. `--config`는 서브커맨드
+    앞에 둔다 (예: `stardustfs.py --config dev-config.json ls /`).
+    """
+    from stardustlib.cli.dispatcher import (
+        add_subcommands,
+        is_cli_command,
+        run_cli,
+    )
+
+    parser = argparse.ArgumentParser(
+        description="StardustFS — 암호화 분산 파일시스템"
+    )
+    parser.add_argument("--config", "-c", help="JSON 설정 파일 경로")
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.add_parser(
+        "daemon", help="상주 데몬 (device를 온라인 피어로 유지)"
+    )
+    add_subcommands(subparsers)
+
+    args = parser.parse_args()
+
+    _setup_logging()
+
+    # 단발 CLI 명령
+    if is_cli_command(args.command):
+        sys.exit(run_cli(args))
+
+    # daemon (서브커맨드 없음 또는 'daemon')
+    if not args.config:
+        parser.error("--config 가 필요합니다 (daemon 모드)")
+    _run_daemon(args.config)
+
+
+def _run_daemon(config_path: str) -> None:
+    """설정을 로드하고 버전에 따라 상주 데몬을 시작한다."""
     from stardustlib.config_loader import ConfigLoader
 
     try:
-        loader = ConfigLoader(args.config)
-        config = loader.load()
+        config = ConfigLoader(config_path).load()
     except (FileNotFoundError, Exception) as e:
         logging.error("설정 로드 실패: %s", e)
         sys.exit(1)
@@ -53,10 +79,10 @@ def main() -> None:
     version = config.get("version")  # type: ignore[attr-defined]
 
     if version == 2:
-        asyncio.run(startup_v2(config, args.config))
+        asyncio.run(startup_v2(config, config_path))
     else:
         # v1: 기존 초기화 흐름
-        _startup_v1(args.config, config)
+        _startup_v1(config_path, config)
 
 
 def _startup_v1(config_path: str, config: dict) -> None:
@@ -424,13 +450,14 @@ def _mount_remote_sources(
             _mount(f"remote-{dev_id}", dev_id)
 
 
-def _initialize_local_storage(config: dict) -> tuple:
-    """로컬 스토리지를 초기화하고 WebDAV 앱과 핵심 컴포넌트를 반환한다.
+def _build_core(config: dict) -> tuple:
+    """로컬 스토리지 핵심 컴포넌트를 조립해 반환한다 (WebDAV 비의존).
 
-    기존 initializer.py의 Phase 3-6 로직을 재사용한다.
+    기존 initializer.py의 Phase 3-6 로직을 재사용한다. WebDAV 앱 생성은 포함하지
+    않으므로 daemon(WebDAV)과 CLI가 공통으로 호출할 수 있다.
 
     Returns:
-        (app, jbod_manager, metadata_store, encryption_engine) 튜플.
+        (jbod_manager, metadata_store, encryption_engine, db_key) 튜플.
         실패 시 sys.exit(1) 호출.
     """
     from cryptography.hazmat.primitives import hashes
@@ -446,7 +473,6 @@ def _initialize_local_storage(config: dict) -> tuple:
         LoopbackSource,
         StorageSource,
     )
-    from stardustlib.webdav_provider import create_webdav_app
 
     logger = logging.getLogger(__name__)
     errors: list[str] = []
@@ -527,9 +553,21 @@ def _initialize_local_storage(config: dict) -> tuple:
 
     assert metadata_store is not None
     jbod_manager = JBODManager(sources, metadata_store, encryption_engine)
-    app = create_webdav_app(config, jbod_manager, encryption_engine)
 
     logger.info("로컬 스토리지 초기화 완료")
+    return jbod_manager, metadata_store, encryption_engine, db_key
+
+
+def _initialize_local_storage(config: dict) -> tuple:
+    """코어 컴포넌트를 조립하고 WebDAV 앱까지 생성해 반환한다 (daemon 경로).
+
+    Returns:
+        (app, jbod_manager, metadata_store, encryption_engine, db_key) 튜플.
+    """
+    from stardustlib.webdav_provider import create_webdav_app
+
+    jbod_manager, metadata_store, encryption_engine, db_key = _build_core(config)
+    app = create_webdav_app(config, jbod_manager, encryption_engine)
     return app, jbod_manager, metadata_store, encryption_engine, db_key
 
 
