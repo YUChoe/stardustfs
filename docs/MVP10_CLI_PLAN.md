@@ -205,6 +205,21 @@ CLI 모델에서 분리/제거 대상이다. `_initialize_local_storage`는 현�
   --config ...`는 상주 데몬(현 startup_v2에서 WebDAV 제거), `stardustfs.py
   get/put/ls/...`는 단발 명령. 두 진입 파일로 나누지 않는다.
 
+### 8.8 CLI 비등록 모델 (2026-06-03 확정)
+CLI 온라인 명령은 `device_mgr.register()`(POST /devices)를 호출하지 않는다.
+
+배경: 서버 `register_device`는 (user_id, name, os)로 중복을 제거하므로 device가
+누적되진 않으나, 재등록 시 connection_address를 요청자 주소로 갱신한다. CLI는
+UPnP/reflexive 보정을 하지 않아 LAN 주소(`_get_local_ip():p2p_port`)를 보낸다.
+daemon이 이중 NAT 환경에서 공인 IP로 보정해 둔 주소를 CLI 실행이 LAN 주소로
+덮어쓰면, 그 사이 다른 device의 인바운드 P2P가 도달 실패한다(heartbeat ≤60초 후
+재보정되나 공백 발생).
+
+해결: `CLISession.open_online()`은 `list_devices()` 결과에서 (name, os)로 자기
+device를 식별해(`_identify_self`) device_id만 얻고 등록은 생략한다. 등록·주소
+보정은 daemon이 소유한다. 자기 device가 목록에 없으면(daemon 미실행) 경고 후
+원격 라우팅 없이 진행한다. connection_address는 CLI에서 전송하지 않는다.
+
 ### 8.7 Phase 1 착수 구조 (확정 반영)
 1. `_initialize_local_storage`를 분리: 코어 빌드(jbod/metadata/encryption/db_key)와
    `create_webdav_app` 호출을 떼어내, CLI가 WebDAV 없이 코어만 조립하도록 한다.

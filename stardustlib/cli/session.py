@@ -21,6 +21,21 @@ from stardustlib.config_loader import ConfigLoader
 logger = logging.getLogger(__name__)
 
 
+def _identify_self(my_devices: list[dict], device_name: str) -> str | None:
+    """device 목록에서 (name, os)로 자기 device의 id를 찾는다.
+
+    서버는 (user_id, name, os)로 device를 식별하므로 같은 기준으로 매칭한다.
+    찾지 못하면 None (이 device가 아직 등록되지 않음 — daemon 미실행).
+    """
+    from stardustlib.device_manager import _get_os_info
+
+    os_info = _get_os_info()
+    for device in my_devices:
+        if device.get("name") == device_name and device.get("os") == os_info:
+            return device.get("id")
+    return None
+
+
 class CLISession:
     """단발 CLI 명령이 사용하는 코어 컴포넌트 묶음.
 
@@ -99,13 +114,24 @@ class CLISession:
         p2p_port = p2p.get("port", 9090)
         device_mgr = DeviceManager(auth, server_url, device_name, p2p_port)
 
-        my_devices: list[dict] = []
-        await device_mgr.register()
-        jbod.device_id = device_mgr.device_id
+        # CLI는 register()하지 않는다 — daemon이 보정해 둔 connection_address(공인
+        # IP)를 CLI의 LAN 주소로 덮어쓰지 않기 위함. 대신 device 목록에서 (name,
+        # os)로 자기 device를 식별해 device_id만 얻는다. 등록·주소 보정은 daemon이
+        # 소유한다.
         my_devices = await device_mgr.list_devices()
+        self_device_id = _identify_self(my_devices, device_name)
+        if self_device_id is not None:
+            jbod.device_id = self_device_id
+            device_mgr._device_id = self_device_id
+        else:
+            logger.warning(
+                "이 device가 서버에 등록돼 있지 않습니다 (name=%s). daemon을 먼저 "
+                "실행해 등록하세요. 원격 라우팅 없이 진행합니다.",
+                device_name,
+            )
         _mount_remote_sources(
             config, jbod, auth, server_url,
-            my_devices=my_devices, self_device_id=device_mgr.device_id,
+            my_devices=my_devices, self_device_id=self_device_id,
         )
 
         if sync:
@@ -118,7 +144,7 @@ class CLISession:
         session.auth = auth
         session.device_mgr = device_mgr
         session.my_devices = my_devices
-        session.self_device_id = device_mgr.device_id
+        session.self_device_id = self_device_id
         return session
 
     @staticmethod
