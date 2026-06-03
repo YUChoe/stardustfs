@@ -71,50 +71,91 @@ def create_config(
 
 # --- 오프라인 조회 ---
 
-def list_dir(config_path: str, vpath: str) -> list[dict]:
-    """가상 경로 목록(로컬 메타데이터). 각 항목: type/name/size/owner."""
+def _rows_for(session, base: str) -> list[dict]:
+    """세션으로 디렉토리 항목 행을 만든다. 각 항목: type/name/size/owner."""
+    rows: list[dict] = []
+    for e in session.jbod.list_directory(base):
+        owner = ""
+        if not e.is_directory:
+            meta = session.metadata.lookup(base.rstrip("/") + "/" + e.name)
+            owner = meta.device_id[:8] if meta and meta.device_id else ""
+        rows.append({
+            "type": "dir" if e.is_directory else "file",
+            "name": e.name,
+            "size": e.file_size,
+            "owner": owner,
+        })
+    rows.sort(key=lambda r: (r["type"] != "dir", r["name"].lower()))
+    return rows
+
+
+def browse(config_path: str, vpath: str) -> dict:
+    """목록 + 용량 + 보류 수를 한 세션에서 함께 조회한다.
+
+    refresh를 단일 세션으로 처리해 _build_core(스토리지 초기화)가 한 번만 실행되게
+    한다(이전에는 목록/용량을 각각 열어 초기화 로그가 2번 출력됐다).
+    """
     base = _vpath(vpath)
     session = CLISession.open(config_path)
     try:
-        rows: list[dict] = []
-        for e in session.jbod.list_directory(base):
-            owner = ""
-            if not e.is_directory:
-                meta = session.metadata.lookup(base.rstrip("/") + "/" + e.name)
-                owner = meta.device_id[:8] if meta and meta.device_id else ""
-            rows.append({
-                "type": "dir" if e.is_directory else "file",
-                "name": e.name,
-                "size": e.file_size,
-                "owner": owner,
-            })
-        rows.sort(key=lambda r: (r["type"] != "dir", r["name"].lower()))
-        return rows
-    finally:
-        session.close()
-
-
-def df_info(config_path: str) -> dict:
-    """총/사용/가용 용량."""
-    session = CLISession.open(config_path)
-    try:
+        rows = _rows_for(session, base)
         total = session.jbod.get_total_space()
         available = session.jbod.get_available_space()
-        return {"total": total, "used": total - available, "available": available}
-    finally:
-        session.close()
-
-
-def status_info(config_path: str) -> dict:
-    """보류 변경 수 + 루트 엔트리 수."""
-    session = CLISession.open(config_path)
-    try:
         return {
+            "rows": rows,
+            "total": total,
+            "used": total - available,
+            "available": available,
             "pending": len(session.metadata.get_pending_files()),
-            "root_entries": len(session.jbod.list_directory("/")),
         }
     finally:
         session.close()
+
+
+# --- 스토리지 소스 관리 (config 편집) ---
+
+def list_sources(config_path: str) -> list[dict]:
+    """설정의 스토리지 소스 목록을 반환한다."""
+    config = ConfigLoader(config_path).load()
+    return list(config.get("sources", []))
+
+
+def _save_sources(config_path: str, sources: list[dict]) -> None:
+    """config.json의 sources만 교체해 저장한다(다른 필드 보존)."""
+    with open(config_path, encoding="utf-8") as f:
+        data = json.load(f)
+    data["sources"] = sources
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def add_source(
+    config_path: str, stype: str, path: str, size: int | None = None
+) -> str:
+    """directory/loopback 소스를 추가한다. 생성된 source_id를 반환한다."""
+    import uuid
+
+    if stype not in ("directory", "loopback"):
+        raise ValueError(f"지원하지 않는 소스 유형: {stype}")
+    sources = list_sources(config_path)
+    entry: dict = {
+        "type": stype,
+        "id": f"{stype}-{uuid.uuid4().hex[:6]}",
+        "path": os.path.abspath(path),
+    }
+    if stype == "loopback":
+        if not size:
+            raise ValueError("loopback 소스는 size(바이트)가 필요합니다.")
+        entry["size"] = int(size)
+    sources.append(entry)
+    _save_sources(config_path, sources)
+    return entry["id"]
+
+
+def remove_source(config_path: str, source_id: str) -> None:
+    """source_id 소스를 설정에서 제거한다(물리 데이터는 삭제하지 않음)."""
+    sources = [s for s in list_sources(config_path) if s.get("id") != source_id]
+    _save_sources(config_path, sources)
 
 
 # --- 온라인(서버/원격) ---

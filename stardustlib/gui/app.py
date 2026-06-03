@@ -33,6 +33,7 @@ class StardustApp:
         self.vpath = "/"
         self.worker = Worker()
         self._rows: dict[str, dict] = {}
+        self._auto_started = False  # 구동 시 daemon 1회 자동 시작용
 
         root.title("StardustFS")
         root.geometry("780x520")
@@ -63,6 +64,7 @@ class StardustApp:
         ttk.Button(dframe, text="daemon 시작", command=self._daemon_start).pack(side="left", padx=4)
         ttk.Button(dframe, text="daemon 정지", command=self._daemon_stop).pack(side="left")
         ttk.Button(dframe, text="디바이스", command=self._devices).pack(side="right")
+        ttk.Button(dframe, text="스토리지", command=self._sources).pack(side="right", padx=4)
 
         pframe = ttk.Frame(self.root, padding=6)
         pframe.pack(fill="x")
@@ -162,6 +164,7 @@ class StardustApp:
             self.cfg_label.config(text=payload)
             self.vpath = "/"
             self.path_var.set("/")
+            self._auto_started = False  # 새 설정에 대해 자동 시작 재허용
             self.refresh()
             self._refresh_daemon()
             if generate_key:
@@ -187,6 +190,7 @@ class StardustApp:
             self.cfg_label.config(text=path)
             self.vpath = "/"
             self.path_var.set("/")
+            self._auto_started = False
             self.refresh()
             self._refresh_daemon()
 
@@ -194,8 +198,8 @@ class StardustApp:
         self.vpath = self.path_var.get() or "/"
         cfg = self.config_path
         vp = self.vpath
-        self._submit(lambda: actions.list_dir(cfg, vp), self._populate, "목록 조회 중...")
-        self._submit(lambda: actions.df_info(cfg), self._show_df, "용량 조회 중...")
+        # 목록 + 용량을 한 세션에서 조회(스토리지 초기화 1회).
+        self._submit(lambda: actions.browse(cfg, vp), self._show_browse, "조회 중...")
 
     def _populate(self, rows: list[dict]) -> None:
         self.tree.delete(*self.tree.get_children())
@@ -207,10 +211,11 @@ class StardustApp:
             )
             self._rows[iid] = r
 
-    def _show_df(self, d: dict) -> None:
+    def _show_browse(self, d: dict) -> None:
+        self._populate(d["rows"])
         self._set_status(
             f"용량: 사용 {_human(d['used'])} / 총 {_human(d['total'])} "
-            f"(가용 {_human(d['available'])})"
+            f"(가용 {_human(d['available'])}) · 보류 {d['pending']}"
         )
 
     def _selected(self) -> dict | None:
@@ -311,6 +316,82 @@ class StardustApp:
         self._submit(lambda: actions.copy(cfg, src, dst), lambda _r: self.refresh(),
                      "복사 중...")
 
+    def _sources(self) -> None:
+        if not self.config_path:
+            messagebox.showwarning("StardustFS", "먼저 설정 파일을 선택하세요.")
+            return
+        cfg = self.config_path
+        win = tk.Toplevel(self.root)
+        win.title("스토리지 소스")
+        win.geometry("580x300")
+        tree = ttk.Treeview(win, columns=("id", "type", "path", "size"),
+                            show="headings")
+        for c, w in (("id", 120), ("type", 80), ("path", 290), ("size", 80)):
+            tree.heading(c, text=c)
+            tree.column(c, width=w)
+        tree.pack(fill="both", expand=True)
+
+        def reload():
+            tree.delete(*tree.get_children())
+            for s in actions.list_sources(cfg):
+                size = (_human(s["size"]) if s.get("type") == "loopback"
+                        and s.get("size") else "")
+                tree.insert("", "end", values=(
+                    s.get("id"), s.get("type"), s.get("path"), size))
+
+        def add_dir():
+            d = filedialog.askdirectory(title="디렉토리 소스로 추가할 폴더")
+            if not d:
+                return
+            try:
+                actions.add_source(cfg, "directory", d)
+            except Exception as e:  # noqa: BLE001
+                messagebox.showerror("오류", str(e))
+                return
+            reload()
+            self.refresh()
+
+        def add_loop():
+            path = filedialog.asksaveasfilename(
+                title="루프백 이미지 경로", defaultextension=".img")
+            if not path:
+                return
+            mb = simpledialog.askinteger("루프백", "크기(MB):",
+                                         initialvalue=100, minvalue=10)
+            if not mb:
+                return
+            try:
+                actions.add_source(cfg, "loopback", path, size=mb * 1024 * 1024)
+            except Exception as e:  # noqa: BLE001
+                messagebox.showerror("오류", str(e))
+                return
+            reload()
+            self.refresh()
+
+        def remove():
+            sel = tree.selection()
+            if not sel:
+                return
+            sid = tree.item(sel[0], "values")[0]
+            if not messagebox.askyesno(
+                "제거",
+                f"소스 '{sid}'를 설정에서 제거할까요?\n물리 데이터는 삭제되지 "
+                "않으나 해당 소스의 파일은 접근 불가가 되며, 실행 중인 daemon은 "
+                "재시작해야 반영됩니다.",
+            ):
+                return
+            actions.remove_source(cfg, sid)
+            reload()
+            self.refresh()
+
+        bar = ttk.Frame(win, padding=6)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="디렉토리 추가", command=add_dir).pack(side="left")
+        ttk.Button(bar, text="루프백 추가", command=add_loop).pack(side="left", padx=4)
+        ttk.Button(bar, text="제거", command=remove).pack(side="left")
+        ttk.Button(bar, text="닫기", command=win.destroy).pack(side="right")
+        reload()
+
     def _devices(self) -> None:
         cfg = self.config_path
         self._submit(lambda: actions.devices_list(cfg), self._show_devices,
@@ -376,6 +457,11 @@ class StardustApp:
             self.daemon_label.config(text="daemon: stale(비정상 종료?)")
         else:
             self.daemon_label.config(text="daemon: 미실행")
+            # 구동 시 미실행이면 1회 자동 시작 (이후/수동 정지 시 재시작 안 함)
+            if self.config_path and not self._auto_started:
+                self._auto_started = True
+                self._set_status("daemon 자동 시작 중...")
+                self._daemon_start()
 
     def _daemon_start(self) -> None:
         cfg = self.config_path

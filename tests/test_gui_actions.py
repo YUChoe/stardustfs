@@ -58,6 +58,25 @@ def test_created_config_validates(tmp_path):
     assert loader.validate(config) == []         # 생성된 설정은 검증 통과
 
 
+def test_source_add_remove(tmp_path):
+    import os as _os
+
+    base = tmp_path / "s"
+    cfg_path = actions.create_config(
+        str(base), "https://s.example", "dev", generate_key=True
+    )
+    extra = tmp_path / "extra"
+    extra.mkdir()
+    before = len(actions.list_sources(cfg_path))
+    sid = actions.add_source(cfg_path, "directory", str(extra))
+    srcs = actions.list_sources(cfg_path)
+    assert len(srcs) == before + 1
+    assert any(s["id"] == sid and s["path"] == _os.path.abspath(str(extra))
+               for s in srcs)
+    actions.remove_source(cfg_path, sid)
+    assert all(s["id"] != sid for s in actions.list_sources(cfg_path))
+
+
 def test_daemon_status_not_running(tmp_path):
     cfg = tmp_path / "config.json"
     cfg.write_text(
