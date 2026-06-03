@@ -46,11 +46,23 @@ def main() -> None:
         description="StardustFS — 암호화 분산 파일시스템"
     )
     parser.add_argument("--config", "-c", help="JSON 설정 파일 경로")
-    subparsers = parser.add_subparsers(dest="command")
-    subparsers.add_parser(
-        "daemon", help="상주 데몬 (device를 온라인 피어로 유지)"
+
+    # 공통 옵션: 서브커맨드 뒤에서도 --config 를 받도록 한다.
+    # default=SUPPRESS로 전역 --config 값을 덮어쓰지 않는다.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--config", "-c", default=argparse.SUPPRESS, help="JSON 설정 파일 경로"
     )
-    add_subcommands(subparsers)
+
+    subparsers = parser.add_subparsers(dest="command")
+    p_daemon = subparsers.add_parser(
+        "daemon", parents=[common], help="상주 데몬 (start/status/stop)"
+    )
+    p_daemon.add_argument(
+        "action", nargs="?", choices=["start", "status", "stop"],
+        default="start", help="동작 (기본 start)",
+    )
+    add_subcommands(subparsers, common)
 
     args = parser.parse_args()
 
@@ -60,14 +72,20 @@ def main() -> None:
     if is_cli_command(args.command):
         sys.exit(run_cli(args))
 
-    # daemon (서브커맨드 없음 또는 'daemon')
+    # daemon (서브커맨드 없음 또는 'daemon [action]')
     if not args.config:
         parser.error("--config 가 필요합니다 (daemon 모드)")
+    action = getattr(args, "action", "start")
+    if action == "status":
+        sys.exit(_daemon_status(args.config))
+    if action == "stop":
+        sys.exit(_daemon_stop(args.config))
     _run_daemon(args.config)
 
 
 def _run_daemon(config_path: str) -> None:
     """설정을 로드하고 버전에 따라 상주 데몬을 시작한다."""
+    from stardustlib import daemon
     from stardustlib.config_loader import ConfigLoader
 
     try:
@@ -76,13 +94,60 @@ def _run_daemon(config_path: str) -> None:
         logging.error("설정 로드 실패: %s", e)
         sys.exit(1)
 
+    # 중복 실행 방지 (제어 파일 기준)
+    metadata_db = config.get("metadata_db")  # type: ignore[attr-defined]
+    if metadata_db and daemon.read_status(metadata_db).get("running"):
+        pid = daemon.read_status(metadata_db).get("pid")
+        logging.error("daemon이 이미 실행 중입니다 (pid=%s)", pid)
+        sys.exit(1)
+
     version = config.get("version")  # type: ignore[attr-defined]
 
     if version == 2:
         asyncio.run(startup_v2(config, config_path))
     else:
-        # v1: 기존 초기화 흐름
+        # v1: 기존 초기화 흐름 (레거시, WebDAV)
         _startup_v1(config_path, config)
+
+
+def _daemon_status(config_path: str) -> int:
+    """실행 중인 daemon 상태를 출력한다."""
+    from stardustlib import daemon
+    from stardustlib.config_loader import ConfigLoader
+
+    config = ConfigLoader(config_path).load()
+    status = daemon.read_status(config["metadata_db"])
+    if status.get("running"):
+        msg = (f"daemon 실행 중: pid={status['pid']} "
+               f"(heartbeat {status['heartbeat_age']:.0f}s 전)\n")
+        sys.stdout.buffer.write(msg.encode("utf-8"))
+        return 0
+    if status.get("stale"):
+        sys.stdout.buffer.write(
+            "daemon 미실행 (stale 제어 파일: 비정상 종료 가능)\n".encode("utf-8")
+        )
+        return 1
+    sys.stdout.buffer.write("daemon 미실행\n".encode("utf-8"))
+    return 1
+
+
+def _daemon_stop(config_path: str) -> int:
+    """실행 중인 daemon에 정지를 요청한다."""
+    from stardustlib import daemon
+    from stardustlib.config_loader import ConfigLoader
+
+    config = ConfigLoader(config_path).load()
+    result = daemon.request_stop(config["metadata_db"])
+    if result.get("stopped"):
+        sys.stdout.buffer.write("daemon 정지됨\n".encode("utf-8"))
+        return 0
+    if result.get("reason") == "not_running":
+        sys.stdout.buffer.write("daemon 미실행\n".encode("utf-8"))
+        return 1
+    sys.stdout.buffer.write(
+        "daemon 정지 요청 전송, 시간 내 종료 확인 실패\n".encode("utf-8")
+    )
+    return 1
 
 
 def _startup_v1(config_path: str, config: dict) -> None:
@@ -140,15 +205,20 @@ async def startup_v2(config: dict, config_path: str) -> None:
         # 오프라인 전용 모드: key_file이 로컬에 있어야 함
         logger.info("server.url 미설정, 오프라인 전용 모드로 시작")
         try:
-            app, jbod_manager, metadata_store, encryption_engine, db_key = (
-                _initialize_local_storage(config)
+            jbod_manager, metadata_store, encryption_engine, db_key = (
+                _build_core(config)
             )
         except SystemExit:
             raise
         except Exception as e:
             logger.error("로컬 스토리지 초기화 실패: %s", e)
             sys.exit(1)
-        _start_webdav(config, app)
+
+        async def _cleanup() -> None:
+            metadata_store.close()
+
+        from stardustlib import daemon
+        await daemon.serve(config["metadata_db"], _cleanup)
         return
 
     # (2) 인증
@@ -181,8 +251,8 @@ async def startup_v2(config: dict, config_path: str) -> None:
 
     # (4) 로컬 스토리지 초기화
     try:
-        app, jbod_manager, metadata_store, encryption_engine, db_key = (
-            _initialize_local_storage(config)
+        jbod_manager, metadata_store, encryption_engine, db_key = (
+            _build_core(config)
         )
     except SystemExit:
         raise
@@ -230,15 +300,17 @@ async def startup_v2(config: dict, config_path: str) -> None:
         )
         await recovery_mgr.start()
 
-        try:
-            _start_webdav(config, app)
-        finally:
+        async def _cleanup() -> None:
             await recovery_mgr.stop()
             await sync_client.stop()
             await device_mgr.stop()
             if p2p_server is not None:
                 await p2p_server.stop()
             await auth_client.close()
+            metadata_store.close()
+
+        from stardustlib import daemon
+        await daemon.serve(config["metadata_db"], _cleanup)
         return
 
     # (4-a) 최초 디바이스: key 백업 업로드 (서버에 백업이 없으면)
@@ -259,8 +331,13 @@ async def startup_v2(config: dict, config_path: str) -> None:
         await device_mgr.register()
     except DeviceRegistrationError as e:
         logger.warning("디바이스 등록 실패, 오프라인 모드로 전환: %s", e)
-        await auth_client.close()
-        _start_webdav(config, app)
+
+        async def _cleanup() -> None:
+            await auth_client.close()
+            metadata_store.close()
+
+        from stardustlib import daemon
+        await daemon.serve(config["metadata_db"], _cleanup)
         return
 
     # 등록된 device_id를 JBOD에 주입 (파일 변경 추적용)
@@ -313,8 +390,8 @@ async def startup_v2(config: dict, config_path: str) -> None:
             # key_file 교체 후 로컬 스토리지 재초기화
             logger.info("key 복원 완료, 로컬 스토리지 재초기화...")
             metadata_store.close()
-            app, jbod_manager, metadata_store, encryption_engine, db_key = (
-                _initialize_local_storage(config)
+            jbod_manager, metadata_store, encryption_engine, db_key = (
+                _build_core(config)
             )
             # device_id, remote 소스 재주입 (jbod_manager가 교체되었으므로)
             jbod_manager.device_id = device_mgr.device_id
@@ -367,22 +444,8 @@ async def startup_v2(config: dict, config_path: str) -> None:
     await device_mgr.start_heartbeat()
     await sync_client.start_periodic_sync()
 
-    # (7) WebDAV 서버 시작 (별도 스레드에서 블로킹 실행)
-    import threading
-
-    webdav_thread = threading.Thread(
-        target=_start_webdav, args=(config, app), daemon=True
-    )
-    webdav_thread.start()
-
-    # asyncio 루프 유지 (Ctrl+C로 종료)
-    try:
-        while webdav_thread.is_alive():
-            await asyncio.sleep(1)
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        pass
-    finally:
-        # 정리
+    # (7) 상주 루프 (정지 신호까지 — Ctrl+C 또는 'daemon stop')
+    async def _cleanup() -> None:
         await sync_client.stop()
         await device_mgr.stop()
         if relay_worker is not None:
@@ -390,6 +453,10 @@ async def startup_v2(config: dict, config_path: str) -> None:
         if p2p_server is not None:
             await p2p_server.stop()
         await auth_client.close()
+        metadata_store.close()
+
+    from stardustlib import daemon
+    await daemon.serve(config["metadata_db"], _cleanup)
 
 
 def _mount_remote_sources(
@@ -556,37 +623,6 @@ def _build_core(config: dict) -> tuple:
 
     logger.info("로컬 스토리지 초기화 완료")
     return jbod_manager, metadata_store, encryption_engine, db_key
-
-
-def _initialize_local_storage(config: dict) -> tuple:
-    """코어 컴포넌트를 조립하고 WebDAV 앱까지 생성해 반환한다 (daemon 경로).
-
-    Returns:
-        (app, jbod_manager, metadata_store, encryption_engine, db_key) 튜플.
-    """
-    from stardustlib.webdav_provider import create_webdav_app
-
-    jbod_manager, metadata_store, encryption_engine, db_key = _build_core(config)
-    app = create_webdav_app(config, jbod_manager, encryption_engine)
-    return app, jbod_manager, metadata_store, encryption_engine, db_key
-
-
-def _start_webdav(config: dict, app) -> None:
-    """cheroot WebDAV 서버를 시작한다 (블로킹)."""
-    from cheroot.wsgi import Server as WSGIServer
-
-    host = config["webdav"]["host"]
-    port = config["webdav"]["port"]
-
-    server = WSGIServer((host, port), app)
-    logging.info("WebDAV 서버 시작: http://%s:%d/", host, port)
-
-    try:
-        server.start()
-    except KeyboardInterrupt:
-        logging.info("서버 종료 중...")
-    finally:
-        server.stop()
 
 
 async def _restore_key_from_server(

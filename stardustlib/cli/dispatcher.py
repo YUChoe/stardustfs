@@ -34,15 +34,21 @@ _HANDLERS = {
 }
 
 
-def add_subcommands(subparsers) -> None:
-    """단발 CLI 서브커맨드를 argparse subparsers에 등록한다."""
+def add_subcommands(subparsers, parent=None) -> None:
+    """단발 CLI 서브커맨드를 argparse subparsers에 등록한다.
+
+    parent(공통 옵션 parser)를 주면 각 서브커맨드가 --config 등을 서브커맨드 뒤에서도
+    받을 수 있다 (예: `stardustfs.py ls --config X`).
+    """
+    kw = {"parents": [parent]} if parent is not None else {}
+
     # 조회 계열
-    p_df = subparsers.add_parser("df", help="총/가용 용량 표시")
-    p_ls = subparsers.add_parser("ls", help="가상 경로 목록")
+    p_df = subparsers.add_parser("df", help="총/가용 용량 표시", **kw)
+    p_ls = subparsers.add_parser("ls", help="가상 경로 목록", **kw)
     p_ls.add_argument("path", nargs="?", default="/", help="가상 경로 (기본 /)")
-    p_status = subparsers.add_parser("status", help="동기화 상태 표시")
+    p_status = subparsers.add_parser("status", help="동기화 상태 표시", **kw)
     p_devices = subparsers.add_parser(
-        "devices", help="내 device 목록 (online 여부)"
+        "devices", help="내 device 목록 (online 여부)", **kw
     )
     for parser in (p_df, p_ls, p_status, p_devices):
         parser.add_argument(
@@ -50,28 +56,28 @@ def add_subcommands(subparsers) -> None:
         )
 
     # 전송/쓰기 계열
-    p_put = subparsers.add_parser("put", help="로컬 파일 업로드")
+    p_put = subparsers.add_parser("put", help="로컬 파일 업로드", **kw)
     p_put.add_argument("local", help="로컬 파일 경로")
     p_put.add_argument("remote", nargs="?", help="가상 경로 (기본: /<파일명>)")
 
-    p_get = subparsers.add_parser("get", help="파일 다운로드")
+    p_get = subparsers.add_parser("get", help="파일 다운로드", **kw)
     p_get.add_argument("remote", help="가상 경로")
     p_get.add_argument("local", nargs="?", help="로컬 저장 경로 (기본: 파일명)")
 
-    p_rm = subparsers.add_parser("rm", help="파일/디렉토리 삭제")
+    p_rm = subparsers.add_parser("rm", help="파일/디렉토리 삭제", **kw)
     p_rm.add_argument("path", help="가상 경로")
     p_rm.add_argument(
         "-r", "--recursive", action="store_true", help="디렉토리 재귀 삭제"
     )
 
-    p_mkdir = subparsers.add_parser("mkdir", help="디렉토리 생성")
+    p_mkdir = subparsers.add_parser("mkdir", help="디렉토리 생성", **kw)
     p_mkdir.add_argument("path", help="가상 경로")
 
-    p_mv = subparsers.add_parser("mv", help="이동/이름변경")
+    p_mv = subparsers.add_parser("mv", help="이동/이름변경", **kw)
     p_mv.add_argument("src", help="원본 가상 경로")
     p_mv.add_argument("dst", help="대상 가상 경로")
 
-    p_cp = subparsers.add_parser("cp", help="파일 복사")
+    p_cp = subparsers.add_parser("cp", help="파일 복사", **kw)
     p_cp.add_argument("src", help="원본 가상 경로")
     p_cp.add_argument("dst", help="대상 가상 경로")
 

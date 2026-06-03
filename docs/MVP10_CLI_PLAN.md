@@ -114,12 +114,26 @@ stardust status                     # 동기화 상태, 보류 변경 수
 Git/foo`가 되어 실패한다. 검증·사용 시 `MSYS_NO_PATHCONV=1` 필요. 후속 개선
 후보: CLI가 선행 슬래시 없는 상대 가상경로를 허용하고 내부에서 `/`를 보정.
 
-### Phase 5 — WebDAV 제거
-- [ ] webdav_provider.py 및 wsgidav/cheroot 의존 제거(requirements.txt 정리)
-- [ ] stardustfs.py 엔트리포인트를 WebDAV 서버 기동 → CLI 디스패처로 전환
-      (또는 stardustfs.py는 sync 데몬 전용으로 축소하고 CLI를 별 엔트리로 분리)
-- [ ] run-dev.sh를 CLI 데모 흐름으로 갱신(루프백 소스 3개 유지)
-- [ ] WebDAV 전용 테스트 제거/대체, CLI 테스트로 회귀 커버리지 이전
+### Phase 5a — daemon에서 WebDAV 제거 + 라이프사이클 (진행 중)
+- [x] daemon 실행 경로에서 WebDAV 제거: startup_v2의 3개 분기(no-server/offline/
+      online) + key 불일치 재초기화 + 등록 실패 분기를 `_build_core`(WebDAV 비의존)로
+      전환. `_initialize_local_storage`/`_start_webdav` 제거(create_webdav_app 미import)
+- [x] WebDAV 스레드 기반 keepalive 제거 → `stardustlib/daemon.py`의 제어 파일 기반
+      생존 루프로 대체(크로스플랫폼, POSIX 시그널 비의존)
+- [x] 라이프사이클 명령: `daemon`(start) / `daemon status` / `daemon stop`.
+      제어 파일 `{metadata_db}.daemon.json`(pid+heartbeat) + 정지 센티넬
+      `{metadata_db}.daemon.stop`. SIGINT/SIGTERM(가능 시) 핸들러도 graceful 경로.
+      중복 시작 거부(제어 파일 기준)
+- [x] `--config`를 서브커맨드 뒤에서도 받도록 공통 parent 적용(`daemon stop
+      --config X` 등). 전역 --config와 충돌 없게 default=SUPPRESS
+- [x] run-dev.sh를 `daemon` 실행으로 갱신(WebDAV/WebClient BasicAuthLevel 블록 제거)
+- [x] 테스트: tests/test_daemon_lifecycle.py 5종(status 전이/stale/stop/serve
+      통합). 오프라인 config로 start→status→stop→중복거부 실측 통과
+
+### Phase 5b — WebDAV 모듈/의존 삭제 (예정)
+- [ ] webdav_provider.py 삭제 + 관련 테스트(test_webdav_provider/app/placeholder) 제거/대체
+- [ ] requirements.txt에서 WsgiDAV/cheroot 제거
+- [ ] config의 webdav 섹션 정리(레거시 v1 _startup_v1도 함께 정리)
 
 ### Phase 6 — 문서/스펙
 - [ ] `.kiro/specs/cli-virtual-fileserver/`에 requirements/design/tasks 작성
