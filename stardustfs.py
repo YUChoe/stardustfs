@@ -158,6 +158,21 @@ def _daemon_stop(config_path: str) -> int:
     return 1
 
 
+def _build_parity_store(config: dict):
+    """호스트 역할 패리티 스토어를 생성한다(p2p.parity_enabled 일 때만).
+
+    보관 디렉토리는 {metadata_db}.parity, 최대 용량은 p2p.parity_max_bytes
+    (없으면 무제한). 비활성 시 None.
+    """
+    p2p_config = config.get("p2p", {})
+    if not p2p_config.get("parity_enabled", False):
+        return None
+    from stardustlib.parity_store import ParityStore
+
+    base_dir = config["metadata_db"] + ".parity"
+    return ParityStore(base_dir, p2p_config.get("parity_max_bytes"))
+
+
 async def startup_v2(config: dict, config_path: str) -> None:
     """v2 설정 기반 MVP2 초기화 흐름.
 
@@ -287,7 +302,8 @@ async def startup_v2(config: dict, config_path: str) -> None:
         p2p_enabled = p2p_config.get("enabled", False)
         if p2p_enabled:
             p2p_server = P2PServer(
-                jbod_manager, auth_client, p2p_port, server_url
+                jbod_manager, auth_client, p2p_port, server_url,
+                parity_store=_build_parity_store(config),
             )
 
         recovery_mgr = OnlineRecoveryManager(
@@ -422,7 +438,10 @@ async def startup_v2(config: dict, config_path: str) -> None:
     p2p_enabled = p2p_config.get("enabled", False)
 
     if p2p_enabled:
-        p2p_server = P2PServer(jbod_manager, auth_client, p2p_port, server_url)
+        p2p_server = P2PServer(
+            jbod_manager, auth_client, p2p_port, server_url,
+            parity_store=_build_parity_store(config),
+        )
         await p2p_server.start()
         await device_mgr.setup_upnp()
 

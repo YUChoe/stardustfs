@@ -15,6 +15,7 @@ from aiohttp import web
 
 from stardustlib.auth_client import AuthClient
 from stardustlib.jbod_manager import JBODManager
+from stardustlib.parity_store import ParityStore, QuotaExceededError
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +34,14 @@ class P2PServer:
         auth_client: AuthClient,
         port: int,
         server_url: str,
+        parity_store: ParityStore | None = None,
     ) -> None:
         self._jbod_manager = jbod_manager
         self._auth_client = auth_client
         self._port = port
         self._server_url = server_url.rstrip("/")
+        # 호스트 역할: 타 사용자 청크 암호문 보관소(없으면 replica op 비활성)
+        self._parity_store = parity_store
         self._app: web.Application | None = None
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
@@ -60,6 +64,12 @@ class P2PServer:
         self._app.router.add_post("/p2p/mkdir", self.handle_mkdir)
         self._app.router.add_post("/p2p/rmdir", self.handle_rmdir)
         self._app.router.add_post("/p2p/space", self.handle_space)
+        # 패리티(타 사용자 청크 보관) 교차 사용자 op
+        self._app.router.add_post("/p2p/replica_store", self.handle_replica_store)
+        self._app.router.add_post("/p2p/replica_fetch", self.handle_replica_fetch)
+        self._app.router.add_post(
+            "/p2p/replica_delete", self.handle_replica_delete
+        )
 
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
@@ -156,6 +166,35 @@ class P2PServer:
             return body
         status, result = self._op_space(body)
         return web.json_response(result, status=status)
+
+    # --- 패리티(교차 사용자 청크 보관) 핸들러 ---
+
+    async def handle_replica_store(self, request: web.Request) -> web.Response:
+        """POST /p2p/replica_store: 타 사용자 청크 암호문 보관."""
+        result = await self._parse_and_verify_any_user(request)
+        if isinstance(result, web.Response):
+            return result
+        body, requester = result
+        status, res = self._op_replica_store(body, requester)
+        return web.json_response(res, status=status)
+
+    async def handle_replica_fetch(self, request: web.Request) -> web.Response:
+        """POST /p2p/replica_fetch: 보관 중인 청크를 소유자에게 반환."""
+        result = await self._parse_and_verify_any_user(request)
+        if isinstance(result, web.Response):
+            return result
+        body, requester = result
+        status, res = self._op_replica_fetch(body, requester)
+        return web.json_response(res, status=status)
+
+    async def handle_replica_delete(self, request: web.Request) -> web.Response:
+        """POST /p2p/replica_delete: 보관 중인 청크를 소유자 요청으로 삭제."""
+        result = await self._parse_and_verify_any_user(request)
+        if isinstance(result, web.Response):
+            return result
+        body, requester = result
+        status, res = self._op_replica_delete(body, requester)
+        return web.json_response(res, status=status)
 
     # --- 작업 디스패치 (릴레이 워커가 인증 없이 직접 호출) ---
 
@@ -336,6 +375,63 @@ class P2PServer:
             "total": source.get_total_space(),
         }
 
+    # --- 패리티 작업 로직 (소유자 = requester 인가는 ParityStore가 집행) ---
+
+    def _op_replica_store(
+        self, body: dict, requester: str
+    ) -> tuple[int, dict]:
+        """타 사용자 청크 암호문을 보관한다(소유자=requester)."""
+        if self._parity_store is None:
+            return 503, {"error": "Parity hosting not enabled"}
+        chunk_id = body.get("chunk_id", "")
+        try:
+            data = base64.b64decode(body.get("data", ""))
+        except Exception:
+            return 400, {"error": "Invalid base64 data"}
+        if len(data) > MAX_WRITE_SIZE:
+            return 413, {"error": "Payload too large (max 100MB)"}
+        try:
+            self._parity_store.store(chunk_id, requester, data)
+        except ValueError:
+            return 400, {"error": "Invalid chunk_id"}
+        except PermissionError:
+            return 403, {"error": "Chunk owner mismatch"}
+        except QuotaExceededError:
+            return 507, {"error": "Insufficient storage (quota exceeded)"}
+        return 200, {"bytes_written": len(data)}
+
+    def _op_replica_fetch(
+        self, body: dict, requester: str
+    ) -> tuple[int, dict]:
+        """보관 중인 청크 암호문을 소유자에게만 반환한다."""
+        if self._parity_store is None:
+            return 503, {"error": "Parity hosting not enabled"}
+        chunk_id = body.get("chunk_id", "")
+        try:
+            data = self._parity_store.fetch(chunk_id, requester)
+        except ValueError:
+            return 400, {"error": "Invalid chunk_id"}
+        except FileNotFoundError:
+            return 404, {"error": "Chunk not found"}
+        except PermissionError:
+            return 403, {"error": "Not chunk owner"}
+        return 200, {"data": base64.b64encode(data).decode("ascii")}
+
+    def _op_replica_delete(
+        self, body: dict, requester: str
+    ) -> tuple[int, dict]:
+        """보관 중인 청크를 소유자 요청으로 삭제한다(멱등)."""
+        if self._parity_store is None:
+            return 503, {"error": "Parity hosting not enabled"}
+        chunk_id = body.get("chunk_id", "")
+        try:
+            self._parity_store.delete(chunk_id, requester)
+        except ValueError:
+            return 400, {"error": "Invalid chunk_id"}
+        except PermissionError:
+            return 403, {"error": "Not chunk owner"}
+        return 200, {"status": "deleted"}
+
     # --- 내부 헬퍼 ---
 
     async def _parse_and_verify(
@@ -380,6 +476,32 @@ class P2PServer:
             return verify_result
 
         return body
+
+    async def _parse_and_verify_any_user(
+        self, request: web.Request
+    ) -> tuple[dict, str] | web.Response:
+        """패리티 op용: 토큰을 검증하되 user_id 일치는 요구하지 않는다.
+
+        호스트는 타 사용자의 청크를 보관하므로 요청자가 로컬 사용자와 달라도
+        된다. 소유자=요청자 인가는 ParityStore가 청크 단위로 집행한다.
+        성공 시 (body, requester_user_id), 실패 시 에러 Response를 반환.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
+        auth_token = body.get("auth_token")
+        if not auth_token:
+            return web.json_response({"error": "Missing auth_token"}, status=401)
+        verify_result = await self._verify_token(auth_token, same_user=False)
+        if isinstance(verify_result, web.Response):
+            return verify_result
+        requester = verify_result.get("user_id")
+        if not requester:
+            return web.json_response(
+                {"error": "Invalid token (no user_id)"}, status=401
+            )
+        return body, requester
 
     async def _verify_share_token(
         self, share_token: str, physical_path: str
@@ -426,10 +548,12 @@ class P2PServer:
         return data
 
     async def _verify_token(
-        self, token: str
+        self, token: str, same_user: bool = True
     ) -> dict | web.Response:
         """중앙 서버 POST /auth/verify로 토큰을 검증한다.
 
+        same_user=True(기본)이면 토큰의 user_id가 로컬 사용자와 일치해야 한다.
+        패리티 op처럼 타 사용자 접근이 정당한 경우 same_user=False로 호출한다.
         성공 시 검증 결과 dict, 실패 시 에러 Response를 반환.
         """
         try:
@@ -459,13 +583,14 @@ class P2PServer:
                 {"error": "Invalid or expired token"}, status=401
             )
 
-        # user_id 일치 확인
-        remote_user_id = data.get("user_id")
-        local_user_id = self._auth_client.user_id
-        if remote_user_id != local_user_id:
-            return web.json_response(
-                {"error": "User ID mismatch"}, status=403
-            )
+        # user_id 일치 확인 (패리티 op 등 교차 사용자 접근에서는 생략)
+        if same_user:
+            remote_user_id = data.get("user_id")
+            local_user_id = self._auth_client.user_id
+            if remote_user_id != local_user_id:
+                return web.json_response(
+                    {"error": "User ID mismatch"}, status=403
+                )
 
         return data
 
