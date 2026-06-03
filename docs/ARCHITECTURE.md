@@ -59,6 +59,11 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
   (`{metadata_db}.credentials.json`, 소유자 전용)에 영속화하고 만료 전 자동 갱신.
 - `daemon.py`: daemon 라이프사이클(제어 파일 + 정지 센티넬 + heartbeat).
 - `cli/`: 단발 명령 디스패처/세션/명령/출력 포매터.
+- 리플리케이션(MVP3): `chunker.py`(암호문 4MiB 청크 split/join), `parity_store.py`
+  (호스트 역할 — 타 사용자 청크 암호문 보관·쿼터·소유자 인가), `replication_manager.py`
+  (replicate/recover/ensure_replicas), `holepunch.py`(UDP 동시 오픈). P2P
+  `/p2p/replica_{store,fetch,delete}`는 교차 사용자 토큰을 검증하되 소유자=요청자
+  인가는 ParityStore가 청크 단위로 집행.
 
 ## 중앙 서버 (별도 저장소 ../stardustfs-server, FastAPI)
 
@@ -68,6 +73,10 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
 - 메타데이터 백업/동기화: 암호화 blob + version(CAS 낙관적 잠금, version 롱폴).
 - key 백업: 마스터키를 key_password로 암호화한 blob 보관(zero-knowledge).
 - 라우팅/릴레이: 디바이스 접속 주소 조회, 직접 연결 불가 시 HTTP 롱폴 릴레이.
+- 리플리케이션 제어 평면: `/replication/*`(청크 레지스트리·배치·복제본·건강성),
+  chunks/replicas/hosting 테이블 + 호혜 회계(provided·hosted, 0.5 호혜 쿼터).
+  위치/크기/회계 메타데이터만 저장(내용·키 미저장). UDP 랑데부(`rendezvous.py`,
+  옵트인)로 홀펀칭 보조.
 
 ## 데이터 흐름
 
@@ -85,6 +94,16 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
 ### 동기화
 - daemon이 version 롱폴로 변경을 즉시 감지해 다운로드·병합하고, 주기 폴링을
   안전망으로 둔다. 삭제는 tombstone으로 전파되고 만료 tombstone은 GC된다.
+
+### 리플리케이션 (backup/restore/heal)
+- backup: 평문을 AES-256-GCM으로 자체 포함 암호문 blob으로 암호화 → 4MiB 청크 분할
+  → 청크 등록 + 서버 배치(placement) → 각 청크를 ≥3 홀더의 ParityStore에 직접 push →
+  레지스트리 확정. ≥3 확보 시 replicated, 아니면 pending(경고). file_ref/chunk_id는
+  가상경로 SHA-256(서버에 경로 비노출).
+- restore: 서버에서 청크 목록 조회 → 청크별 온라인·도달 가능한 홀더에서 fetch(스웜) →
+  결합 → 복호화 → 로컬 복원. 도달 불가 청크가 있으면 누락 chunk_id 명시 에러.
+- heal: 청크별 online 복제 수가 부족하면 온라인 홀더에서 받아(불변 청크) 새 홀더로
+  복사. 호스트는 키가 없어 청크를 복호화할 수 없다.
 
 ## 설계 결정 (요약)
 

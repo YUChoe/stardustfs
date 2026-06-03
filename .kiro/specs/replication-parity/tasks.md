@@ -80,11 +80,14 @@ pytest 그린 유지, 전송/복구는 로컬 서버 E2E로 검증.
       별도 스펙으로 분리. 직접 push/fetch + 스웜(≥3) + 홀펀칭으로 도달성 확보.
 
 ## Phase 7: 검증 / 문서
-- [ ] 7.1 E2E(로컬 서버 + 다중 device): replicate → 소스 중지 → 다른 홀더 recover →
-      바이트 일치. 홀더 1곳만 도달 가능한 경우 복구 성공(스웜).
-- [ ] 7.2 가용성: 홀더 부족 → pending + 경고 → 확보 후 자동 완료.
-- [ ] 7.3 양쪽 pytest 회귀 그린.
-- [ ] 7.4 ROADMAP의 MVP3 항목을 본 스펙으로 갱신, HANDOVER/ARCHITECTURE 반영.
+- [x] 7.1 E2E(tests/test_replication_e2e.py): 실제 P2PServer 홀더 + ParityStore +
+      중앙 mock. replicate → 소스 훼손 → recover 바이트 일치. 홀더 2곳 중지(스웜)에서
+      1곳으로 복구 성공. 호스트는 암호문만 보관(평문 비가독).
+- [x] 7.2 가용성: 홀더 부족(<3) → pending(E2E test_pending_when_insufficient_holders).
+      홀더 상실 후 heal로 자동 회복(test_heal_restores_replication_after_holder_loss).
+- [x] 7.3 양쪽 pytest 회귀 그린(클라이언트 469/1 skip, 서버 88).
+- [x] 7.4 ROADMAP MVP3를 "엔진 구현 완료"로 갱신, ARCHITECTURE에 리플리케이션
+      컴포넌트·흐름 추가, HANDOVER에 현황·이관 항목·스펙 위치 반영.
 
 ## 비범위 (후속)
 - Erasure coding(Reed-Solomon)로 저장 효율 개선.

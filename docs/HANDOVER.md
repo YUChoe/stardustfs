@@ -166,9 +166,21 @@ E2E 테스트는 롱폴/릴레이 미배포 서버에서는 자동 skip된다(�
 
 → B 진행 전 사용자에게 B-1/B-2 방향을 먼저 확인할 것.
 
-### MVP3: 암호화 리플리케이션
-교차 계정 P2P를 암호화 복제 청크로 단일화. 릴레이 인프라(RelayHub) + share_token
-인프라를 복제 노드 접근 인가로 승계 가능.
+### MVP3: 암호화 리플리케이션 — 엔진 구현 완료 (2026-06)
+스펙 `.kiro/specs/replication-parity/`. Phase 1~7 완료.
+- 청킹(`chunker.py`) + 메타 replication_status, 서버 chunks/replicas/hosting 레지스트리
+  + ReplicationService(placement·건강성·호혜 0.5) + `/replication/*`.
+- 호스트 역할 `parity_store.py` + P2P `/p2p/replica_{store,fetch,delete}`(교차 사용자
+  토큰 검증, 소유자=요청자 인가는 ParityStore가 집행, 호스트 비가독).
+- `replication_manager.py`: replicate/recover/ensure_replicas, CLI `backup`/`restore`/
+  `heal`. file_ref/chunk_id는 가상경로 SHA-256(경로 비노출).
+- UDP 홀펀칭(`holepunch.py` + 서버 `rendezvous.py` 옵트인). E2E `test_replication_e2e.py`.
+
+남은 항목(이관/후속):
+- 교차 사용자 릴레이 fallback: RelayHub가 same-user만 중개 → 허브 인가 모델 재설계
+  (보안 민감)가 필요해 별도 스펙으로 분리. 현재 도달성은 직접+스웜(≥3)+홀펀칭.
+- 데이터 전송의 UDP 채널 전환(현 전송은 HTTP/TCP) + daemon 자동 랑데부 등록.
+- 재복제의 24h 유예/주기 스케줄러(현재는 명시적 `heal` 호출), erasure coding(저장 효율).
 
 ### 알려진 한계
 - 이중 NAT에서 직접 P2P는 상위 NAT 포트포워딩 없으면 불가 → 릴레이로 우회(구현됨)
@@ -181,6 +193,7 @@ E2E 테스트는 롱폴/릴레이 미배포 서버에서는 자동 skip된다(�
 - `p2p-relay-fallback/`: 서버 경유 long-polling 릴레이
 - `remote-write-takeover/`: 소유권 이전 3a + orphan GC
 - `sync-longpoll-events/`: 메타데이터 version 롱폴링
+- `replication-parity/`: 암호화 리플리케이션(MVP3, Phase 1~7 완료)
 - `mvp2-client-multidevice/`: MVP2 전체
 
 작업 재개 시 해당 스펙의 tasks.md에서 미완료(`[ ]`) 항목을 확인할 것.
