@@ -7,6 +7,7 @@ df/ls/status는 오프라인(로컬 코어)으로 동작하고, devices는 온�
 
 from __future__ import annotations
 
+import getpass
 import os
 import sys
 
@@ -151,6 +152,78 @@ def cmd_devices(session, args) -> int:
 def _err(message: str) -> None:
     """오류 메시지를 표준오류에 UTF-8로 출력한다."""
     sys.stderr.buffer.write((message + "\n").encode("utf-8"))
+
+
+# --- 인증 계열 (login/logout) ---
+#
+# 세션 없이 config만으로 동작한다. login은 토큰이 없어도 실행되며, 토큰을 자격증명
+# 저장소에 기록한다. 자격증명 수집 우선순위: 플래그 > 환경변수 > 대화형 입력.
+
+
+def _server_url_of(config) -> str | None:
+    server = config.get("server")
+    return server.get("url") if isinstance(server, dict) else None
+
+
+async def cmd_login(args) -> int:
+    """email/password로 로그인하여 토큰을 자격증명 저장소에 저장한다."""
+    from stardustlib.auth_client import AuthClient
+    from stardustlib.config_loader import ConfigLoader
+    from stardustlib.credential_store import CredentialStore
+    from stardustlib.exceptions import AuthenticationError
+
+    config = ConfigLoader(args.config).load()
+    server_url = _server_url_of(config)
+    if not server_url:
+        _err("오류: server.url이 설정되어 있지 않습니다(오프라인 전용 설정).")
+        return 2
+
+    email = (args.email or os.environ.get("STARDUST_EMAIL")
+             or input("Email: ").strip())
+    password = (args.password or os.environ.get("STARDUST_PASSWORD")
+                or getpass.getpass("Password: "))
+
+    store = CredentialStore(config["metadata_db"])
+    auth = AuthClient(server_url, credential_store=store)
+    try:
+        await auth.login(email, password)
+    except AuthenticationError as e:
+        _err(f"오류: 로그인 실패: {e}")
+        await auth.close()
+        return 1
+
+    # 마스터키 백업 암호(선택): 플래그 > 환경변수. 없으면 보관하지 않음.
+    key_password = args.key_password or os.environ.get("STARDUST_KEY_PASSWORD")
+    if key_password:
+        auth.set_key_password(key_password)
+
+    await auth.close()
+    echo(f"로그인 성공: {email}")
+    echo(f"자격증명 저장: {store.path}")
+    return 0
+
+
+async def cmd_logout(args) -> int:
+    """서버에 토큰 취소를 요청(best-effort)하고 자격증명 저장소를 삭제한다."""
+    from stardustlib.auth_client import AuthClient
+    from stardustlib.config_loader import ConfigLoader
+    from stardustlib.credential_store import CredentialStore
+
+    config = ConfigLoader(args.config).load()
+    store = CredentialStore(config["metadata_db"])
+    if not store.exists():
+        echo("로그아웃: 저장된 자격증명이 없습니다.")
+        return 0
+
+    server_url = _server_url_of(config) or ""
+    auth = AuthClient(server_url, credential_store=store)
+    auth.load_from_store()
+    if server_url:
+        await auth.logout()
+    await auth.close()
+    store.clear()
+    echo("로그아웃 완료: 자격증명을 삭제했습니다.")
+    return 0
 
 
 def _note_propagation(session) -> str:

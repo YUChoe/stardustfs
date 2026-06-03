@@ -33,6 +33,12 @@ _HANDLERS = {
     "cp": (commands.cmd_cp, True, True),
 }
 
+# 인증 계열: 세션 없이 config + 자격증명 저장소로 동작. (args) -> int 코루틴.
+_AUTH_HANDLERS = {
+    "login": commands.cmd_login,
+    "logout": commands.cmd_logout,
+}
+
 
 def add_subcommands(subparsers, parent=None) -> None:
     """단발 CLI 서브커맨드를 argparse subparsers에 등록한다.
@@ -81,10 +87,20 @@ def add_subcommands(subparsers, parent=None) -> None:
     p_cp.add_argument("src", help="원본 가상 경로")
     p_cp.add_argument("dst", help="대상 가상 경로")
 
+    # 인증 계열
+    p_login = subparsers.add_parser("login", help="이메일/비밀번호 로그인(토큰 저장)", **kw)
+    p_login.add_argument("--email", help="이메일(미지정 시 환경변수/대화형)")
+    p_login.add_argument("--password", help="비밀번호(미지정 시 환경변수/대화형)")
+    p_login.add_argument(
+        "--key-password", dest="key_password",
+        help="마스터키 백업 암호(선택, 미지정 시 저장 안 함)",
+    )
+    subparsers.add_parser("logout", help="토큰 취소 + 자격증명 삭제", **kw)
+
 
 def is_cli_command(command: str | None) -> bool:
     """주어진 서브커맨드가 단발 CLI 명령인지 여부."""
-    return command in _HANDLERS
+    return command in _HANDLERS or command in _AUTH_HANDLERS
 
 
 def run_cli(args) -> int:
@@ -92,6 +108,11 @@ def run_cli(args) -> int:
     if not getattr(args, "config", None):
         print("오류: --config 가 필요합니다.", file=sys.stderr)
         return 2
+
+    # 인증 계열(login/logout): 세션 없이 직접 실행
+    auth_handler = _AUTH_HANDLERS.get(args.command)
+    if auth_handler is not None:
+        return asyncio.run(auth_handler(args))
 
     entry = _HANDLERS.get(args.command)
     if entry is None:
