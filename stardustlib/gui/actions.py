@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -23,6 +24,49 @@ from stardustlib.config_loader import ConfigLoader
 _REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
+
+
+# --- 초기 설정 생성 (닭-달걀 해소: 설정이 없을 때 새로 만든다) ---
+
+def create_config(
+    base_dir: str,
+    server_url: str | None,
+    device_name: str,
+    generate_key: bool = True,
+    p2p_port: int = 9090,
+) -> str:
+    """base_dir에 v2 설정·스토리지 폴더를 만들고 config.json 경로를 반환한다.
+
+    - directory 소스 1개(base/storage), metadata_db, key_file(base/master.key).
+    - generate_key=True(첫 디바이스): master.key를 새로 생성.
+    - generate_key=False(기존 계정): key_file은 생성하지 않음 → 로그인(키 백업 암호
+      포함) 후 첫 온라인 작업에서 서버 백업으로 복원된다.
+    - server_url이 비면 오프라인 전용 설정(server.url=null).
+    """
+    base = os.path.abspath(base_dir)
+    storage = os.path.join(base, "storage")
+    os.makedirs(storage, exist_ok=True)
+
+    key_path = os.path.join(base, "master.key")
+    if generate_key and not os.path.exists(key_path):
+        with open(key_path, "wb") as f:
+            f.write(os.urandom(32))
+
+    config = {
+        "version": 2,
+        "server": {"url": server_url or None, "device_name": device_name},
+        "sources": [
+            {"type": "directory", "id": "local-1", "path": storage}
+        ],
+        "metadata_db": os.path.join(base, "metadata.db"),
+        "key_file": key_path,
+        "sync": {"interval_seconds": 30, "conflict_strategy": "copy"},
+        "p2p": {"port": p2p_port, "enabled": True},
+    }
+    cfg_path = os.path.join(base, "config.json")
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+    return cfg_path
 
 
 # --- 오프라인 조회 ---

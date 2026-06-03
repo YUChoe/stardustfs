@@ -20,6 +20,44 @@ def test_human_size():
     assert _human(1048576) == "1.0 MiB"
 
 
+def test_create_config_generates_key(tmp_path):
+    base = tmp_path / "setup"
+    cfg_path = actions.create_config(
+        str(base), "https://s.example", "dev-1", generate_key=True
+    )
+    assert __import__("os").path.exists(cfg_path)
+    cfg = json.loads(open(cfg_path, encoding="utf-8").read())
+    assert cfg["version"] == 2
+    assert cfg["server"]["url"] == "https://s.example"
+    assert cfg["server"]["device_name"] == "dev-1"
+    assert cfg["sources"][0]["type"] == "directory"
+    key = base / "master.key"
+    assert key.exists() and key.stat().st_size == 32
+    assert (base / "storage").is_dir()
+
+
+def test_create_config_offline_no_key(tmp_path):
+    base = tmp_path / "setup2"
+    cfg_path = actions.create_config(
+        str(base), "", "dev-2", generate_key=False
+    )
+    cfg = json.loads(open(cfg_path, encoding="utf-8").read())
+    assert cfg["server"]["url"] is None          # 빈 URL → 오프라인
+    assert not (base / "master.key").exists()    # 복원 모드: 키 미생성
+
+
+def test_created_config_validates(tmp_path):
+    from stardustlib.config_loader import ConfigLoader
+
+    base = tmp_path / "setup3"
+    cfg_path = actions.create_config(
+        str(base), "https://s.example", "dev-3", generate_key=True
+    )
+    loader = ConfigLoader(cfg_path)
+    config = loader.load()
+    assert loader.validate(config) == []         # 생성된 설정은 검증 통과
+
+
 def test_daemon_status_not_running(tmp_path):
     cfg = tmp_path / "config.json"
     cfg.write_text(

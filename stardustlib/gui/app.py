@@ -49,7 +49,8 @@ class StardustApp:
     def _build_widgets(self) -> None:
         top = ttk.Frame(self.root, padding=6)
         top.pack(fill="x")
-        ttk.Button(top, text="설정...", command=self._choose_config).pack(side="left")
+        ttk.Button(top, text="새 설정...", command=self._new_config).pack(side="left")
+        ttk.Button(top, text="설정...", command=self._choose_config).pack(side="left", padx=4)
         self.cfg_label = ttk.Label(top, text=self.config_path or "(미선택)")
         self.cfg_label.pack(side="left", padx=6)
         ttk.Button(top, text="로그인", command=self._login).pack(side="right")
@@ -120,6 +121,62 @@ class StardustApp:
         self.status.config(text=text)
 
     # --- 동작 ---
+
+    def _new_config(self) -> None:
+        import socket
+
+        base = filedialog.askdirectory(
+            title="설정/저장 폴더 선택 (비어 있는 폴더 권장)"
+        )
+        if not base:
+            return
+        server_url = simpledialog.askstring(
+            "새 설정", "서버 URL (비우면 오프라인 전용):",
+            initialvalue="https://stardustfs.noizze.net",
+        )
+        if server_url is None:
+            return
+        device_name = simpledialog.askstring(
+            "새 설정", "디바이스 이름:", initialvalue=socket.gethostname()
+        )
+        if not device_name:
+            return
+        generate_key = messagebox.askyesno(
+            "암호화 키",
+            "이 디바이스에서 새 암호화 키를 생성할까요?\n\n"
+            "예 = 첫 디바이스(새 키 생성)\n"
+            "아니오 = 기존 계정(로그인 후 서버 백업에서 복원)",
+        )
+
+        def make():
+            return actions.create_config(
+                base, server_url.strip() or None, device_name.strip(),
+                generate_key=generate_key,
+            )
+
+        def done(ok, payload):
+            if not ok:
+                messagebox.showerror("오류", str(payload))
+                return
+            self.config_path = payload
+            self.cfg_label.config(text=payload)
+            self.vpath = "/"
+            self.path_var.set("/")
+            self.refresh()
+            self._refresh_daemon()
+            if generate_key:
+                messagebox.showinfo(
+                    "새 설정", "설정과 새 키를 생성했습니다. 로그인 후 사용하세요."
+                )
+            else:
+                messagebox.showinfo(
+                    "새 설정",
+                    "설정을 생성했습니다. '로그인'에서 키 백업 암호까지 입력하면 "
+                    "서버 백업에서 키가 복원됩니다.",
+                )
+
+        self._set_status("설정 생성 중...")
+        self.worker.submit(make, done)
 
     def _choose_config(self) -> None:
         path = filedialog.askopenfilename(
