@@ -59,6 +59,7 @@ def main() -> None:
         "action", nargs="?", choices=["start", "status", "stop"],
         default="start", help="동작 (기본 start)",
     )
+    subparsers.add_parser("gui", parents=[common], help="데스크톱 GUI")
     add_subcommands(subparsers, common)
 
     args = parser.parse_args()
@@ -68,6 +69,13 @@ def main() -> None:
     # 단발 CLI 명령
     if is_cli_command(args.command):
         sys.exit(run_cli(args))
+
+    # 데스크톱 GUI (config 미지정 시 GUI에서 선택)
+    if args.command == "gui":
+        from stardustlib.gui.app import run_gui
+
+        run_gui(getattr(args, "config", None))
+        return
 
     # daemon (서브커맨드 없음 또는 'daemon [action]')
     if not args.config:
