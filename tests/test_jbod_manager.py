@@ -255,15 +255,33 @@ class _FakeRemoteSource:
 class TestRemoteSourceExcludedFromLocalCapacity:
     """오프라인 원격 소스가 로컬 용량 집계/쓰기 선택을 깨뜨리지 않아야 한다."""
 
-    def test_total_space_ignores_remote(self, jbod):
+    def test_total_space_ignores_remote(self, jbod, monkeypatch):
         """get_total_space는 원격 소스의 P2P를 호출하지 않고 로컬만 합산한다."""
+        # DirectorySource는 실제 디스크 용량(shutil.disk_usage)을 쓰므로, 호출 간
+        # 시스템 디스크 변동으로 값이 흔들린다. 테스트 결정성을 위해 고정한다.
+        import collections
+
+        import stardustlib.storage_source as ss
+
+        usage = collections.namedtuple("usage", "total used free")
+        monkeypatch.setattr(
+            ss.shutil, "disk_usage", lambda _p: usage(1000, 400, 600)
+        )
         local_total = jbod.get_total_space()
         jbod.add_source(_FakeRemoteSource("remote-offline"))
         # 원격이 OSError를 던져도 예외 없이 동일한 로컬 합계를 반환해야 한다
         assert jbod.get_total_space() == local_total
 
-    def test_available_space_ignores_remote(self, jbod):
+    def test_available_space_ignores_remote(self, jbod, monkeypatch):
         """get_available_space는 원격 소스를 제외한다."""
+        import collections
+
+        import stardustlib.storage_source as ss
+
+        usage = collections.namedtuple("usage", "total used free")
+        monkeypatch.setattr(
+            ss.shutil, "disk_usage", lambda _p: usage(1000, 400, 600)
+        )
         local_avail = jbod.get_available_space()
         jbod.add_source(_FakeRemoteSource("remote-offline"))
         assert jbod.get_available_space() == local_avail

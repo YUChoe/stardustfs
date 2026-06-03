@@ -15,6 +15,27 @@ from stardustlib.cli.format import echo, print_json, print_table
 from stardustlib.exceptions import InsufficientStorageError
 
 
+def _vpath(path: str | None) -> str:
+    """CLI 입력 가상 경로를 정규화한다.
+
+    선행 슬래시가 없으면 붙인다 → 사용자는 상대 경로(`foo/bar`)를 쓸 수 있고, 이는
+    Git Bash의 MSYS 경로 변환(`/foo` → Windows 경로)을 회피한다. 백슬래시는
+    슬래시로, 중복 슬래시는 단일로 정리한다. 빈 값/`.`은 루트(`/`).
+    """
+    if not path:
+        return "/"
+    s = path.replace("\\", "/").strip()
+    if s in ("", ".", "./"):
+        return "/"
+    if not s.startswith("/"):
+        s = "/" + s
+    while "//" in s:
+        s = s.replace("//", "/")
+    if len(s) > 1:
+        s = s.rstrip("/")
+    return s
+
+
 def _join(base: str, name: str) -> str:
     """디렉토리 경로와 엔트리 이름을 가상 경로로 결합한다."""
     return base.rstrip("/") + "/" + name
@@ -48,7 +69,7 @@ def cmd_ls(session, args) -> int:
     파일은 소유 device_id를 함께 표시한다(로컬 메타데이터 기준). 온라인 세션이면
     self device는 'this'로 표시한다.
     """
-    base = args.path
+    base = _vpath(args.path)
     entries = session.jbod.list_directory(base)
     self_id = session.self_device_id
 
@@ -236,7 +257,7 @@ def _note_propagation(session) -> str:
 async def cmd_put(session, args) -> int:
     """로컬 파일을 가상 경로로 업로드한다 (암호화·소스 저장·메타데이터·전파)."""
     local = args.local
-    remote = args.remote or ("/" + os.path.basename(local))
+    remote = _vpath(args.remote) if args.remote else "/" + os.path.basename(local)
     try:
         with open(local, "rb") as f:
             data = f.read()
@@ -261,7 +282,7 @@ async def cmd_put(session, args) -> int:
 
 async def cmd_get(session, args) -> int:
     """가상 경로의 파일을 로컬로 다운로드한다 (소유 device에서 fetch·복호화)."""
-    remote = args.remote
+    remote = _vpath(args.remote)
     local = args.local or os.path.basename(remote.rstrip("/"))
     try:
         data = session.jbod.read_file(remote)
@@ -285,7 +306,7 @@ async def cmd_get(session, args) -> int:
 
 async def cmd_rm(session, args) -> int:
     """파일 또는 디렉토리(-r)를 삭제한다 (tombstone·전파)."""
-    path = args.path
+    path = _vpath(args.path)
     try:
         if args.recursive:
             session.jbod.delete_directory(path)
@@ -305,15 +326,16 @@ async def cmd_rm(session, args) -> int:
 
 async def cmd_mkdir(session, args) -> int:
     """디렉토리를 생성한다 (전파)."""
-    session.jbod.create_directory(args.path)
+    path = _vpath(args.path)
+    session.jbod.create_directory(path)
     await session.upload_if_online()
-    echo(f"디렉토리 생성: {args.path}{_note_propagation(session)}")
+    echo(f"디렉토리 생성: {path}{_note_propagation(session)}")
     return 0
 
 
 async def cmd_mv(session, args) -> int:
     """파일/디렉토리를 이동(이름변경)한다 (전파)."""
-    src, dst = args.src, args.dst
+    src, dst = _vpath(args.src), _vpath(args.dst)
     try:
         if session.jbod.file_exists(src):
             session.jbod.move_file(src, dst)
@@ -333,7 +355,7 @@ async def cmd_mv(session, args) -> int:
 
 async def cmd_cp(session, args) -> int:
     """파일을 복사한다 (전파)."""
-    src, dst = args.src, args.dst
+    src, dst = _vpath(args.src), _vpath(args.dst)
     try:
         session.jbod.copy_file(src, dst)
     except FileNotFoundError:
