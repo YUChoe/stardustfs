@@ -1,9 +1,5 @@
 # StardustFS 의존성 (pinned versions)
 
-# WebDAV 서버
-WsgiDAV==4.3.3
-cheroot==11.1.2
-
 # 암호화
 cryptography==48.0.0
 

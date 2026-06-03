@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""StardustFS - WebDAV 기반 암호화 가상 파일시스템."""
+"""StardustFS - 암호화 분산 파일시스템 (CLI + 상주 daemon)."""
 
 import argparse
 import asyncio
@@ -14,8 +14,6 @@ try:
 except ImportError:
     pass
 
-from stardustlib.initializer import initialize_system
-
 
 def _setup_logging() -> None:
     """표준 로깅 포맷을 설정하고 외부 라이브러리 로그를 억제한다."""
@@ -26,7 +24,6 @@ def _setup_logging() -> None:
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
-    logging.getLogger("wsgidav").setLevel(logging.WARNING)
 
 
 def main() -> None:
@@ -103,11 +100,14 @@ def _run_daemon(config_path: str) -> None:
 
     version = config.get("version")  # type: ignore[attr-defined]
 
-    if version == 2:
-        asyncio.run(startup_v2(config, config_path))
-    else:
-        # v1: 기존 초기화 흐름 (레거시, WebDAV)
-        _startup_v1(config_path, config)
+    if version != 2:
+        logging.error(
+            "지원하지 않는 설정 버전입니다: %s (v2 필요). "
+            "WebDAV 기반 v1 흐름은 제거되었습니다.", version,
+        )
+        sys.exit(1)
+
+    asyncio.run(startup_v2(config, config_path))
 
 
 def _daemon_status(config_path: str) -> int:
@@ -150,32 +150,12 @@ def _daemon_stop(config_path: str) -> int:
     return 1
 
 
-def _startup_v1(config_path: str, config: dict) -> None:
-    """v1 설정 기반 기존 초기화 흐름 (cheroot WebDAV 서버)."""
-    app, config = initialize_system(config_path)
-
-    from cheroot.wsgi import Server as WSGIServer
-
-    host = config["webdav"]["host"]
-    port = config["webdav"]["port"]
-
-    server = WSGIServer((host, port), app)
-    logging.info("WebDAV 서버 시작: http://%s:%d/", host, port)
-
-    try:
-        server.start()
-    except KeyboardInterrupt:
-        logging.info("서버 종료 중...")
-    finally:
-        server.stop()
-
-
 async def startup_v2(config: dict, config_path: str) -> None:
     """v2 설정 기반 MVP2 초기화 흐름.
 
     순서: (1) 설정 로드 → (2) 인증 → (3) key_file 복원 (필요 시)
     → (4) 로컬 스토리지 초기화 → (5) 디바이스 등록
-    → (6) 메타데이터 동기화 → (7) P2P 서버 시작 → (8) WebDAV 서버 시작
+    → (6) 메타데이터 동기화 → (7) P2P 서버 시작 → (8) 상주 루프(daemon.serve)
 
     인증 실패 시 오프라인 모드 (key_file이 로컬에 있어야 동작 가능).
     메타데이터 동기화 실패 시 로컬 DB만 사용.

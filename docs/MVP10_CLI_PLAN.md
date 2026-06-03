@@ -130,10 +130,15 @@ Git/foo`가 되어 실패한다. 검증·사용 시 `MSYS_NO_PATHCONV=1` 필요.
 - [x] 테스트: tests/test_daemon_lifecycle.py 5종(status 전이/stale/stop/serve
       통합). 오프라인 config로 start→status→stop→중복거부 실측 통과
 
-### Phase 5b — WebDAV 모듈/의존 삭제 (예정)
-- [ ] webdav_provider.py 삭제 + 관련 테스트(test_webdav_provider/app/placeholder) 제거/대체
-- [ ] requirements.txt에서 WsgiDAV/cheroot 제거
-- [ ] config의 webdav 섹션 정리(레거시 v1 _startup_v1도 함께 정리)
+### Phase 5b — WebDAV 모듈/의존 삭제 (진행 중)
+- [x] webdav_provider.py 삭제 + 관련 테스트(test_webdav_provider/app/placeholder) 제거
+- [x] initializer.py 삭제 + test_initializer.py 제거 (webdav_provider 전용 의존이었음)
+- [x] 레거시 v1 제거: `_startup_v1` 삭제, `_run_daemon`은 v2 전용(v1 설정은 에러),
+      `initialize_system` import 제거, wsgidav 로거 억제 제거
+- [x] requirements.txt에서 WsgiDAV/cheroot 제거
+- [ ] config의 webdav 섹션/스키마/검증은 이번 범위에서 제외(유지). 무시되는 선택적
+      값이고 제거 시 config 테스트 3종(loader/pbt/migration)까지 연쇄되어 churn 과다 →
+      별도 정리 단계로 분리
 
 ### Phase 6 — 문서/스펙
 - [ ] `.kiro/specs/cli-virtual-fileserver/`에 requirements/design/tasks 작성
