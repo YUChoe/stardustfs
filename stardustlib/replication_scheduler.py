@@ -27,6 +27,7 @@ class ReplicationScheduler:
         heal_interval: float = 3600.0,
         heal_grace_seconds: float = 86400.0,
         max_files_per_cycle: int = 20,
+        backup_concurrency: int = 4,
         policy_fetcher=None,
         on_policy=None,
         policy_interval: float = 3600.0,
@@ -38,6 +39,7 @@ class ReplicationScheduler:
         self._heal_interval = heal_interval
         self._heal_grace = heal_grace_seconds
         self._max = max_files_per_cycle
+        self._backup_concurrency = max(1, backup_concurrency)
         # 정책 주기 갱신: policy_fetcher()(async)→dict|None, on_policy(dict) 적용 콜백.
         self._policy_fetcher = policy_fetcher
         self._on_policy = on_policy
@@ -119,24 +121,37 @@ class ReplicationScheduler:
         paths = self._metadata.list_virtual_paths_for_replication(
             ("none", "pending"), self._owner_device_id
         )
-        processed = 0
-        for vpath in paths[: self._max]:
+        targets = [
+            vp for vp in paths[: self._max] if vp not in self._skip_backup
+        ]
+        if not targets:
+            return 0
+
+        # 제한된 동시성으로 병렬 백업한다(한 파일이 직접 연결 타임아웃을 기다리는
+        # 동안 다른 파일이 진행). MetadataStore는 스레드별 연결 + WAL이라 안전하다.
+        sem = asyncio.Semaphore(self._backup_concurrency)
+        done = [0]
+
+        async def _one(vpath: str) -> None:
             if self._stop.is_set():
-                break
-            if vpath in self._skip_backup:
-                continue  # 로컬에 없는 파일(다른 device 소유) — 재시도 안 함
-            try:
-                result = await asyncio.to_thread(self._manager.replicate, vpath)
-                processed += 1
-                logger.info("자동 백업: %s → %s", vpath, result.status)
-            except FileNotFoundError:
-                # 이 device에 물리 파일이 없음(다른 device 소유의 NULL 레코드 등).
-                # 그 device가 백업하므로 여기서는 조용히 건너뛰고 캐시한다.
-                self._skip_backup.add(vpath)
-                logger.debug("로컬에 없어 백업 건너뜀(타 device 소유 추정): %s", vpath)
-            except Exception as e:  # noqa: BLE001 — 실패 격리
-                logger.warning("자동 백업 실패(건너뜀): %s: %s", vpath, e)
-        return processed
+                return
+            async with sem:
+                try:
+                    result = await asyncio.to_thread(
+                        self._manager.replicate, vpath
+                    )
+                    done[0] += 1
+                    logger.info("자동 백업: %s → %s", vpath, result.status)
+                except FileNotFoundError:
+                    # 이 device에 물리 파일이 없음(다른 device 소유 NULL 레코드 등).
+                    # 그 device가 백업하므로 조용히 건너뛰고 캐시한다.
+                    self._skip_backup.add(vpath)
+                    logger.debug("로컬에 없어 백업 건너뜀: %s", vpath)
+                except Exception as e:  # noqa: BLE001 — 파일 단위 실패 격리
+                    logger.warning("자동 백업 실패(건너뜀): %s: %s", vpath, e)
+
+        await asyncio.gather(*[_one(vp) for vp in targets])
+        return done[0]
 
     async def _heal_loop(self) -> None:
         while not self._stop.is_set():

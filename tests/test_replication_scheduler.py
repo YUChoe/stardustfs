@@ -113,7 +113,7 @@ async def test_backup_cycle_replicates_all_targets():
     sched = ReplicationScheduler(mgr, _FakeMeta(["/a", "/b", "/c"]), "devA")
     n = await sched.run_backup_cycle()
     assert n == 3
-    assert mgr.replicated == ["/a", "/b", "/c"]
+    assert set(mgr.replicated) == {"/a", "/b", "/c"}  # 병렬이라 순서 무관
 
 
 @pytest.mark.asyncio
@@ -139,7 +139,7 @@ async def test_backup_cycle_isolates_failure():
     sched = ReplicationScheduler(mgr, _FakeMeta(["/a", "/b", "/c"]), "devA")
     n = await sched.run_backup_cycle()
     assert n == 2  # /b 실패해도 /a,/c 진행
-    assert mgr.replicated == ["/a", "/c"]
+    assert set(mgr.replicated) == {"/a", "/c"}  # 병렬이라 순서 무관
 
 
 @pytest.mark.asyncio

@@ -536,6 +536,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
             heal_interval=repl_config.get("heal_interval_seconds", 3600),
             heal_grace_seconds=repl_config.get("heal_grace_seconds", 86400),
             max_files_per_cycle=repl_config.get("max_files_per_cycle", 20),
+            backup_concurrency=repl_config.get("backup_concurrency", 4),
             policy_fetcher=lambda: fetch_policy(auth_client, server_url),
             on_policy=_apply_policy,
             policy_interval=repl_config.get("policy_interval_seconds", 3600),

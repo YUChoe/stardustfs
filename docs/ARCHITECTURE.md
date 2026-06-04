@@ -102,20 +102,28 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
 키가 없어 보관 중인 청크를 복호화할 수 없다.
 
 - backup: 평문을 AES-256-GCM으로 자체 포함 암호문 blob으로 암호화 → 4MiB 청크 분할
-  → 청크 등록 + 서버 배치(placement: 용량·온라인·호혜 균형) → 각 청크를 ≥3 홀더의
-  ParityStore에 직접 push → 레지스트리 확정. ≥3 확보 시 replicated, 아니면
+  → 청크 등록 + 서버 배치(placement: 용량·온라인·호혜 균형, 소유자 자신 device는 제외)
+  → 각 청크를 홀더의 ParityStore에 push → 레지스트리 확정. 모든 청크가 목표
+  복제본 수(`min_replicas`, 기본 1=원본 외 1부)를 확보하면 replicated, 아니면
   pending(경고). file_ref/chunk_id는 가상경로 SHA-256(서버에 경로 비노출).
-- restore: 서버에서 청크 목록 조회 → 청크별 온라인·도달 가능한 홀더에서 fetch(스웜) →
-  결합 → 복호화 → 로컬 복원. 도달 불가 청크가 있으면 누락 chunk_id 명시 에러.
+- 복제본 전송: 홀더로 직접 HTTP push/fetch를 짧은 타임아웃(`DIRECT_HOLDER_TIMEOUT`,
+  3s)으로 시도하고, 직접 연결 실패(NAT·이중 NAT) 시 같은 사용자 릴레이로 fallback한다
+  (RemoteSource와 동일 원리). 직접 비-200(쿼터 등)은 릴레이하지 않는다.
+- restore: 서버에서 청크 목록 조회 → 청크별 온라인·도달 가능한 홀더에서 fetch(스웜,
+  직접→릴레이) → 결합 → 복호화 → 로컬 복원. 도달 불가 청크가 있으면 누락 chunk_id
+  명시 에러.
 - heal: 청크별 online 복제 수가 부족하면 온라인 홀더에서 받아(불변 청크) 새 홀더로
   복사. 호스트는 키가 없어 청크를 복호화할 수 없다.
 - 운영 활성화(`replication.enabled`, 기본 활성): daemon이 시작 시 GET
   `/replication/policy`로 호혜 비율·목표 복제본 수를 내려받아 적용하고(주기 갱신),
-  `provided_bytes`를 서버에 신고하며 ParityStore를 `provided*비율`로 켠다(provided
-  미설정 시 0=타인 보관 안 함). `replication_scheduler`가 백그라운드로 미복제(none)
-  로컬 파일을 자동 backup하고, degraded가 유예(`heal_grace_seconds`, 기본 24h) 이상
-  지속되면 heal한다(파일 단위 실패 격리, asyncio.to_thread로 루프 비차단). CLI
-  `backup`/`restore`/`heal`은 수동 경로로 항상 사용 가능.
+  `provided_bytes`(미설정 시 로컬 총 용량)를 서버에 신고하며 ParityStore를
+  `provided*비율`로 켠다. `replication_scheduler`가 백그라운드로 미복제(none)·미달
+  (pending) 로컬 파일을 자동 backup하고(제한된 동시성 `backup_concurrency`로 병렬,
+  한 파일이 연결 타임아웃을 기다리는 동안 다른 파일 진행), replicated가 degraded로
+  떨어진 채 유예(`heal_grace_seconds`, 기본 24h) 이상 지속되면 heal한다. 파일 단위
+  실패 격리, 로컬에 없는 파일(타 device 소유)은 건너뛰어 캐시. MetadataStore는
+  스레드별 sqlite 연결 + WAL이라 병렬 백업이 안전하다. CLI `backup`/`restore`/`heal`은
+  수동 경로로 항상 사용 가능.
 
 ## 설계 결정 (요약)
 

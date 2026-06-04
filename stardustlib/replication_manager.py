@@ -33,6 +33,8 @@ from stardustlib.remote_source import _EventLoopThread
 logger = logging.getLogger(__name__)
 
 DEFAULT_MIN_REPLICAS = 1  # 원본 외 추가 사본 수. 서버 /replication/policy로 재정의됨.
+# 홀더 직접 연결 시도 타임아웃(초). 짧게 잡아 도달 불가 시 릴레이로 빨리 fallback.
+DIRECT_HOLDER_TIMEOUT = 3.0
 
 
 class ReplicationError(Exception):
@@ -475,6 +477,7 @@ class ReplicationManager:
                 resp = await self._client.post(
                     f"http://{address}/p2p/replica_store",
                     json={**body, "auth_token": token},
+                    timeout=DIRECT_HOLDER_TIMEOUT,
                 )
                 return resp.status_code == 200
             except (httpx.TimeoutException, httpx.NetworkError):
@@ -501,6 +504,7 @@ class ReplicationManager:
                 resp = await self._client.post(
                     f"http://{address}/p2p/replica_fetch",
                     json={**body, "auth_token": token},
+                    timeout=DIRECT_HOLDER_TIMEOUT,
                 )
                 if resp.status_code == 200:
                     try:
