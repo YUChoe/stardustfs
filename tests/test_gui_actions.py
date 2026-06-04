@@ -52,7 +52,9 @@ def test_replica_counts_empty_when_offline(tmp_path):
     cfg_path = actions.create_config(
         str(base), "", "dev-rc", generate_key=True
     )
-    assert actions.replica_counts(cfg_path, "/") == {}
+    assert actions.replica_counts(cfg_path, "/", ["a", "b"]) == {}
+    # 대상 없음(names=[]) → 서버 조회 자체를 건너뜀
+    assert actions.replica_counts(cfg_path, "/", []) == {}
 
 
 def test_created_config_validates(tmp_path):

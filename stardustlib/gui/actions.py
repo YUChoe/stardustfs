@@ -215,22 +215,49 @@ def devices_list(config_path: str) -> list[dict]:
     return asyncio.run(_run_online(config_path, aop, sync=False))
 
 
-def replica_counts(config_path: str, vpath: str) -> dict:
-    """디렉토리 내 파일별 실제 복제본 수(온라인 홀더)를 조회한다.
+def replica_counts(config_path: str, vpath: str, names: list[str]) -> dict:
+    """주어진 파일들의 실제 복제본 수(온라인 홀더)를 조회한다.
 
     {name: {"online": int, "chunks": int, "min": int}}. 로그인 안 됐거나 서버 도달
-    불가면 빈 dict(상태 컬럼만 유지). 파일마다 서버 조회가 발생하므로 비용이 있다.
-    """
-    base = _vpath(vpath)
+    불가/저장된 청크 없음이면 해당 항목 생략(상태 컬럼만 유지).
 
-    async def aop(s):
-        mgr = s.make_replication_manager()
+    open_online(전체 코어 재빌드·원격 마운트)을 쓰지 않고, 캐시된 오프라인 세션과
+    경량 토큰만으로 서버 조회한다 — 새로고침마다 스토리지 초기화가 반복되지 않는다.
+    replication_health는 jbod/metadata를 쓰지 않고 서버 API만 호출한다.
+    """
+    if not names:
+        return {}
+    base = _vpath(vpath)
+    config = ConfigLoader(config_path).load()
+    server = config.get("server")
+    server_url = server.get("url") if isinstance(server, dict) else None
+    if not server_url:
+        return {}
+    session = _offline_session(config_path)  # 캐시 재사용(재초기화 없음)
+
+    async def run() -> dict:
+        from stardustlib.auth_client import AuthClient
+        from stardustlib.credential_store import CredentialStore
+        from stardustlib.exceptions import AuthenticationError
+        from stardustlib.replication_manager import ReplicationManager
+
+        store = CredentialStore(config["metadata_db"])
+        auth = AuthClient(server_url, credential_store=store)
+        if not auth.load_from_store():
+            await auth.close()
+            return {}
+        try:
+            await auth.get_valid_token()
+        except AuthenticationError:
+            await auth.close()
+            return {}
+        mgr = ReplicationManager(
+            auth, server_url, session.metadata, session.jbod
+        )
         out: dict = {}
         try:
-            for e in s.jbod.list_directory(base):
-                if e.is_directory:
-                    continue
-                vp = base.rstrip("/") + "/" + e.name
+            for name in names:
+                vp = base.rstrip("/") + "/" + name
                 try:
                     summary = await asyncio.to_thread(
                         mgr.replication_health, vp
@@ -238,17 +265,18 @@ def replica_counts(config_path: str, vpath: str) -> dict:
                 except Exception:  # noqa: BLE001 — 파일 단위 격리
                     continue
                 if summary.chunk_count > 0:
-                    out[e.name] = {
+                    out[name] = {
                         "online": summary.min_online,
                         "chunks": summary.chunk_count,
                         "min": mgr.min_replicas,
                     }
         finally:
             mgr.close()
+            await auth.close()
         return out
 
     try:
-        return asyncio.run(_run_online(config_path, aop, sync=False))
+        return asyncio.run(run())
     except Exception:  # noqa: BLE001 — 오프라인/미로그인 시 상태만 표시
         return {}
 

@@ -375,12 +375,17 @@ class StardustApp:
             used=_human(d["used"]), total=_human(d["total"]),
             avail=_human(d["available"]), pending=d["pending"],
         ))
-        # 온라인이면 실제 복제본 수를 백그라운드로 조회해 백업 컬럼에 병기한다.
+        # 로컬 상태가 pending/replicated인 파일만 실제 복제본 수를 백그라운드 조회해
+        # 병기한다. none(미백업) 뿐이면 서버 조회를 생략한다(불필요한 초기화/호출 방지).
         # (조용한 보강 — worker 콜백은 (ok, payload) 시그니처, 실패 시 상태만 유지)
-        if self._logged_in():
+        names = [
+            r["name"] for r in d["rows"]
+            if r["type"] == "file" and r.get("backup") in ("pending", "replicated")
+        ]
+        if names and self._logged_in():
             cfg, vp = self.config_path, self.vpath
             self.worker.submit(
-                lambda: actions.replica_counts(cfg, vp),
+                lambda: actions.replica_counts(cfg, vp, names),
                 lambda ok, counts: self._apply_counts(vp, counts) if ok else None,
             )
 
