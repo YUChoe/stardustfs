@@ -384,7 +384,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
     else:
         repl_provided = int(jbod_manager.get_total_space())
     repl_fraction = float(repl_config.get("reciprocity_fraction", _RECIPROCITY_FRACTION))
-    repl_min = int(repl_config.get("min_replicas", 2))
+    repl_min = int(repl_config.get("min_replicas", 1))
     if repl_enabled:
         from stardustlib.replication_hosting import fetch_policy, report_hosting
 

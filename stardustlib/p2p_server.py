@@ -206,6 +206,21 @@ class P2PServer:
         share_token이 payload에 있어도 dispatch 경로에서는 무시한다(릴레이는
         같은 유저 디바이스 간만 허용되므로 공유 토큰 경로가 필요 없음).
         """
+        # 패리티(복제본) op: 릴레이는 같은 user 간만 중개하므로 요청자=로컬 user.
+        # 소유자=요청자 인가는 ParityStore가 청크 단위로 집행한다.
+        if op in ("replica_store", "replica_fetch", "replica_delete"):
+            requester = self._auth_client.user_id
+            replica_map = {
+                "replica_store": self._op_replica_store,
+                "replica_fetch": self._op_replica_fetch,
+                "replica_delete": self._op_replica_delete,
+            }
+            try:
+                return replica_map[op](payload, requester)
+            except Exception as e:  # noqa: BLE001
+                logger.error("Relay replica op=%s 실패: %s", op, e, exc_info=True)
+                return 500, {"error": "Internal error"}
+
         op_map = {
             "read": self._op_read,
             "write": self._op_write,

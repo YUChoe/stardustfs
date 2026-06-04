@@ -5,8 +5,10 @@
 """
 from __future__ import annotations
 
+import base64
 import os
 
+import httpx
 import pytest
 
 from stardustlib.encryption_engine import EncryptionEngine
@@ -84,7 +86,7 @@ class _Cloud:
             ]
             return avail if cloud.cap is None else avail[: cloud.cap]
 
-        async def holder_store(address, chunk_id, data, token):
+        async def holder_store(device_id, address, chunk_id, data, token):
             if address in cloud.store_fail:
                 return False
             cloud.holder_store.setdefault(address, {})[chunk_id] = data
@@ -104,7 +106,7 @@ class _Cloud:
                 for d in cloud.registry.get(chunk_id, [])
             ]
 
-        async def holder_fetch(address, chunk_id, token):
+        async def holder_fetch(device_id, address, chunk_id, token):
             return cloud.holder_store.get(address, {}).get(chunk_id)
 
         mgr._register_chunk = register_chunk
@@ -256,6 +258,71 @@ def test_ensure_replicas_unrecoverable_when_no_online_source(key):
     assert report.status == "pending"
     assert len(report.unrecoverable) == report.chunk_count
     assert meta.status["/f"] == "pending"
+
+
+def _bare_manager(key):
+    jbod = _FakeJbod(key)
+    return ReplicationManager(
+        _FakeAuth(), "http://server", _FakeMeta(set()), jbod, min_replicas=2
+    )
+
+
+@pytest.mark.asyncio
+async def test_holder_store_relay_fallback_on_connect_error(key):
+    """직접 연결 실패(NAT) 시 같은 사용자 릴레이로 store가 성공한다."""
+    mgr = _bare_manager(key)
+    seen = {}
+
+    async def boom(*a, **k):
+        raise httpx.ConnectError("unreachable")
+
+    async def fake_relay(device_id, op, payload):
+        seen.update(device_id=device_id, op=op, chunk=payload["chunk_id"])
+        return {"bytes_written": 5}
+
+    mgr._client.post = boom
+    mgr._relay_op = fake_relay
+    ok = await mgr._holder_store("devX", "1.2.3.4:9090", "c1", b"cipher", "tok")
+    assert ok is True
+    assert seen == {"device_id": "devX", "op": "replica_store", "chunk": "c1"}
+
+
+@pytest.mark.asyncio
+async def test_holder_fetch_relay_fallback_on_connect_error(key):
+    mgr = _bare_manager(key)
+
+    async def boom(*a, **k):
+        raise httpx.ConnectError("unreachable")
+
+    async def fake_relay(device_id, op, payload):
+        return {"data": base64.b64encode(b"cipher").decode("ascii")}
+
+    mgr._client.post = boom
+    mgr._relay_op = fake_relay
+    data = await mgr._holder_fetch("devX", "1.2.3.4:9090", "c1", "tok")
+    assert data == b"cipher"
+
+
+@pytest.mark.asyncio
+async def test_holder_store_no_relay_on_non_connection_error(key):
+    """직접 비-200(쿼터 등)은 릴레이하지 않고 False(릴레이해도 동일 홀더)."""
+    mgr = _bare_manager(key)
+    relayed = {"called": False}
+
+    class _Resp:
+        status_code = 507
+
+    async def post(*a, **k):
+        return _Resp()
+
+    async def fake_relay(device_id, op, payload):
+        relayed["called"] = True
+        return {}
+
+    mgr._client.post = post
+    mgr._relay_op = fake_relay
+    ok = await mgr._holder_store("devX", "1.2.3.4:9090", "c1", b"x", "tok")
+    assert ok is False and relayed["called"] is False
 
 
 def test_file_ref_does_not_leak_path(key):

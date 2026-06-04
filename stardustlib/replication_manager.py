@@ -32,7 +32,7 @@ from stardustlib.remote_source import _EventLoopThread
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MIN_REPLICAS = 2  # 무료/기본 정책. 서버 /replication/policy로 재정의됨.
+DEFAULT_MIN_REPLICAS = 1  # 원본 외 추가 사본 수. 서버 /replication/policy로 재정의됨.
 
 
 class ReplicationError(Exception):
@@ -216,18 +216,23 @@ class ReplicationManager:
         self, file_ref: str, chunks: list[tuple[int, bytes]]
     ) -> ReplicationResult:
         token = await self._token()
+        # 소유자 자신의 device는 홀더에서 제외한다(자기 기기에 백업은 무의미·헤어핀 실패).
+        self_dev = getattr(self._jbod, "device_id", None)
+        exclude = [self_dev] if self_dev else []
         replicas_per_chunk: list[int] = []
         for idx, data in chunks:
             chunk_id = self._chunk_id(file_ref, idx)
             await self._register_chunk(token, chunk_id, file_ref, idx, len(data))
-            holders = await self._placement(token, len(data), exclude=[])
+            holders = await self._placement(token, len(data), exclude=exclude)
             placed = 0
             for holder in holders:
                 address = holder.get("connection_address")
                 device_id = holder.get("device_id")
-                if not address or not device_id:
+                if not device_id:
                     continue
-                if await self._holder_store(address, chunk_id, data, token):
+                if await self._holder_store(
+                    device_id, address, chunk_id, data, token
+                ):
                     if await self._record_replica(token, chunk_id, device_id):
                         placed += 1
             replicas_per_chunk.append(placed)
@@ -328,7 +333,7 @@ class ReplicationManager:
         data = None
         for h in online:
             data = await self._holder_fetch(
-                h["connection_address"], chunk_id, token
+                h.get("device_id"), h.get("connection_address"), chunk_id, token
             )
             if data is not None:
                 break
@@ -336,18 +341,22 @@ class ReplicationManager:
             # 도달 가능한 소스가 없어 복제 불가 — 데이터 자체는 다른 곳에 있을 수 있음.
             return {"chunk_id": chunk_id, "added": 0, "healthy": False}
 
-        candidates = await self._placement(
-            token, len(data), exclude=current_devices
-        )
+        self_dev = getattr(self._jbod, "device_id", None)
+        exclude = list(current_devices)
+        if self_dev and self_dev not in exclude:
+            exclude.append(self_dev)
+        candidates = await self._placement(token, len(data), exclude=exclude)
         added = 0
         for cand in candidates:
             if added >= need:
                 break
             address = cand.get("connection_address")
             device_id = cand.get("device_id")
-            if not address or not device_id:
+            if not device_id:
                 continue
-            if await self._holder_store(address, chunk_id, data, token):
+            if await self._holder_store(
+                device_id, address, chunk_id, data, token
+            ):
                 if await self._record_replica(token, chunk_id, device_id):
                     added += 1
         return {
@@ -364,10 +373,11 @@ class ReplicationManager:
         for holder in holders:
             if holder.get("is_online") is False:
                 continue
+            device_id = holder.get("device_id")
             address = holder.get("connection_address")
-            if not address:
+            if not device_id and not address:
                 continue
-            data = await self._holder_fetch(address, chunk_id, token)
+            data = await self._holder_fetch(device_id, address, chunk_id, token)
             if data is not None:
                 return data
         return None
@@ -439,39 +449,75 @@ class ReplicationManager:
     # 홀더 직접 전송 (단위 테스트에서 패치 가능)
     # ------------------------------------------------------------------
 
-    async def _holder_store(
-        self, address: str, chunk_id: str, data: bytes, token: str
-    ) -> bool:
-        """홀더의 P2P /p2p/replica_store로 청크 암호문을 push한다.
+    async def _relay_op(self, device_id: str, op: str, payload: dict) -> dict:
+        """같은 사용자 device로 릴레이 op를 전달한다(직접 연결 실패 시 fallback).
 
-        도달 불가/거부 시 False(해당 홀더만 실패, 다음 홀더로 진행).
+        RelayClient는 status!=200/도달 불가 시 OSError를 던진다.
+        """
+        from stardustlib.relay_client import RelayClient
+
+        relay = RelayClient(self._auth, self._server_url, device_id, self._io)
+        return await relay.request_async(op, payload)
+
+    async def _holder_store(
+        self, device_id: str, address: str, chunk_id: str,
+        data: bytes, token: str,
+    ) -> bool:
+        """홀더에 청크 암호문을 push한다. 직접 연결 실패 시 릴레이로 fallback한다.
+
+        직접 200 → True. 직접 비-200(쿼터 등) → False(릴레이해도 동일). 직접 연결
+        불가(NAT) → 같은 사용자 릴레이 시도. 모두 실패 시 False(다음 홀더로 진행).
         """
         encoded = base64.b64encode(data).decode("ascii")
-        try:
-            resp = await self._client.post(
-                f"http://{address}/p2p/replica_store",
-                json={"chunk_id": chunk_id, "data": encoded, "auth_token": token},
-            )
-        except (httpx.TimeoutException, httpx.NetworkError) as e:
-            logger.info("홀더 store 실패(%s): %s", address, e)
+        body = {"chunk_id": chunk_id, "data": encoded}
+        if address:
+            try:
+                resp = await self._client.post(
+                    f"http://{address}/p2p/replica_store",
+                    json={**body, "auth_token": token},
+                )
+                return resp.status_code == 200
+            except (httpx.TimeoutException, httpx.NetworkError):
+                pass  # 직접 실패 → 릴레이 fallback
+        if not device_id:
             return False
-        return resp.status_code == 200
+        try:
+            await self._relay_op(device_id, "replica_store", body)
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.info(
+                "홀더 store 실패(direct+relay) dev=%s addr=%s: %s",
+                device_id, address, e,
+            )
+            return False
 
     async def _holder_fetch(
-        self, address: str, chunk_id: str, token: str
+        self, device_id: str, address: str, chunk_id: str, token: str
     ) -> bytes | None:
-        """홀더의 P2P /p2p/replica_fetch로 청크 암호문을 받는다(실패 시 None)."""
+        """홀더에서 청크 암호문을 받는다. 직접 실패 시 릴레이로 fallback(실패 시 None)."""
+        body = {"chunk_id": chunk_id}
+        if address:
+            try:
+                resp = await self._client.post(
+                    f"http://{address}/p2p/replica_fetch",
+                    json={**body, "auth_token": token},
+                )
+                if resp.status_code == 200:
+                    try:
+                        return base64.b64decode(resp.json()["data"])
+                    except (KeyError, ValueError):
+                        return None
+                return None  # 404/403 등은 릴레이해도 동일
+            except (httpx.TimeoutException, httpx.NetworkError):
+                pass  # 직접 실패 → 릴레이 fallback
+        if not device_id:
+            return None
         try:
-            resp = await self._client.post(
-                f"http://{address}/p2p/replica_fetch",
-                json={"chunk_id": chunk_id, "auth_token": token},
+            result = await self._relay_op(device_id, "replica_fetch", body)
+            return base64.b64decode(result["data"])
+        except Exception as e:  # noqa: BLE001
+            logger.info(
+                "홀더 fetch 실패(direct+relay) dev=%s addr=%s: %s",
+                device_id, address, e,
             )
-        except (httpx.TimeoutException, httpx.NetworkError) as e:
-            logger.info("홀더 fetch 실패(%s): %s", address, e)
-            return None
-        if resp.status_code != 200:
-            return None
-        try:
-            return base64.b64decode(resp.json()["data"])
-        except (KeyError, ValueError):
             return None
