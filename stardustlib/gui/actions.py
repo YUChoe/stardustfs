@@ -476,12 +476,15 @@ def daemon_start(config_path: str) -> int:
     config = ConfigLoader(config_path).load()
     log_path = config["metadata_db"] + ".daemon.log"
     log_file = open(log_path, "a", encoding="utf-8")
+    # 자식 프로세스가 로그를 UTF-8로 쓰도록 강제(Windows 기본 cp949 → 파일 mojibake 방지).
+    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
     try:
         proc = subprocess.Popen(
             [sys.executable, "stardustfs.py", "daemon", "--config", config_path],
             cwd=_REPO_ROOT,
             stdout=log_file,
             stderr=subprocess.STDOUT,
+            env=env,
         )
     finally:
         log_file.close()  # 자식이 자체 핸들을 보유하므로 부모 핸들은 닫는다
