@@ -4,19 +4,10 @@
 """
 
 from dataclasses import dataclass
-from typing import Literal, TypedDict
+from typing import Literal, TypeAlias, TypedDict
 
 
 # --- 설정 스키마 (Configuration Schema) ---
-
-
-class WebDAVConfig(TypedDict):
-    """WebDAV 서비스 설정."""
-
-    host: str       # 바인드 호스트 (고정: "127.0.0.1")
-    port: int       # 바인드 포트 (기본: 8080)
-    username: str   # Basic Auth 사용자명
-    password: str   # Basic Auth 비밀번호
 
 
 class DirectorySourceConfig(TypedDict):
@@ -40,13 +31,62 @@ SourceConfig = DirectorySourceConfig | LoopbackSourceConfig
 
 
 class StardustConfig(TypedDict):
-    """StardustFS 전체 설정."""
+    """StardustFS 전체 설정 (v1)."""
 
     version: int                    # 설정 파일 버전 (현재 1)
-    webdav: WebDAVConfig            # WebDAV 서비스 설정
     sources: list[SourceConfig]     # 스토리지 소스 목록
     metadata_db: str                # SQLite DB 파일 경로
     key_file: str | None            # 암호화 키 파일 경로 (선택)
+
+
+# --- v2 설정 스키마 ---
+
+
+class ServerConfig(TypedDict):
+    """중앙 서버 연결 설정."""
+
+    url: str | None     # https:// URL 또는 None (오프라인 전용)
+    device_name: str    # 디바이스 이름 (1-64자)
+
+
+class SyncConfig(TypedDict):
+    """메타데이터 동기화 설정."""
+
+    interval_seconds: int                   # 동기화 간격 (10-3600초)
+    conflict_strategy: Literal["copy"]      # 충돌 해결 전략
+
+
+class P2PConfig(TypedDict):
+    """P2P 서버 설정."""
+
+    port: int       # P2P 포트 (1024-65535)
+    enabled: bool   # P2P 활성화 여부
+    auto_mount_devices: bool  # 내 다른 디바이스를 자동으로 remote 소스로 마운트 (기본 True)
+
+
+class RemoteSourceConfig(TypedDict):
+    """원격 디바이스 소스 설정."""
+
+    type: Literal["remote"]
+    id: str             # 소스 고유 ID
+    device_id: str      # RFC 4122 UUID (8-4-4-4-12)
+
+
+SourceConfigV2: TypeAlias = (
+    DirectorySourceConfig | LoopbackSourceConfig | RemoteSourceConfig
+)
+
+
+class StardustConfigV2(TypedDict):
+    """StardustFS v2 전체 설정."""
+
+    version: Literal[2]
+    server: ServerConfig
+    sources: list[SourceConfigV2]
+    sync: SyncConfig
+    p2p: P2PConfig
+    metadata_db: str
+    key_file: str | None
 
 
 # --- 런타임 데이터 모델 ---
@@ -62,6 +102,10 @@ class FileMetadata:
     file_size: int          # 0 이상, 바이트 단위
     created_at: float       # UTC 타임스탬프
     modified_at: float      # UTC 타임스탬프
+    version: int = 1        # 메타데이터 버전 (동기화용)
+    device_id: str | None = None    # 마지막 수정 디바이스 ID
+    sync_status: str = "synced"     # synced | pending | conflict
+    deleted: bool = False   # tombstone 여부 (삭제 동기화용)
 
 
 @dataclass

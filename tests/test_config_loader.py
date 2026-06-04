@@ -18,12 +18,6 @@ def valid_config(tmp_path: Path) -> dict:
     source_dir.mkdir()
     return {
         "version": 1,
-        "webdav": {
-            "host": "127.0.0.1",
-            "port": 8080,
-            "username": "admin",
-            "password": "secret",
-        },
         "sources": [
             {
                 "type": "directory",
@@ -51,19 +45,7 @@ class TestConfigLoaderLoad:
         loader = ConfigLoader(str(config_file))
         config = loader.load()
         assert config["version"] == 1
-        assert config["webdav"]["host"] == "127.0.0.1"
-        assert config["webdav"]["port"] == 8080
         assert len(config["sources"]) == 1
-
-    def test_load_forces_host_to_localhost(self, tmp_path: Path, valid_config: dict):
-        """webdav.host가 다른 값이어도 127.0.0.1로 강제된다."""
-        valid_config["webdav"]["host"] = "0.0.0.0"
-        cfg_path = tmp_path / "config.json"
-        cfg_path.write_text(json.dumps(valid_config), encoding="utf-8")
-
-        loader = ConfigLoader(str(cfg_path))
-        config = loader.load()
-        assert config["webdav"]["host"] == "127.0.0.1"
 
     def test_load_file_not_found(self):
         loader = ConfigLoader("/nonexistent/path/config.json")
@@ -87,7 +69,7 @@ class TestConfigLoaderValidate:
         assert errors == []
 
     def test_invalid_version(self, valid_config: dict):
-        valid_config["version"] = 2
+        valid_config["version"] = 99
         loader = ConfigLoader("")
         errors = loader.validate(valid_config)
         assert any("version" in e for e in errors)
@@ -126,18 +108,6 @@ class TestConfigLoaderValidate:
         loader = ConfigLoader("")
         errors = loader.validate(valid_config)
         assert any("size" in e for e in errors)
-
-    def test_port_out_of_range(self, valid_config: dict):
-        valid_config["webdav"]["port"] = 70000
-        loader = ConfigLoader("")
-        errors = loader.validate(valid_config)
-        assert any("port" in e for e in errors)
-
-    def test_port_zero(self, valid_config: dict):
-        valid_config["webdav"]["port"] = 0
-        loader = ConfigLoader("")
-        errors = loader.validate(valid_config)
-        assert any("port" in e for e in errors)
 
     def test_key_file_not_exists(self, valid_config: dict):
         valid_config["key_file"] = "/nonexistent/key.bin"

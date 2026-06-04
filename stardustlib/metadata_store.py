@@ -8,7 +8,9 @@ pysqlcipher3가 사용 가능하면 암호화된 SQLite를 사용하고,
 """
 
 import logging
+import shutil
 import threading
+import time
 from typing import Any
 
 from stardustlib.models import EntryInfo, FileMetadata
@@ -96,11 +98,172 @@ class MetadataStore:
         conn = self._get_conn()
         conn.executescript(_SCHEMA_SQL)
         conn.commit()
+        self._migrate_to_v2()
+        self._migrate_to_v3()
+        self._migrate_to_v4()
         self._initialized = True
         logger.info("Metadata Store 초기화 완료: %s", self._db_path)
 
+    def _needs_migration(self) -> bool:
+        """v2 마이그레이션이 필요한지 판단한다.
+
+        schema_version 테이블이 존재하고 version >= 2이면 불필요.
+        files 테이블에 version 컬럼이 없으면 필요.
+        """
+        conn = self._get_conn()
+
+        # schema_version 테이블 존재 여부 확인
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='schema_version'"
+        )
+        if cursor.fetchone() is not None:
+            row = conn.execute(
+                "SELECT version FROM schema_version WHERE id = 1"
+            ).fetchone()
+            if row is not None and row["version"] >= 2:
+                return False
+
+        # files 테이블에 version 컬럼 존재 여부 확인
+        cursor = conn.execute("PRAGMA table_info(files)")
+        columns = [row["name"] for row in cursor.fetchall()]
+        if "version" in columns:
+            return False
+
+        return True
+
+    def _migrate_to_v2(self) -> None:
+        """v1 → v2 스키마 마이그레이션을 수행한다.
+
+        - DB 파일 백업 ("{원본}.v1.bak")
+        - files 테이블에 version, device_id, sync_status 컬럼 추가
+        - schema_version 테이블 생성 및 버전 기록
+        - 기존 레코드 초기값 설정
+        - 실패 시 트랜잭션 롤백
+        """
+        if not self._needs_migration():
+            return
+
+        # DB 파일 백업
+        backup_path = f"{self._db_path}.v1.bak"
+        try:
+            shutil.copy2(self._db_path, backup_path)
+            logger.info("DB 백업 생성: %s", backup_path)
+        except OSError as e:
+            logger.error("DB 백업 실패, 마이그레이션 중단: %s", e)
+            return
+
+        conn = self._get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            # files 테이블에 컬럼 추가
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN version INTEGER NOT NULL DEFAULT 1"
+            )
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN device_id TEXT"
+            )
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN sync_status TEXT DEFAULT 'synced'"
+            )
+
+            # 기존 레코드 초기값 설정
+            conn.execute(
+                "UPDATE files SET version = 1, sync_status = 'synced' "
+                "WHERE version = 1"
+            )
+
+            # schema_version 테이블 생성 및 버전 기록
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "    id INTEGER PRIMARY KEY CHECK (id = 1),"
+                "    version INTEGER NOT NULL,"
+                "    migrated_at REAL NOT NULL"
+                ")"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_version (id, version, migrated_at) "
+                "VALUES (1, 2, ?)",
+                (time.time(),),
+            )
+
+            conn.commit()
+            logger.info("MetadataStore v2 스키마 마이그레이션 완료")
+        except Exception as e:
+            conn.rollback()
+            logger.error("스키마 마이그레이션 실패, 롤백 수행: %s", e)
+            raise
+
+    def _migrate_to_v3(self) -> None:
+        """v2 → v3 스키마 마이그레이션을 수행한다.
+
+        - files 테이블에 deleted 컬럼 추가 (tombstone, 삭제 동기화용)
+        - schema_version을 3으로 갱신
+        이미 deleted 컬럼이 존재하면 아무 작업도 하지 않는다.
+        """
+        conn = self._get_conn()
+
+        cursor = conn.execute("PRAGMA table_info(files)")
+        columns = [row["name"] for row in cursor.fetchall()]
+        if "deleted" in columns:
+            return
+
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_version (id, version, migrated_at) "
+                "VALUES (1, 3, ?)",
+                (time.time(),),
+            )
+            conn.commit()
+            logger.info("MetadataStore v3 스키마 마이그레이션 완료 (tombstone)")
+        except Exception as e:
+            conn.rollback()
+            logger.error("v3 스키마 마이그레이션 실패, 롤백 수행: %s", e)
+            raise
+
+    def _migrate_to_v4(self) -> None:
+        """v3 → v4 스키마 마이그레이션을 수행한다.
+
+        - files 테이블에 replication_status 컬럼 추가 (none|pending|replicated)
+        - schema_version을 4로 갱신
+        이미 컬럼이 존재하면 아무 작업도 하지 않는다. 기존 레코드는 DEFAULT 'none'.
+        """
+        conn = self._get_conn()
+
+        cursor = conn.execute("PRAGMA table_info(files)")
+        columns = [row["name"] for row in cursor.fetchall()]
+        if "replication_status" in columns:
+            return
+
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN replication_status "
+                "TEXT NOT NULL DEFAULT 'none'"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_version (id, version, migrated_at) "
+                "VALUES (1, 4, ?)",
+                (time.time(),),
+            )
+            conn.commit()
+            logger.info(
+                "MetadataStore v4 스키마 마이그레이션 완료 (replication_status)"
+            )
+        except Exception as e:
+            conn.rollback()
+            logger.error("v4 스키마 마이그레이션 실패, 롤백 수행: %s", e)
+            raise
+
     # --- 파일 메타데이터 CRUD ---
 
+    _VALID_SYNC_STATUSES = ("synced", "pending", "conflict")
+    _VALID_REPLICATION_STATUSES = ("none", "pending", "replicated")
     def insert(
         self,
         virtual_path: str,
@@ -109,41 +272,239 @@ class MetadataStore:
         file_size: int,
         created_at: float,
         modified_at: float,
+        device_id: str | None = None,
     ) -> None:
-        """파일 메타데이터를 삽입한다."""
+        """파일 메타데이터를 삽입한다.
+
+        version=1, sync_status="pending"으로 초기 삽입한다.
+        device_id는 이 변경을 수행한 디바이스 ID (없으면 NULL).
+        동일 경로에 tombstone(삭제 마커)이 남아 있으면 재활성화한다.
+        """
         conn = self._get_conn()
+        # 동일 경로에 tombstone이 있으면 재활성화 (version 증가로 삭제보다 우선)
+        existing = conn.execute(
+            "SELECT version FROM files WHERE virtual_path = ?",
+            (virtual_path,),
+        ).fetchone()
+        if existing is not None:
+            conn.execute(
+                "UPDATE files SET source_id = ?, physical_path = ?, "
+                "file_size = ?, created_at = ?, modified_at = ?, "
+                "version = version + 1, sync_status = 'pending', deleted = 0, "
+                "device_id = ? "
+                "WHERE virtual_path = ?",
+                (source_id, physical_path, file_size, created_at, modified_at,
+                 device_id, virtual_path),
+            )
+            conn.commit()
+            return
         conn.execute(
             "INSERT INTO files "
-            "(virtual_path, source_id, physical_path, file_size, created_at, modified_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (virtual_path, source_id, physical_path, file_size, created_at, modified_at),
+            "(virtual_path, source_id, physical_path, file_size, "
+            "created_at, modified_at, version, sync_status, deleted, device_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1, 'pending', 0, ?)",
+            (virtual_path, source_id, physical_path, file_size, created_at,
+             modified_at, device_id),
         )
         conn.commit()
 
-    def update(self, virtual_path: str, file_size: int, modified_at: float) -> None:
-        """파일 메타데이터를 갱신한다."""
+    def update(
+        self,
+        virtual_path: str,
+        file_size: int,
+        modified_at: float,
+        device_id: str | None = None,
+        source_id: str | None = None,
+        physical_path: str | None = None,
+    ) -> None:
+        """파일 메타데이터를 갱신한다.
+
+        version을 1 증가시키고 sync_status를 "pending"으로 설정한다.
+        device_id는 이 변경을 수행한 디바이스 ID (없으면 기존 값 유지).
+        source_id/physical_path는 소유권 이전(takeover) 시 물리 위치를 함께
+        갱신하기 위해 사용한다 (없으면 기존 값 유지).
+        """
         conn = self._get_conn()
+        set_clauses = [
+            "file_size = ?",
+            "modified_at = ?",
+            "version = version + 1",
+            "sync_status = 'pending'",
+        ]
+        params: list = [file_size, modified_at]
+        if device_id is not None:
+            set_clauses.append("device_id = ?")
+            params.append(device_id)
+        if source_id is not None:
+            set_clauses.append("source_id = ?")
+            params.append(source_id)
+        if physical_path is not None:
+            set_clauses.append("physical_path = ?")
+            params.append(physical_path)
+        params.append(virtual_path)
         conn.execute(
-            "UPDATE files SET file_size = ?, modified_at = ? WHERE virtual_path = ?",
-            (file_size, modified_at, virtual_path),
+            f"UPDATE files SET {', '.join(set_clauses)} WHERE virtual_path = ?",
+            tuple(params),
         )
         conn.commit()
 
-    def delete(self, virtual_path: str) -> None:
-        """파일 메타데이터를 삭제한다."""
+    def increment_version(self, virtual_path: str, device_id: str) -> None:
+        """파일의 version을 1 증가시키고 device_id를 설정한다."""
         conn = self._get_conn()
         conn.execute(
-            "DELETE FROM files WHERE virtual_path = ?",
+            "UPDATE files SET version = version + 1, device_id = ? "
+            "WHERE virtual_path = ?",
+            (device_id, virtual_path),
+        )
+        conn.commit()
+
+    def set_sync_status(self, virtual_path: str, status: str) -> None:
+        """sync_status를 변경한다.
+
+        Args:
+            virtual_path: 대상 파일의 가상 경로.
+            status: 유효값 "synced", "pending", "conflict".
+
+        Raises:
+            ValueError: 유효하지 않은 status 값.
+        """
+        if status not in self._VALID_SYNC_STATUSES:
+            raise ValueError(
+                f"유효하지 않은 sync_status: {status!r}. "
+                f"허용값: {self._VALID_SYNC_STATUSES}"
+            )
+        conn = self._get_conn()
+        conn.execute(
+            "UPDATE files SET sync_status = ? WHERE virtual_path = ?",
+            (status, virtual_path),
+        )
+        conn.commit()
+
+    def set_replication_status(self, virtual_path: str, status: str) -> None:
+        """replication_status를 변경한다 (none|pending|replicated).
+
+        Raises:
+            ValueError: 유효하지 않은 status 값.
+        """
+        if status not in self._VALID_REPLICATION_STATUSES:
+            raise ValueError(
+                f"유효하지 않은 replication_status: {status!r}. "
+                f"허용값: {self._VALID_REPLICATION_STATUSES}"
+            )
+        conn = self._get_conn()
+        conn.execute(
+            "UPDATE files SET replication_status = ? WHERE virtual_path = ?",
+            (status, virtual_path),
+        )
+        conn.commit()
+
+    def get_replication_status(self, virtual_path: str) -> str | None:
+        """파일의 replication_status를 반환한다(레코드 없으면 None)."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT replication_status FROM files WHERE virtual_path = ?",
             (virtual_path,),
-        )
-        conn.commit()
+        ).fetchone()
+        return row["replication_status"] if row is not None else None
 
-    def lookup(self, virtual_path: str) -> FileMetadata | None:
-        """가상 경로로 파일 메타데이터를 조회한다."""
+    def list_virtual_paths_for_replication(
+        self, statuses: tuple[str, ...], owner_device_id: str | None = None
+    ) -> list[str]:
+        """리플리케이션 대상 가상 경로 목록을 반환한다(자동 백업/heal용).
+
+        deleted=0 이고 replication_status가 statuses 중 하나인 파일. owner_device_id가
+        주어지면 그 device 소유(또는 레거시 NULL=로컬)만 포함한다 — 다른 device가
+        소유한 원격 파일은 그 device가 백업하므로 제외한다.
+        """
+        if not statuses:
+            return []
+        conn = self._get_conn()
+        placeholders = ",".join("?" for _ in statuses)
+        sql = (
+            "SELECT virtual_path FROM files "
+            "WHERE deleted = 0 AND COALESCE(replication_status, 'none') "
+            f"IN ({placeholders})"
+        )
+        params: list = list(statuses)
+        if owner_device_id is not None:
+            sql += " AND (device_id = ? OR device_id IS NULL)"
+            params.append(owner_device_id)
+        rows = conn.execute(sql, tuple(params)).fetchall()
+        return [row["virtual_path"] for row in rows]
+
+    def get_pending_files(self) -> list[FileMetadata]:
+        """sync_status가 "pending"인 모든 파일 목록을 반환한다.
+
+        tombstone(deleted=1)도 pending이면 포함한다 (삭제 동기화 업로드 대상).
+        """
         conn = self._get_conn()
         cursor = conn.execute(
             "SELECT virtual_path, source_id, physical_path, file_size, "
-            "created_at, modified_at FROM files WHERE virtual_path = ?",
+            "created_at, modified_at, version, device_id, sync_status, deleted "
+            "FROM files WHERE sync_status = 'pending'"
+        )
+        results: list[FileMetadata] = []
+        for row in cursor.fetchall():
+            results.append(FileMetadata(
+                virtual_path=row["virtual_path"],
+                source_id=row["source_id"],
+                physical_path=row["physical_path"],
+                file_size=row["file_size"],
+                created_at=row["created_at"],
+                modified_at=row["modified_at"],
+                version=row["version"],
+                device_id=row["device_id"],
+                sync_status=row["sync_status"],
+                deleted=bool(row["deleted"]),
+            ))
+        return results
+
+    def delete(self, virtual_path: str) -> None:
+        """파일을 tombstone으로 표시한다 (soft delete).
+
+        실제 행을 제거하지 않고 deleted=1, version+1, sync_status='pending'으로
+        설정하여 삭제 사실이 다른 디바이스로 동기화되도록 한다.
+        """
+        conn = self._get_conn()
+        conn.execute(
+            "UPDATE files SET deleted = 1, version = version + 1, "
+            "sync_status = 'pending', modified_at = ? "
+            "WHERE virtual_path = ?",
+            (time.time(), virtual_path),
+        )
+        conn.commit()
+
+    def purge_expired_tombstones(self, retention_seconds: float) -> int:
+        """보관기간이 지난 tombstone을 물리적으로 제거한다 (GC).
+
+        deleted=1이고 modified_at이 (현재시각 - retention_seconds)보다 오래된
+        레코드만 삭제한다. 활성(deleted=0) 레코드는 절대 삭제하지 않는다.
+
+        Args:
+            retention_seconds: tombstone 보관기간(초).
+
+        Returns:
+            삭제된 tombstone 레코드 수.
+        """
+        cutoff = time.time() - retention_seconds
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "DELETE FROM files WHERE deleted = 1 AND modified_at < ?",
+            (cutoff,),
+        )
+        conn.commit()
+        return cursor.rowcount if cursor.rowcount is not None else 0
+
+    def lookup(self, virtual_path: str) -> FileMetadata | None:
+        """가상 경로로 파일 메타데이터를 조회한다.
+
+        tombstone(deleted=1)은 존재하지 않는 것으로 간주하여 None을 반환한다.
+        """
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "SELECT virtual_path, source_id, physical_path, file_size, "
+            "created_at, modified_at, version, device_id, sync_status, deleted "
+            "FROM files WHERE virtual_path = ? AND deleted = 0",
             (virtual_path,),
         )
         row = cursor.fetchone()
@@ -156,7 +517,59 @@ class MetadataStore:
             file_size=row["file_size"],
             created_at=row["created_at"],
             modified_at=row["modified_at"],
+            version=row["version"],
+            device_id=row["device_id"],
+            sync_status=row["sync_status"],
+            deleted=bool(row["deleted"]),
         )
+
+    def lookup_any(self, virtual_path: str) -> FileMetadata | None:
+        """tombstone을 포함하여 가상 경로로 레코드를 조회한다 (동기화 병합용)."""
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "SELECT virtual_path, source_id, physical_path, file_size, "
+            "created_at, modified_at, version, device_id, sync_status, deleted "
+            "FROM files WHERE virtual_path = ?",
+            (virtual_path,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return FileMetadata(
+            virtual_path=row["virtual_path"],
+            source_id=row["source_id"],
+            physical_path=row["physical_path"],
+            file_size=row["file_size"],
+            created_at=row["created_at"],
+            modified_at=row["modified_at"],
+            version=row["version"],
+            device_id=row["device_id"],
+            sync_status=row["sync_status"],
+            deleted=bool(row["deleted"]),
+        )
+
+    def live_physical_paths_for_device(
+        self, device_id: str
+    ) -> set[tuple[str, str]]:
+        """orphan GC용 보존 집합을 반환한다.
+
+        삭제되지 않은(deleted=0) 레코드 중, 현재 디바이스 소유(device_id 일치)
+        이거나 소유자 미지정(device_id IS NULL, 레거시)인 것의
+        (source_id, physical_path) 집합을 반환한다.
+
+        이 집합에 포함된 물리 파일은 활성 metadata가 참조하므로 GC 대상에서
+        제외(보존)해야 한다.
+        """
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "SELECT source_id, physical_path FROM files "
+            "WHERE deleted = 0 AND (device_id = ? OR device_id IS NULL)",
+            (device_id,),
+        )
+        return {
+            (row["source_id"], row["physical_path"])
+            for row in cursor.fetchall()
+        }
 
     # --- 디렉토리 메타데이터 ---
 
@@ -201,7 +614,7 @@ class MetadataStore:
 
         cursor = conn.execute(
             "SELECT virtual_path, file_size, created_at, modified_at "
-            "FROM files WHERE virtual_path LIKE ? || '%'",
+            "FROM files WHERE virtual_path LIKE ? || '%' AND deleted = 0",
             (directory_path,),
         )
         for row in cursor.fetchall():

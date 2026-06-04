@@ -1,14 +1,13 @@
 .venv
 __pycache__
 .vscode
-.venv_win
-
-setup.json
-mnt
-p1
-p2
-p3
-d*
+.pytest_cache
+knowledge-graph.json
+.env
 
 # 개발용 스토리지
 .dev-storage/
+
+# 로컬 개발 설정 (커밋 제외)
+dev-config.json
+dev-config.json.v1.bak

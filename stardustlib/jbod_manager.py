@@ -5,6 +5,7 @@
 """
 
 import logging
+import re
 import time
 import uuid
 
@@ -15,6 +16,10 @@ from stardustlib.models import EntryInfo, FileInfo
 from stardustlib.storage_source import StorageSource
 
 logger = logging.getLogger(__name__)
+
+# 물리 파일명 형식: <32자리 hex UUID>_<원본 파일명>. orphan GC는 이 형식의
+# 파일만 대상으로 하여 metadata DB 등 비관리 파일을 건드리지 않는다.
+_MANAGED_FILE_RE = re.compile(r"^[0-9a-f]{32}_")
 
 
 class JBODManager:
@@ -29,6 +34,7 @@ class JBODManager:
         sources: list[StorageSource],
         metadata_store: MetadataStore,
         encryption_engine: EncryptionEngine | None = None,
+        device_id: str | None = None,
     ) -> None:
         """JBODManager 초기화.
 
@@ -36,14 +42,34 @@ class JBODManager:
             sources: Storage Source 목록.
             metadata_store: 메타데이터 저장소.
             encryption_engine: 암호화 엔진 (None이면 암호화 비활성).
+            device_id: 이 클라이언트의 디바이스 ID (파일 변경 추적용, 선택).
         """
         self.sources = sources
         self.metadata_store = metadata_store
         self.encryption_engine = encryption_engine
+        self.device_id = device_id
         # 개선 1: source_id → StorageSource dict (O(1) 조회)
         self._source_map: dict[str, StorageSource] = {
             s.source_id: s for s in sources
         }
+        # device_id → 원격 디바이스 프록시 (RemoteSource). 크로스 디바이스 읽기 라우팅용.
+        self._remote_devices: dict = {}
+        # orphan GC 디바운스: 소유권 이전/병합 감지 시 set, 사이클당 1회 스캔
+        self._gc_needed: bool = False
+
+    def mark_gc_needed(self) -> None:
+        """orphan GC가 필요함을 표시한다 (다음 사이클에 1회 스캔).
+
+        소유권 이전 또는 동기화 병합에서 소유권 변경을 감지했을 때 호출한다.
+        """
+        self._gc_needed = True
+
+    def register_remote_device(self, device_id: str, remote) -> None:
+        """원격 디바이스 프록시(RemoteSource)를 device_id로 등록한다.
+
+        read_file이 원격 소유 파일을 이 프록시로 라우팅한다.
+        """
+        self._remote_devices[device_id] = remote
 
     # --- 소스 관리 ---
 
@@ -63,7 +89,7 @@ class JBODManager:
         best_space: int = -1
 
         for source in self.sources:
-            if not source.is_active:
+            if not source.is_active or source.is_remote:
                 continue
             available = source.get_available_space()
             if available >= file_size and available > best_space:
@@ -79,6 +105,16 @@ class JBODManager:
     def _get_source_by_id(self, source_id: str) -> StorageSource | None:
         """source_id로 소스를 찾는다. O(1)."""
         return self._source_map.get(source_id)
+
+    def add_source(self, source: StorageSource) -> None:
+        """소스를 동적으로 추가한다 (예: 인증 후 RemoteSource 마운트).
+
+        동일 source_id가 이미 있으면 교체한다.
+        """
+        # 기존 동일 id 소스 제거 후 추가 (중복 방지)
+        self.sources = [s for s in self.sources if s.source_id != source.source_id]
+        self.sources.append(source)
+        self._source_map[source.source_id] = source
 
     def _generate_physical_path(self, virtual_path: str) -> str:
         """가상 경로에서 물리 경로를 생성한다.
@@ -112,6 +148,15 @@ class JBODManager:
         if metadata is None:
             raise FileNotFoundError(f"파일을 찾을 수 없습니다: {virtual_path}")
 
+        owner = metadata.device_id
+        # 로컬 소유 또는 레거시(NULL) → 로컬 읽기
+        if owner is None or owner == self.device_id:
+            return self._read_local(metadata)
+        # 원격 소유 → 디바이스 프록시로 라우팅
+        return self._read_remote(metadata)
+
+    def _read_local(self, metadata) -> bytes:
+        """로컬 소스에서 파일을 읽어 복호화한다."""
         source = self._get_source_by_id(metadata.source_id)
         if source is None or not source.is_active:
             raise OSError(
@@ -119,6 +164,44 @@ class JBODManager:
             )
 
         encrypted_data = source.read(metadata.physical_path)
+
+        if self.encryption_engine is not None:
+            return self.encryption_engine.decrypt(encrypted_data)
+        return encrypted_data
+
+    def _read_remote(self, metadata) -> bytes:
+        """원격 디바이스의 P2P 서버에서 파일을 읽어 로컬에서 복호화한다.
+
+        같은 계정이면 master_key가 동일하므로 원격에서 받은 암호문을
+        로컬 encryption_engine으로 복호화할 수 있다.
+
+        비활성(오프라인) 프록시는 routing 재조회(refresh)로 한 번 재네고시에이션을
+        시도한다. 디바이스가 그사이 온라인이 되었으면 활성으로 전환되어 읽기가
+        진행된다.
+        """
+        remote = self._remote_devices.get(metadata.device_id)
+        if remote is None:
+            raise OSError(
+                f"원격 디바이스 미마운트: {metadata.device_id}"
+            )
+
+        # 비활성이면 재네고시에이션 1회 시도 (디바이스 재온라인 대응)
+        if not remote.is_active:
+            refresh = getattr(remote, "refresh", None)
+            if callable(refresh):
+                logger.info(
+                    "원격 디바이스 비활성 — 재네고시에이션 시도: %s",
+                    metadata.device_id,
+                )
+                refresh()
+            if not remote.is_active:
+                raise OSError(
+                    f"원격 디바이스 오프라인: {metadata.device_id}"
+                )
+
+        encrypted_data = remote.read_from_source(
+            metadata.physical_path, metadata.source_id
+        )
 
         if self.encryption_engine is not None:
             return self.encryption_engine.decrypt(encrypted_data)
@@ -144,7 +227,12 @@ class JBODManager:
         existing = self.metadata_store.lookup(virtual_path)
 
         if existing is not None:
-            # 기존 파일 덮어쓰기
+            # 원격 디바이스 소유 파일 수정 → 로컬 소유권 이전(takeover, 3a)
+            owner = existing.device_id
+            if owner is not None and owner != self.device_id:
+                self._takeover_write(virtual_path, encrypted, len(data))
+                return
+            # 기존 파일 덮어쓰기 (로컬 소유 또는 레거시 NULL)
             source = self._get_source_by_id(existing.source_id)
             if source is None or not source.is_active:
                 raise OSError(
@@ -157,8 +245,14 @@ class JBODManager:
                     virtual_path,
                     file_size=len(data),
                     modified_at=time.time(),
+                    device_id=self.device_id,
                 )
                 self.metadata_store.commit()
+            except OSError as e:
+                self.metadata_store.rollback()
+                if "insufficient space" in str(e).lower():
+                    raise InsufficientStorageError(str(e)) from e
+                raise
             except Exception:
                 self.metadata_store.rollback()
                 raise
@@ -178,6 +272,7 @@ class JBODManager:
                     file_size=len(data),
                     created_at=now,
                     modified_at=now,
+                    device_id=self.device_id,
                 )
                 self.metadata_store.commit()
             except Exception:
@@ -186,6 +281,116 @@ class JBODManager:
                 if source.exists(physical_path):
                     source.delete(physical_path)
                 raise
+
+    def _takeover_write(
+        self, virtual_path: str, encrypted: bytes, plain_size: int
+    ) -> None:
+        """원격 소유 파일 수정 시 로컬 소유권 이전(3a).
+
+        로컬 소스에 새 내용을 기록하고 metadata의 device_id/source_id/
+        physical_path를 로컬로 갱신한다. 가상 경로는 유지된다. 원래 소유
+        디바이스의 물리 파일은 orphan이 되며 그 디바이스가 동기화 후 정리한다.
+
+        Raises:
+            InsufficientStorageError: 로컬 소스 공간 부족 시.
+        """
+        source = self.select_source(len(encrypted))
+        new_physical_path = self._generate_physical_path(virtual_path)
+
+        self.metadata_store.begin_transaction()
+        try:
+            source.write(new_physical_path, encrypted)
+            self.metadata_store.update(
+                virtual_path,
+                file_size=plain_size,
+                modified_at=time.time(),
+                device_id=self.device_id,
+                source_id=source.source_id,
+                physical_path=new_physical_path,
+            )
+            self.metadata_store.commit()
+        except OSError as e:
+            self.metadata_store.rollback()
+            if source.exists(new_physical_path):
+                source.delete(new_physical_path)
+            if "insufficient space" in str(e).lower():
+                raise InsufficientStorageError(str(e)) from e
+            raise
+        except Exception:
+            self.metadata_store.rollback()
+            if source.exists(new_physical_path):
+                source.delete(new_physical_path)
+            raise
+
+        # 사이클당 1회 GC를 위해 플래그만 set (파일마다 스캔하지 않음)
+        self._gc_needed = True
+        logger.info(
+            "소유권 이전 완료: %s → device=%s source=%s",
+            virtual_path, self.device_id, source.source_id,
+        )
+
+    def gc_orphan_files_if_needed(self) -> int:
+        """이전(takeover)/병합 감지로 플래그가 섰을 때만 orphan GC를 1회 수행한다.
+
+        다중 파일 동시 수정 시에도 사이클당 전체 스캔은 1회뿐이다.
+        """
+        if not self._gc_needed:
+            return 0
+        self._gc_needed = False
+        return self.gc_orphan_files()
+
+    def gc_orphan_files(self) -> int:
+        """로컬 소스의 고아 물리 파일을 삭제한다 (orphan GC).
+
+        활성 metadata가 현재 디바이스 소유(또는 레거시 NULL)로 참조하는 물리
+        파일은 보존하고, 그 외(소유권이 다른 디바이스로 이전되어 더 이상 참조되지
+        않는) 물리 파일을 삭제한다.
+
+        안전장치: device_id가 없으면(None) 보존 집합을 신뢰할 수 없으므로 전체를
+        건너뛴다(전체 삭제 위험 방지). 원격 소스는 스캔하지 않는다.
+
+        Returns:
+            삭제한 물리 파일 수.
+        """
+        if self.device_id is None:
+            logger.debug("device_id 없음, orphan GC 건너뜀")
+            return 0
+
+        live = self.metadata_store.live_physical_paths_for_device(self.device_id)
+        removed = 0
+        for source in self.sources:
+            if not source.is_active or source.is_remote:
+                continue
+            try:
+                names = source.list_physical_files()
+            except Exception as e:
+                logger.warning(
+                    "orphan GC: 물리 파일 목록 조회 실패 (%s): %s",
+                    source.source_id, e,
+                )
+                continue
+            for name in names:
+                # 우리가 만든 관리 파일(<hex32>_...)만 GC 대상. metadata DB,
+                # 사용자 직접 파일 등 비관리 파일은 절대 건드리지 않는다.
+                if not _MANAGED_FILE_RE.match(name):
+                    continue
+                if (source.source_id, name) in live:
+                    continue
+                try:
+                    source.delete(name)
+                    removed += 1
+                    logger.info(
+                        "orphan 물리 파일 삭제: source=%s file=%s",
+                        source.source_id, name,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "orphan 파일 삭제 실패 (%s/%s): %s",
+                        source.source_id, name, e,
+                    )
+        if removed:
+            logger.info("orphan GC 완료: %d개 물리 파일 삭제", removed)
+        return removed
 
     def delete_file(self, virtual_path: str) -> None:
         """파일을 삭제하고 메타데이터를 제거한다.
@@ -199,6 +404,13 @@ class JBODManager:
         metadata = self.metadata_store.lookup(virtual_path)
         if metadata is None:
             raise FileNotFoundError(f"파일을 찾을 수 없습니다: {virtual_path}")
+
+        owner = metadata.device_id
+        # 원격 디바이스 소유 파일은 물리 삭제하지 않고 로컬 metadata만 tombstone 처리한다.
+        # (실제 물리 삭제는 소유 디바이스가 자신의 tombstone 동기화 시 수행)
+        if owner is not None and owner != self.device_id:
+            self.metadata_store.delete(virtual_path)
+            return
 
         source = self._get_source_by_id(metadata.source_id)
         if source is not None and source.is_active:
@@ -290,7 +502,7 @@ class JBODManager:
         physical_path = virtual_path.lstrip("/")
 
         for source in self.sources:
-            if not source.is_active:
+            if not source.is_active or source.is_remote:
                 continue
             try:
                 source.mkdir(physical_path)
@@ -327,10 +539,10 @@ class JBODManager:
                         "삭제 대상 파일이 이미 없음: %s", child_path
                     )
 
-        # 모든 활성 소스에서 물리 디렉토리 삭제
+        # 모든 활성 로컬 소스에서 물리 디렉토리 삭제 (원격은 읽기 전용)
         physical_path = virtual_path.lstrip("/")
         for source in self.sources:
-            if not source.is_active:
+            if not source.is_active or source.is_remote:
                 continue
             try:
                 source.rmdir(physical_path)
@@ -364,11 +576,11 @@ class JBODManager:
         )
         self.metadata_store._conn.commit()
 
-        # 물리 디렉토리 이동 (각 활성 소스)
+        # 물리 디렉토리 이동 (각 활성 로컬 소스, 원격은 읽기 전용)
         src_physical = src_path.lstrip("/")
         dst_physical = dst_path.lstrip("/")
         for source in self.sources:
-            if not source.is_active:
+            if not source.is_active or source.is_remote:
                 continue
             try:
                 # 대상 디렉토리 생성 후 원본 삭제 방식
@@ -386,18 +598,24 @@ class JBODManager:
     # --- 용량 정보 ---
 
     def get_total_space(self) -> int:
-        """모든 활성 소스의 전체 공간 합계를 반환한다."""
+        """모든 활성 로컬 소스의 전체 공간 합계를 반환한다.
+
+        원격 소스(is_remote)는 읽기 전용 프록시이므로 로컬 용량에서 제외한다.
+        """
         total = 0
         for source in self.sources:
-            if source.is_active:
+            if source.is_active and not source.is_remote:
                 total += source.get_total_space()
         return total
 
     def get_available_space(self) -> int:
-        """모든 활성 소스의 가용 공간 합계를 반환한다."""
+        """모든 활성 로컬 소스의 가용 공간 합계를 반환한다.
+
+        원격 소스(is_remote)는 읽기 전용 프록시이므로 로컬 용량에서 제외한다.
+        """
         available = 0
         for source in self.sources:
-            if source.is_active:
+            if source.is_active and not source.is_remote:
                 available += source.get_available_space()
         return available
 

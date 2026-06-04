@@ -1,0 +1,59 @@
+name: Build Windows Executable
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+    types: [closed]
+
+jobs:
+  build:
+    if: github.event_name == 'push' || github.event.pull_request.merged == true
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller==6.11.1
+
+      - name: Build single-file executable
+        run: |
+          pyinstaller --onefile --name stardustfs --clean ^
+            --hidden-import=stardustlib.auth_client ^
+            --hidden-import=stardustlib.sync_client ^
+            --hidden-import=stardustlib.device_manager ^
+            --hidden-import=stardustlib.remote_source ^
+            --hidden-import=stardustlib.p2p_server ^
+            --hidden-import=stardustlib.conflict_resolver ^
+            --hidden-import=stardustlib.key_backup_engine ^
+            --hidden-import=stardustlib.online_recovery ^
+            --hidden-import=wsgidav ^
+            --hidden-import=cheroot ^
+            --hidden-import=aiohttp ^
+            stardustfs.py
+
+      - name: Verify executable
+        run: dist\stardustfs.exe --help
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stardustfs-windows-x64
+          path: dist/stardustfs.exe
+          retention-days: 30
+
+      - name: Create Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/stardustfs.exe
