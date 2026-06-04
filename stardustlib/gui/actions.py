@@ -72,18 +72,22 @@ def create_config(
 # --- 오프라인 조회 ---
 
 def _rows_for(session, base: str) -> list[dict]:
-    """세션으로 디렉토리 항목 행을 만든다. 각 항목: type/name/size/owner."""
+    """세션으로 디렉토리 항목 행을 만든다. 각 항목: type/name/size/owner/backup."""
     rows: list[dict] = []
     for e in session.jbod.list_directory(base):
         owner = ""
+        backup = ""
         if not e.is_directory:
-            meta = session.metadata.lookup(base.rstrip("/") + "/" + e.name)
+            vpath = base.rstrip("/") + "/" + e.name
+            meta = session.metadata.lookup(vpath)
             owner = meta.device_id[:8] if meta and meta.device_id else ""
+            backup = session.metadata.get_replication_status(vpath) or "none"
         rows.append({
             "type": "dir" if e.is_directory else "file",
             "name": e.name,
             "size": e.file_size,
             "owner": owner,
+            "backup": backup,  # none|pending|replicated (로컬 상태)
         })
     rows.sort(key=lambda r: (r["type"] != "dir", r["name"].lower()))
     return rows
@@ -209,6 +213,44 @@ def devices_list(config_path: str) -> list[dict]:
         ]
 
     return asyncio.run(_run_online(config_path, aop, sync=False))
+
+
+def replica_counts(config_path: str, vpath: str) -> dict:
+    """디렉토리 내 파일별 실제 복제본 수(온라인 홀더)를 조회한다.
+
+    {name: {"online": int, "chunks": int, "min": int}}. 로그인 안 됐거나 서버 도달
+    불가면 빈 dict(상태 컬럼만 유지). 파일마다 서버 조회가 발생하므로 비용이 있다.
+    """
+    base = _vpath(vpath)
+
+    async def aop(s):
+        mgr = s.make_replication_manager()
+        out: dict = {}
+        try:
+            for e in s.jbod.list_directory(base):
+                if e.is_directory:
+                    continue
+                vp = base.rstrip("/") + "/" + e.name
+                try:
+                    summary = await asyncio.to_thread(
+                        mgr.replication_health, vp
+                    )
+                except Exception:  # noqa: BLE001 — 파일 단위 격리
+                    continue
+                if summary.chunk_count > 0:
+                    out[e.name] = {
+                        "online": summary.min_online,
+                        "chunks": summary.chunk_count,
+                        "min": mgr.min_replicas,
+                    }
+        finally:
+            mgr.close()
+        return out
+
+    try:
+        return asyncio.run(_run_online(config_path, aop, sync=False))
+    except Exception:  # noqa: BLE001 — 오프라인/미로그인 시 상태만 표시
+        return {}
 
 
 def put_file(config_path: str, local: str, remote: str) -> int:

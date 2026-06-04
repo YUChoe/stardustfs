@@ -109,6 +109,11 @@ class ReplicationManager:
     # 식별자 (서버에 가상경로 비노출 — SHA-256 해시)
     # ------------------------------------------------------------------
 
+    @property
+    def min_replicas(self) -> int:
+        """목표 복제본 수."""
+        return self._min_replicas
+
     def _file_ref(self, virtual_path: str) -> str:
         uid = self._auth.user_id or ""
         return hashlib.sha256(

@@ -170,11 +170,12 @@ class StardustApp:
         ttk.Button(pframe, text=t["go"], command=self._go).pack(side="left")
         ttk.Button(pframe, text=t["refresh"], command=self.refresh).pack(side="left", padx=4)
 
-        cols = ("type", "name", "size", "owner")
+        cols = ("type", "name", "size", "owner", "backup")
         self.tree = ttk.Treeview(self.body, columns=cols, show="headings", selectmode="browse")
         for c, head, w in (
-            ("type", t["col_type"], 60), ("name", t["col_name"], 380),
-            ("size", t["col_size"], 110), ("owner", t["col_owner"], 110),
+            ("type", t["col_type"], 60), ("name", t["col_name"], 320),
+            ("size", t["col_size"], 100), ("owner", t["col_owner"], 90),
+            ("backup", t["col_backup"], 110),
         ):
             self.tree.heading(c, text=head)
             self.tree.column(c, width=w, anchor="w")
@@ -348,13 +349,23 @@ class StardustApp:
             self.worker.submit(lambda: actions.invalidate(cfg), lambda *_a: None)
         self.refresh()
 
+    def _backup_label(self, status: str) -> str:
+        """로컬 replication_status를 표시 라벨로 변환한다."""
+        if status == "replicated":
+            return self.t["bk_done"]
+        if status == "pending":
+            return self.t["bk_pending"]
+        return self.t["bk_none"]
+
     def _populate(self, rows: list[dict]) -> None:
         self.tree.delete(*self.tree.get_children())
         self._rows = {}
         for r in rows:
             size = _human(r["size"]) if r["type"] == "file" else ""
+            backup = self._backup_label(r.get("backup", "")) if r["type"] == "file" else ""
             iid = self.tree.insert(
-                "", "end", values=(r["type"], r["name"], size, r["owner"])
+                "", "end",
+                values=(r["type"], r["name"], size, r["owner"], backup),
             )
             self._rows[iid] = r
 
@@ -364,6 +375,27 @@ class StardustApp:
             used=_human(d["used"]), total=_human(d["total"]),
             avail=_human(d["available"]), pending=d["pending"],
         ))
+        # 온라인이면 실제 복제본 수를 백그라운드로 조회해 백업 컬럼에 병기한다.
+        if self._logged_in():
+            cfg, vp = self.config_path, self.vpath
+            self.worker.submit(
+                lambda: actions.replica_counts(cfg, vp),
+                lambda counts: self._apply_counts(vp, counts),
+            )
+
+    def _apply_counts(self, vp: str, counts: dict) -> None:
+        """replica_counts 결과를 백업 컬럼에 '상태 (online/min)'로 병기한다."""
+        if vp != self.vpath or not counts:
+            return  # 폴더가 바뀌었거나 조회 결과 없음
+        for iid, row in self._rows.items():
+            if row["type"] != "file":
+                continue
+            info = counts.get(row["name"])
+            if not info:
+                continue
+            label = self._backup_label(row.get("backup", ""))
+            text = f"{label} ({info['online']}/{info['min']})"
+            self.tree.set(iid, "backup", text)
 
     def _selected(self) -> dict | None:
         sel = self.tree.selection()

@@ -46,6 +46,15 @@ def test_create_config_offline_no_key(tmp_path):
     assert not (base / "master.key").exists()    # 복원 모드: 키 미생성
 
 
+def test_replica_counts_empty_when_offline(tmp_path):
+    # 오프라인(server.url 없음) 설정 → 온라인 조회 불가 → 빈 dict(상태 컬럼만)
+    base = tmp_path / "setup-rc"
+    cfg_path = actions.create_config(
+        str(base), "", "dev-rc", generate_key=True
+    )
+    assert actions.replica_counts(cfg_path, "/") == {}
+
+
 def test_created_config_validates(tmp_path):
     from stardustlib.config_loader import ConfigLoader
 
