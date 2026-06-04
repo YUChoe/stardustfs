@@ -14,6 +14,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+# 한 주기에 상한(max)만큼 처리했으면 백로그가 남은 것으로 보고 짧게 쉬고 계속 비운다.
+_BACKLOG_DRAIN_DELAY = 2.0
+
+
 class ReplicationScheduler:
     """백업/heal 백그라운드 루프."""
 
@@ -104,13 +108,21 @@ class ReplicationScheduler:
 
     async def _backup_loop(self) -> None:
         while not self._stop.is_set():
+            processed = 0
             try:
-                await self.run_backup_cycle()
+                processed = await self.run_backup_cycle()
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001 — 루프 유지
                 logger.error("백업 주기 오류: %s", e, exc_info=True)
-            await self._sleep(self._backup_interval)
+            # 상한만큼 처리했으면 백로그가 남았다고 보고 짧게 쉬고 계속 비운다.
+            # 그 외(처리량 < 상한)에는 정상 주기 간격으로 쉰다.
+            delay = (
+                _BACKLOG_DRAIN_DELAY
+                if processed >= self._max
+                else self._backup_interval
+            )
+            await self._sleep(delay)
 
     async def run_backup_cycle(self) -> int:
         """미복제/미완료(none|pending) 로컬 파일 ≤max개를 복제한다.
