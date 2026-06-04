@@ -46,6 +46,9 @@ class ReplicationScheduler:
         self._tasks: list[asyncio.Task] = []
         # vpath → 처음 degraded로 관측된 시각(monotonic). 유예 경과 시 재복제.
         self._degraded_since: dict[str, float] = {}
+        # 로컬에 물리 파일이 없어 백업 불가한 vpath(다른 device 소유의 NULL 레코드 등).
+        # 매 주기 재시도/경고 스팸을 막기 위해 캐시해 건너뛴다.
+        self._skip_backup: set[str] = set()
 
     async def start(self) -> None:
         """백그라운드 루프(백업 + heal)를 기동한다."""
@@ -120,10 +123,17 @@ class ReplicationScheduler:
         for vpath in paths[: self._max]:
             if self._stop.is_set():
                 break
+            if vpath in self._skip_backup:
+                continue  # 로컬에 없는 파일(다른 device 소유) — 재시도 안 함
             try:
                 result = await asyncio.to_thread(self._manager.replicate, vpath)
                 processed += 1
                 logger.info("자동 백업: %s → %s", vpath, result.status)
+            except FileNotFoundError:
+                # 이 device에 물리 파일이 없음(다른 device 소유의 NULL 레코드 등).
+                # 그 device가 백업하므로 여기서는 조용히 건너뛰고 캐시한다.
+                self._skip_backup.add(vpath)
+                logger.debug("로컬에 없어 백업 건너뜀(타 device 소유 추정): %s", vpath)
             except Exception as e:  # noqa: BLE001 — 실패 격리
                 logger.warning("자동 백업 실패(건너뜀): %s: %s", vpath, e)
         return processed

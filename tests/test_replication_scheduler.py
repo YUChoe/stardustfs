@@ -65,6 +65,8 @@ class _FakeManager:
         self.closed = False
 
     def replicate(self, vpath: str):
+        if vpath in getattr(self, "missing_paths", set()):
+            raise FileNotFoundError(vpath)
         if vpath in self.fail_paths:
             raise RuntimeError("boom")
         self.replicated.append(vpath)
@@ -138,6 +140,25 @@ async def test_backup_cycle_isolates_failure():
     n = await sched.run_backup_cycle()
     assert n == 2  # /b 실패해도 /a,/c 진행
     assert mgr.replicated == ["/a", "/c"]
+
+
+@pytest.mark.asyncio
+async def test_backup_cycle_skips_missing_local_file_and_caches():
+    """로컬에 없는 파일(타 device 소유 NULL 레코드)은 건너뛰고 재시도 안 한다."""
+    mgr = _FakeManager()
+    mgr.missing_paths = {"/remote-owned"}
+    sched = ReplicationScheduler(
+        mgr, _FakeMeta(["/local", "/remote-owned"]), "devA"
+    )
+    n1 = await sched.run_backup_cycle()
+    assert n1 == 1                       # /local만 처리
+    assert mgr.replicated == ["/local"]
+    assert "/remote-owned" in sched._skip_backup
+    # 다음 주기엔 missing 파일을 아예 시도하지 않음
+    mgr.replicated.clear()
+    n2 = await sched.run_backup_cycle()
+    assert mgr.replicated == ["/local"]  # /remote-owned 재시도 없음
+    assert n2 == 1
 
 
 @pytest.mark.asyncio
