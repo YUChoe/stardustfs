@@ -32,7 +32,7 @@ from stardustlib.remote_source import _EventLoopThread
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MIN_REPLICAS = 3
+DEFAULT_MIN_REPLICAS = 2  # 무료/기본 정책. 서버 /replication/policy로 재정의됨.
 
 
 class ReplicationError(Exception):

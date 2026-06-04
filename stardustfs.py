@@ -162,12 +162,17 @@ def _daemon_stop(config_path: str) -> int:
 _RECIPROCITY_FRACTION = 0.5
 
 
-def _build_parity_store(config: dict, fraction: float = _RECIPROCITY_FRACTION):
+def _build_parity_store(
+    config: dict,
+    fraction: float = _RECIPROCITY_FRACTION,
+    provided_bytes: int | None = None,
+):
     """호스트 역할 패리티 스토어를 생성한다(replication.enabled 일 때만, 기본 활성).
 
     보관 디렉토리는 {metadata_db}.parity. 최대 용량은 provided_bytes * fraction
-    (정책 호혜 비율). provided_bytes 미지정 시 0(호스팅 안 함). 레거시 p2p.parity_max_bytes
-    지원. replication.enabled=false면 None.
+    (정책 호혜 비율). provided_bytes를 인자로 주면 그 값을, 없으면 config의
+    replication.provided_bytes를, 그것도 없으면 레거시 p2p.parity_max_bytes를,
+    모두 없으면 0(호스팅 안 함)을 사용한다. replication.enabled=false면 None.
     """
     repl = config.get("replication", {})
     p2p_config = config.get("p2p", {})
@@ -176,12 +181,14 @@ def _build_parity_store(config: dict, fraction: float = _RECIPROCITY_FRACTION):
     from stardustlib.parity_store import ParityStore
 
     base_dir = config["metadata_db"] + ".parity"
-    if "provided_bytes" in repl:
-        max_bytes = int(repl["provided_bytes"] * fraction)
+    if provided_bytes is None and "provided_bytes" in repl:
+        provided_bytes = int(repl["provided_bytes"])
+    if provided_bytes is not None:
+        max_bytes = int(provided_bytes * fraction)
     elif "parity_max_bytes" in p2p_config:
         max_bytes = p2p_config["parity_max_bytes"]
     else:
-        max_bytes = 0  # 활성이지만 제공 용량 미설정 → 타인 청크 보관 안 함
+        max_bytes = 0
     return ParityStore(base_dir, max_bytes)
 
 
@@ -371,9 +378,13 @@ async def startup_v2(config: dict, config_path: str) -> None:
     # 기본 활성(replication.enabled 미지정 시 true), 호혜 비율 0.5.
     repl_config = config.get("replication", {})  # type: ignore[attr-defined]
     repl_enabled = repl_config.get("enabled", True)
-    repl_provided = int(repl_config.get("provided_bytes", 0))
+    # 미설정 시 로컬 총 용량을 제공(호혜 0.5 → 타인 최대 50% 사용). 0이면 호스팅 안 함.
+    if "provided_bytes" in repl_config:
+        repl_provided = int(repl_config["provided_bytes"])
+    else:
+        repl_provided = int(jbod_manager.get_total_space())
     repl_fraction = float(repl_config.get("reciprocity_fraction", _RECIPROCITY_FRACTION))
-    repl_min = int(repl_config.get("min_replicas", 3))
+    repl_min = int(repl_config.get("min_replicas", 2))
     if repl_enabled:
         from stardustlib.replication_hosting import fetch_policy, report_hosting
 
@@ -477,7 +488,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
     p2p_enabled = p2p_config.get("enabled", False)
 
     if p2p_enabled:
-        parity_store = _build_parity_store(config, repl_fraction)
+        parity_store = _build_parity_store(config, repl_fraction, repl_provided)
         p2p_server = P2PServer(
             jbod_manager, auth_client, p2p_port, server_url,
             parity_store=parity_store,

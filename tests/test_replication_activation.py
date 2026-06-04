@@ -52,6 +52,15 @@ def test_parity_uses_policy_fraction(tmp_path):
     assert ps is not None and ps._max_bytes == 250
 
 
+def test_parity_provided_arg_overrides_config(tmp_path):
+    # 인자로 받은 provided(예: 로컬 총 용량 기본값)가 max = provided*fraction에 반영
+    ps = _build_parity_store(
+        {"metadata_db": str(tmp_path / "m.db"), "replication": {"enabled": True}},
+        0.5, 800,
+    )
+    assert ps is not None and ps._max_bytes == 400
+
+
 def test_parity_legacy_p2p_flag(tmp_path):
     config = {
         "metadata_db": str(tmp_path / "m.db"),

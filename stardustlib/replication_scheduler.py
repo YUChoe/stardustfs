@@ -108,9 +108,13 @@ class ReplicationScheduler:
             await self._sleep(self._backup_interval)
 
     async def run_backup_cycle(self) -> int:
-        """미복제 로컬 파일 ≤max개를 복제한다. 처리한 파일 수를 반환한다."""
+        """미복제/미완료(none|pending) 로컬 파일 ≤max개를 복제한다.
+
+        pending(목표 미달)도 매 주기 재시도해 홀더가 확보되면 곧 replicated가 된다
+        (heal의 24h 유예와 달리 즉시 재시도). 처리한 파일 수를 반환한다.
+        """
         paths = self._metadata.list_virtual_paths_for_replication(
-            ("none",), self._owner_device_id
+            ("none", "pending"), self._owner_device_id
         )
         processed = 0
         for vpath in paths[: self._max]:
@@ -143,8 +147,10 @@ class ReplicationScheduler:
         ensure_replicas로 재복제한다(일시적 오프라인의 churn 방지). 건강해진 파일은
         관측 기록을 지운다. 실제 재복제한 파일 수를 반환한다.
         """
+        # replicated(건강했다가 줄어든) 파일만 유예 후 보충. pending은 backup 루프가
+        # 즉시 재시도하므로 제외한다.
         paths = self._metadata.list_virtual_paths_for_replication(
-            ("replicated", "pending"), self._owner_device_id
+            ("replicated",), self._owner_device_id
         )
         now = asyncio.get_running_loop().time()
         repaired = 0

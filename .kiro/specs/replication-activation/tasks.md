@@ -54,8 +54,13 @@ inclusion: manual
 - [x] A6.3 주기적 정책 갱신: 스케줄러 policy_loop(policy_fetcher/on_policy/
       policy_interval, 시작 즉시 1회+주기). on_policy가 ReplicationManager.
       set_min_replicas + ParityStore.set_max_bytes(provided*fraction) 반영.
-- [x] A6.4 기본값 변경: replication.enabled 기본 true, 호혜 비율 기본 0.5.
-      provided 미설정 시 호스팅 용량 0(타인 보관 안 함, 자기 파일 백업은 동작).
+- [x] A6.4 기본값 변경: replication.enabled 기본 true, 호혜 비율 0.5, 목표 복제본 수
+      기본 2(무료/기본 = 홀더 2개, 서버 Settings/policy). provided_bytes 미설정 시
+      로컬 총 용량을 제공(타인 최대 50% 사용) → device가 기본으로 호스팅에 참여해
+      자동 백업이 실제로 완료된다.
+- [x] A6.6 backup 루프가 none + pending을 모두 대상(목표 미달 pending을 즉시 재시도).
+      heal 루프는 replicated 전용(건강→저하 시 24h 유예 후 보충). pending이 24h
+      기다리지 않고 홀더 확보 시 곧 replicated가 된다.
 - [x] A6.5 테스트: 정책 비율 반영 parity / 기본 활성 max 0 / fetch_policy 성공·도달불가
       / 스케줄러 정책 루프 적용.
 

@@ -115,6 +115,23 @@ async def test_backup_cycle_replicates_all_targets():
 
 
 @pytest.mark.asyncio
+async def test_backup_cycle_includes_pending():
+    """backup 루프는 none + pending을 대상으로 한다(pending 즉시 재시도)."""
+    seen: list = []
+
+    class _RecMeta:
+        def list_virtual_paths_for_replication(self, statuses, owner_device_id=None):
+            seen.append(tuple(statuses))
+            return ["/p"]
+
+    mgr = _FakeManager()
+    sched = ReplicationScheduler(mgr, _RecMeta(), "devA")
+    await sched.run_backup_cycle()
+    assert ("none", "pending") in seen
+    assert mgr.replicated == ["/p"]
+
+
+@pytest.mark.asyncio
 async def test_backup_cycle_isolates_failure():
     mgr = _FakeManager(fail_paths={"/b"})
     sched = ReplicationScheduler(mgr, _FakeMeta(["/a", "/b", "/c"]), "devA")
