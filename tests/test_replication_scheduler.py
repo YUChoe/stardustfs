@@ -60,6 +60,7 @@ class _FakeManager:
         self.healed: list[str] = []
         self.fail_paths = fail_paths or set()
         self.heal_fail = heal_fail or set()
+        self.healthy_paths: set[str] = set()
         self.closed = False
 
     def replicate(self, vpath: str):
@@ -74,8 +75,18 @@ class _FakeManager:
         self.healed.append(vpath)
         return _FakeResult("replicated")
 
+    def replication_health(self, vpath: str):
+        # 기본: 모든 파일 degraded(테스트에서 healthy_paths로 일부 건강 처리)
+        return _Health(degraded=vpath not in self.healthy_paths)
+
     def close(self) -> None:
         self.closed = True
+
+
+class _Health:
+    def __init__(self, degraded: bool, min_online: int = 0) -> None:
+        self.degraded = degraded
+        self.min_online = min_online
 
 
 class _FakeMeta:
@@ -121,10 +132,10 @@ async def test_backup_cycle_respects_max():
 
 
 @pytest.mark.asyncio
-async def test_heal_cycle_runs_ensure_replicas():
+async def test_heal_cycle_runs_ensure_replicas_after_grace():
     mgr = _FakeManager()
     sched = ReplicationScheduler(
-        mgr, _FakeMeta(heal_paths=["/a", "/b"]), "devA"
+        mgr, _FakeMeta(heal_paths=["/a", "/b"]), "devA", heal_grace_seconds=0,
     )
     n = await sched.run_heal_cycle()
     assert n == 2
@@ -132,10 +143,36 @@ async def test_heal_cycle_runs_ensure_replicas():
 
 
 @pytest.mark.asyncio
+async def test_heal_cycle_waits_for_grace():
+    """유예(grace) 동안은 degraded여도 재복제하지 않는다(churn 방지)."""
+    mgr = _FakeManager()
+    sched = ReplicationScheduler(
+        mgr, _FakeMeta(heal_paths=["/a"]), "devA", heal_grace_seconds=10_000,
+    )
+    n = await sched.run_heal_cycle()
+    assert n == 0
+    assert mgr.healed == []
+    assert "/a" in sched._degraded_since  # 관측은 기록됨
+
+
+@pytest.mark.asyncio
+async def test_heal_cycle_skips_healthy_and_clears_record():
+    mgr = _FakeManager()
+    mgr.healthy_paths = {"/a"}  # /a는 건강, /b는 degraded
+    sched = ReplicationScheduler(
+        mgr, _FakeMeta(heal_paths=["/a", "/b"]), "devA", heal_grace_seconds=0,
+    )
+    n = await sched.run_heal_cycle()
+    assert mgr.healed == ["/b"]
+    assert n == 1
+    assert "/a" not in sched._degraded_since
+
+
+@pytest.mark.asyncio
 async def test_heal_cycle_isolates_failure():
     mgr = _FakeManager(heal_fail={"/b"})
     sched = ReplicationScheduler(
-        mgr, _FakeMeta(heal_paths=["/a", "/b", "/c"]), "devA"
+        mgr, _FakeMeta(heal_paths=["/a", "/b", "/c"]), "devA", heal_grace_seconds=0,
     )
     n = await sched.run_heal_cycle()
     assert n == 2

@@ -37,5 +37,14 @@ inclusion: manual
       (test_replication_e2e)로 엔진은 검증됨. daemon 통합 스모크는 수동(후속).
 - [x] A4.3 ARCHITECTURE/HANDOVER에 운영 활성화 동작 반영.
 
+## Phase A5: 재복제 유예(grace) 정책
+- [x] A5.1 ReplicationManager.replication_health(virtual_path): 재복제 없이 청크별
+      online 복제 수만 점검(HealthSummary degraded/min_online/chunk_count).
+- [x] A5.2 스케줄러 heal에 유예 게이트: degraded가 heal_grace_seconds(기본 24h) 이상
+      지속된 파일만 ensure_replicas. 건강 회복 시 관측 기록 삭제(일시 오프라인 churn
+      방지). config heal_grace_seconds.
+- [x] A5.3 단위 테스트: 유예 경과 후 재복제 / 유예 중 대기 / 건강 파일 건너뜀+기록
+      삭제 / 실패 격리.
+
 ## 비범위
 - 등급별 정책(MVP4), 교차 사용자 릴레이, UDP 데이터 채널 전환.

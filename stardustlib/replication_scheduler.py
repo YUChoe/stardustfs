@@ -25,6 +25,7 @@ class ReplicationScheduler:
         *,
         backup_interval: float = 300.0,
         heal_interval: float = 3600.0,
+        heal_grace_seconds: float = 86400.0,
         max_files_per_cycle: int = 20,
     ) -> None:
         self._manager = manager
@@ -32,9 +33,12 @@ class ReplicationScheduler:
         self._owner_device_id = owner_device_id
         self._backup_interval = backup_interval
         self._heal_interval = heal_interval
+        self._heal_grace = heal_grace_seconds
         self._max = max_files_per_cycle
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
+        # vpath → 처음 degraded로 관측된 시각(monotonic). 유예 경과 시 재복제.
+        self._degraded_since: dict[str, float] = {}
 
     async def start(self) -> None:
         """백그라운드 루프(백업 + heal)를 기동한다."""
@@ -111,23 +115,46 @@ class ReplicationScheduler:
                 logger.error("재복제 주기 오류: %s", e, exc_info=True)
 
     async def run_heal_cycle(self) -> int:
-        """복제됨/pending 파일의 건강성을 점검해 부족분을 보충한다.
+        """복제됨/pending 파일의 건강성을 점검해 유예 경과분만 보충한다.
 
-        처리한(ensure_replicas 호출 성공) 파일 수를 반환한다.
+        degraded(청크 online < min_replicas)가 heal_grace_seconds 이상 지속된 파일만
+        ensure_replicas로 재복제한다(일시적 오프라인의 churn 방지). 건강해진 파일은
+        관측 기록을 지운다. 실제 재복제한 파일 수를 반환한다.
         """
         paths = self._metadata.list_virtual_paths_for_replication(
             ("replicated", "pending"), self._owner_device_id
         )
-        processed = 0
+        now = asyncio.get_running_loop().time()
+        repaired = 0
         for vpath in paths[: self._max]:
             if self._stop.is_set():
                 break
             try:
+                summary = await asyncio.to_thread(
+                    self._manager.replication_health, vpath
+                )
+            except Exception as e:  # noqa: BLE001 — 실패 격리
+                logger.warning("건강성 점검 실패(건너뜀): %s: %s", vpath, e)
+                continue
+
+            if not summary.degraded:
+                self._degraded_since.pop(vpath, None)
+                continue
+
+            first = self._degraded_since.setdefault(vpath, now)
+            if (now - first) < self._heal_grace:
+                logger.info(
+                    "degraded 관측(유예 대기): %s (online=%d)",
+                    vpath, summary.min_online,
+                )
+                continue
+            try:
                 report = await asyncio.to_thread(
                     self._manager.ensure_replicas, vpath
                 )
-                processed += 1
+                repaired += 1
+                self._degraded_since.pop(vpath, None)
                 logger.info("자동 재복제: %s → %s", vpath, report.status)
             except Exception as e:  # noqa: BLE001 — 실패 격리
                 logger.warning("자동 재복제 실패(건너뜀): %s: %s", vpath, e)
-        return processed
+        return repaired

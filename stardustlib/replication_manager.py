@@ -58,6 +58,15 @@ class ReplicationResult:
 
 
 @dataclass
+class HealthSummary:
+    """비파괴적 건강성 점검 결과(재복제 없이 현황만)."""
+
+    degraded: bool       # 청크 중 하나라도 online 복제 수 < min_replicas
+    chunk_count: int
+    min_online: int      # 청크별 online 복제 수의 최소값
+
+
+@dataclass
 class HealReport:
     """ensure_replicas(재복제) 결과."""
 
@@ -176,6 +185,12 @@ class ReplicationManager:
             )
         return report
 
+    def replication_health(self, virtual_path: str) -> HealthSummary:
+        """재복제 없이 현재 복제 건강성만 점검한다(유예 게이트용)."""
+        return self._io.run_coroutine(
+            self._health(self._file_ref(virtual_path))
+        )
+
     def close(self) -> None:
         """내부 httpx 클라이언트를 닫는다."""
         try:
@@ -265,6 +280,25 @@ class ReplicationManager:
             min_replicas=self._min_replicas,
             repaired=repaired,
             unrecoverable=unrecoverable,
+        )
+
+    async def _health(self, file_ref: str) -> HealthSummary:
+        token = await self._token()
+        chunk_infos = await self._list_chunks(token, file_ref)
+        if not chunk_infos:
+            return HealthSummary(degraded=False, chunk_count=0, min_online=0)
+        min_online: int | None = None
+        for info in chunk_infos:
+            holders = await self._list_replicas(token, info["chunk_id"])
+            online = sum(
+                1 for h in holders if h.get("is_online") is not False
+            )
+            min_online = online if min_online is None else min(min_online, online)
+        min_online = min_online or 0
+        return HealthSummary(
+            degraded=min_online < self._min_replicas,
+            chunk_count=len(chunk_infos),
+            min_online=min_online,
         )
 
     async def _heal_chunk(self, token: str, info: dict) -> dict:

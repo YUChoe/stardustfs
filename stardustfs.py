@@ -500,6 +500,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
             repl_mgr, metadata_store, device_mgr.device_id,
             backup_interval=repl_config.get("backup_interval_seconds", 300),
             heal_interval=repl_config.get("heal_interval_seconds", 3600),
+            heal_grace_seconds=repl_config.get("heal_grace_seconds", 86400),
             max_files_per_cycle=repl_config.get("max_files_per_cycle", 20),
         )
         await repl_scheduler.start()
