@@ -407,6 +407,31 @@ class MetadataStore:
         ).fetchone()
         return row["replication_status"] if row is not None else None
 
+    def list_virtual_paths_for_replication(
+        self, statuses: tuple[str, ...], owner_device_id: str | None = None
+    ) -> list[str]:
+        """리플리케이션 대상 가상 경로 목록을 반환한다(자동 백업/heal용).
+
+        deleted=0 이고 replication_status가 statuses 중 하나인 파일. owner_device_id가
+        주어지면 그 device 소유(또는 레거시 NULL=로컬)만 포함한다 — 다른 device가
+        소유한 원격 파일은 그 device가 백업하므로 제외한다.
+        """
+        if not statuses:
+            return []
+        conn = self._get_conn()
+        placeholders = ",".join("?" for _ in statuses)
+        sql = (
+            "SELECT virtual_path FROM files "
+            "WHERE deleted = 0 AND COALESCE(replication_status, 'none') "
+            f"IN ({placeholders})"
+        )
+        params: list = list(statuses)
+        if owner_device_id is not None:
+            sql += " AND (device_id = ? OR device_id IS NULL)"
+            params.append(owner_device_id)
+        rows = conn.execute(sql, tuple(params)).fetchall()
+        return [row["virtual_path"] for row in rows]
+
     def get_pending_files(self) -> list[FileMetadata]:
         """sync_status가 "pending"인 모든 파일 목록을 반환한다.
 

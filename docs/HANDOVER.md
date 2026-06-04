@@ -175,12 +175,15 @@ E2E 테스트는 롱폴/릴레이 미배포 서버에서는 자동 skip된다(�
 - `replication_manager.py`: replicate/recover/ensure_replicas, CLI `backup`/`restore`/
   `heal`. file_ref/chunk_id는 가상경로 SHA-256(경로 비노출).
 - UDP 홀펀칭(`holepunch.py` + 서버 `rendezvous.py` 옵트인). E2E `test_replication_e2e.py`.
+- 운영 활성화(스펙 `.kiro/specs/replication-activation/`, Phase A1~A3): daemon이
+  `replication.enabled` 시 제공 용량 신고(`report_hosting`) + ParityStore(provided*0.5)
+  + `replication_scheduler`(자동 backup/heal 백그라운드 루프). 기본 비활성.
 
 남은 항목(이관/후속):
 - 교차 사용자 릴레이 fallback: RelayHub가 same-user만 중개 → 허브 인가 모델 재설계
   (보안 민감)가 필요해 별도 스펙으로 분리. 현재 도달성은 직접+스웜(≥3)+홀펀칭.
 - 데이터 전송의 UDP 채널 전환(현 전송은 HTTP/TCP) + daemon 자동 랑데부 등록.
-- 재복제의 24h 유예/주기 스케줄러(현재는 명시적 `heal` 호출), erasure coding(저장 효율).
+- 재복제 24h 유예 정책(현재는 부족 즉시 보충), 등급별 정책(MVP4), erasure coding.
 
 ### 알려진 한계
 - 이중 NAT에서 직접 P2P는 상위 NAT 포트포워딩 없으면 불가 → 릴레이로 우회(구현됨)

@@ -1,0 +1,133 @@
+"""리플리케이션 백그라운드 스케줄러 (운영 활성화).
+
+daemon이 주기적으로 (1) 미복제 로컬 파일을 자동 백업하고 (2) 복제본이 부족한 파일을
+재복제(heal)한다. ReplicationManager의 동기 API는 전용 IO 루프로 자가 브리지되므로
+asyncio.to_thread로 호출해 daemon 이벤트 루프를 막지 않는다. 한 파일의 실패는 그
+파일에 국한되고 루프는 계속된다(실패 격리).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class ReplicationScheduler:
+    """백업/heal 백그라운드 루프."""
+
+    def __init__(
+        self,
+        manager,
+        metadata_store,
+        owner_device_id: str | None,
+        *,
+        backup_interval: float = 300.0,
+        heal_interval: float = 3600.0,
+        max_files_per_cycle: int = 20,
+    ) -> None:
+        self._manager = manager
+        self._metadata = metadata_store
+        self._owner_device_id = owner_device_id
+        self._backup_interval = backup_interval
+        self._heal_interval = heal_interval
+        self._max = max_files_per_cycle
+        self._stop = asyncio.Event()
+        self._tasks: list[asyncio.Task] = []
+
+    async def start(self) -> None:
+        """백그라운드 루프(백업 + heal)를 기동한다."""
+        self._stop.clear()
+        self._tasks = [
+            asyncio.create_task(self._backup_loop()),
+            asyncio.create_task(self._heal_loop()),
+        ]
+        logger.info(
+            "리플리케이션 스케줄러 시작 (backup=%.0fs, heal=%.0fs, max=%d/주기)",
+            self._backup_interval, self._heal_interval, self._max,
+        )
+
+    async def stop(self) -> None:
+        """루프를 중지하고 매니저를 정리한다."""
+        self._stop.set()
+        for task in self._tasks:
+            task.cancel()
+        for task in self._tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._tasks = []
+        try:
+            self._manager.close()
+        except Exception as e:  # noqa: BLE001 — 종료 경로
+            logger.debug("매니저 close 중 예외: %s", e)
+
+    async def _sleep(self, seconds: float) -> None:
+        """정지 신호가 오면 즉시 깨어나는 대기."""
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass
+
+    async def _backup_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await self.run_backup_cycle()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 — 루프 유지
+                logger.error("백업 주기 오류: %s", e, exc_info=True)
+            await self._sleep(self._backup_interval)
+
+    async def run_backup_cycle(self) -> int:
+        """미복제 로컬 파일 ≤max개를 복제한다. 처리한 파일 수를 반환한다."""
+        paths = self._metadata.list_virtual_paths_for_replication(
+            ("none",), self._owner_device_id
+        )
+        processed = 0
+        for vpath in paths[: self._max]:
+            if self._stop.is_set():
+                break
+            try:
+                result = await asyncio.to_thread(self._manager.replicate, vpath)
+                processed += 1
+                logger.info("자동 백업: %s → %s", vpath, result.status)
+            except Exception as e:  # noqa: BLE001 — 실패 격리
+                logger.warning("자동 백업 실패(건너뜀): %s: %s", vpath, e)
+        return processed
+
+    async def _heal_loop(self) -> None:
+        while not self._stop.is_set():
+            await self._sleep(self._heal_interval)
+            if self._stop.is_set():
+                break
+            try:
+                await self.run_heal_cycle()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 — 루프 유지
+                logger.error("재복제 주기 오류: %s", e, exc_info=True)
+
+    async def run_heal_cycle(self) -> int:
+        """복제됨/pending 파일의 건강성을 점검해 부족분을 보충한다.
+
+        처리한(ensure_replicas 호출 성공) 파일 수를 반환한다.
+        """
+        paths = self._metadata.list_virtual_paths_for_replication(
+            ("replicated", "pending"), self._owner_device_id
+        )
+        processed = 0
+        for vpath in paths[: self._max]:
+            if self._stop.is_set():
+                break
+            try:
+                report = await asyncio.to_thread(
+                    self._manager.ensure_replicas, vpath
+                )
+                processed += 1
+                logger.info("자동 재복제: %s → %s", vpath, report.status)
+            except Exception as e:  # noqa: BLE001 — 실패 격리
+                logger.warning("자동 재복제 실패(건너뜀): %s: %s", vpath, e)
+        return processed

@@ -158,19 +158,30 @@ def _daemon_stop(config_path: str) -> int:
     return 1
 
 
-def _build_parity_store(config: dict):
-    """호스트 역할 패리티 스토어를 생성한다(p2p.parity_enabled 일 때만).
+# 무료 사용자는 제공 용량의 50%를 타 사용자 보관에 제공한다(서버 RECIPROCITY와 일치).
+_RECIPROCITY_FRACTION = 0.5
 
-    보관 디렉토리는 {metadata_db}.parity, 최대 용량은 p2p.parity_max_bytes
-    (없으면 무제한). 비활성 시 None.
+
+def _build_parity_store(config: dict):
+    """호스트 역할 패리티 스토어를 생성한다(replication.enabled 일 때만).
+
+    보관 디렉토리는 {metadata_db}.parity. 최대 용량은 replication.provided_bytes의
+    호혜 비율(0.5). 레거시: replication 섹션이 없으면 p2p.parity_enabled +
+    parity_max_bytes로 폴백. 비활성 시 None.
     """
+    repl = config.get("replication", {})
     p2p_config = config.get("p2p", {})
-    if not p2p_config.get("parity_enabled", False):
+    enabled = repl.get("enabled", p2p_config.get("parity_enabled", False))
+    if not enabled:
         return None
     from stardustlib.parity_store import ParityStore
 
     base_dir = config["metadata_db"] + ".parity"
-    return ParityStore(base_dir, p2p_config.get("parity_max_bytes"))
+    if "provided_bytes" in repl:
+        max_bytes = int(repl["provided_bytes"] * _RECIPROCITY_FRACTION)
+    else:
+        max_bytes = p2p_config.get("parity_max_bytes")
+    return ParityStore(base_dir, max_bytes)
 
 
 async def startup_v2(config: dict, config_path: str) -> None:
@@ -355,6 +366,22 @@ async def startup_v2(config: dict, config_path: str) -> None:
     # 등록된 device_id를 JBOD에 주입 (파일 변경 추적용)
     jbod_manager.device_id = device_mgr.device_id
 
+    # (5-a) 리플리케이션 활성 시 제공 용량 신고 (호스팅 역할)
+    repl_config = config.get("replication", {})  # type: ignore[attr-defined]
+    if repl_config.get("enabled", False):
+        from stardustlib.replication_hosting import report_hosting
+
+        provided = int(repl_config.get("provided_bytes", 0))
+        if device_mgr.device_id and provided > 0:
+            ok = await report_hosting(
+                auth_client, server_url, device_mgr.device_id, provided
+            )
+            if ok:
+                logger.info("호스팅 용량 신고: %d bytes (호혜 %.0f%%)",
+                            provided, _RECIPROCITY_FRACTION * 100)
+        elif not device_mgr.device_id:
+            logger.warning("device 미등록 — 호스팅 신고를 건너뜁니다")
+
     # 내 계정에 등록된 디바이스 목록 조회 (remote 소스 설정 참고용)
     my_devices = await device_mgr.list_devices()
     if my_devices:
@@ -459,8 +486,28 @@ async def startup_v2(config: dict, config_path: str) -> None:
     await device_mgr.start_heartbeat()
     await sync_client.start_periodic_sync()
 
+    # (6-b) 리플리케이션 스케줄러 (자동 백업/heal) — replication.enabled 일 때만
+    repl_scheduler = None
+    if repl_config.get("enabled", False):
+        from stardustlib.replication_manager import ReplicationManager
+        from stardustlib.replication_scheduler import ReplicationScheduler
+
+        repl_mgr = ReplicationManager(
+            auth_client, server_url, metadata_store, jbod_manager,
+            min_replicas=repl_config.get("min_replicas", 3),
+        )
+        repl_scheduler = ReplicationScheduler(
+            repl_mgr, metadata_store, device_mgr.device_id,
+            backup_interval=repl_config.get("backup_interval_seconds", 300),
+            heal_interval=repl_config.get("heal_interval_seconds", 3600),
+            max_files_per_cycle=repl_config.get("max_files_per_cycle", 20),
+        )
+        await repl_scheduler.start()
+
     # (7) 상주 루프 (정지 신호까지 — Ctrl+C 또는 'daemon stop')
     async def _cleanup() -> None:
+        if repl_scheduler is not None:
+            await repl_scheduler.stop()
         await sync_client.stop()
         await device_mgr.stop()
         if relay_worker is not None:
