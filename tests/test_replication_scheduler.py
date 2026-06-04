@@ -1,6 +1,7 @@
 """리플리케이션 스케줄러(자동 백업 루프) + 메타데이터 대상 조회 테스트."""
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 
@@ -78,6 +79,9 @@ class _FakeManager:
     def replication_health(self, vpath: str):
         # 기본: 모든 파일 degraded(테스트에서 healthy_paths로 일부 건강 처리)
         return _Health(degraded=vpath not in self.healthy_paths)
+
+    def set_min_replicas(self, n: int) -> None:
+        self.min_replicas = n
 
     def close(self) -> None:
         self.closed = True
@@ -186,7 +190,32 @@ async def test_start_stop_lifecycle():
         mgr, _FakeMeta([]), "devA", backup_interval=0.05, heal_interval=0.05
     )
     await sched.start()
-    assert len(sched._tasks) == 2  # backup + heal
+    assert len(sched._tasks) == 2  # backup + heal (정책 fetcher 없음)
     await sched.stop()
     assert mgr.closed is True
     assert sched._tasks == []
+
+
+@pytest.mark.asyncio
+async def test_policy_loop_applies_policy():
+    mgr = _FakeManager()
+    applied: list[dict] = []
+
+    async def fetcher():
+        return {"reciprocity_fraction": 0.5, "min_replicas": 5}
+
+    sched = ReplicationScheduler(
+        mgr, _FakeMeta([]), "devA",
+        backup_interval=10_000, heal_interval=10_000, policy_interval=10_000,
+        policy_fetcher=fetcher,
+        on_policy=lambda p: applied.append(p),
+    )
+    await sched.start()
+    assert len(sched._tasks) == 3  # backup + heal + policy
+    # 정책 루프가 시작 즉시 1회 적용할 시간을 준다
+    for _ in range(50):
+        if applied:
+            break
+        await asyncio.sleep(0.01)
+    await sched.stop()
+    assert applied and applied[0]["min_replicas"] == 5

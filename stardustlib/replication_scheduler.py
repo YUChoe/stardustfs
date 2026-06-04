@@ -27,6 +27,9 @@ class ReplicationScheduler:
         heal_interval: float = 3600.0,
         heal_grace_seconds: float = 86400.0,
         max_files_per_cycle: int = 20,
+        policy_fetcher=None,
+        on_policy=None,
+        policy_interval: float = 3600.0,
     ) -> None:
         self._manager = manager
         self._metadata = metadata_store
@@ -35,6 +38,10 @@ class ReplicationScheduler:
         self._heal_interval = heal_interval
         self._heal_grace = heal_grace_seconds
         self._max = max_files_per_cycle
+        # 정책 주기 갱신: policy_fetcher()(async)→dict|None, on_policy(dict) 적용 콜백.
+        self._policy_fetcher = policy_fetcher
+        self._on_policy = on_policy
+        self._policy_interval = policy_interval
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
         # vpath → 처음 degraded로 관측된 시각(monotonic). 유예 경과 시 재복제.
@@ -47,10 +54,25 @@ class ReplicationScheduler:
             asyncio.create_task(self._backup_loop()),
             asyncio.create_task(self._heal_loop()),
         ]
+        if self._policy_fetcher is not None:
+            self._tasks.append(asyncio.create_task(self._policy_loop()))
         logger.info(
             "리플리케이션 스케줄러 시작 (backup=%.0fs, heal=%.0fs, max=%d/주기)",
             self._backup_interval, self._heal_interval, self._max,
         )
+
+    async def _policy_loop(self) -> None:
+        """주기적으로 서버 정책을 내려받아 적용한다(시작 시 즉시 1회)."""
+        while not self._stop.is_set():
+            try:
+                policy = await self._policy_fetcher()
+                if policy and self._on_policy is not None:
+                    self._on_policy(policy)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 — 루프 유지
+                logger.warning("정책 갱신 실패: %s", e)
+            await self._sleep(self._policy_interval)
 
     async def stop(self) -> None:
         """루프를 중지하고 매니저를 정리한다."""

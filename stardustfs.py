@@ -162,25 +162,26 @@ def _daemon_stop(config_path: str) -> int:
 _RECIPROCITY_FRACTION = 0.5
 
 
-def _build_parity_store(config: dict):
-    """호스트 역할 패리티 스토어를 생성한다(replication.enabled 일 때만).
+def _build_parity_store(config: dict, fraction: float = _RECIPROCITY_FRACTION):
+    """호스트 역할 패리티 스토어를 생성한다(replication.enabled 일 때만, 기본 활성).
 
-    보관 디렉토리는 {metadata_db}.parity. 최대 용량은 replication.provided_bytes의
-    호혜 비율(0.5). 레거시: replication 섹션이 없으면 p2p.parity_enabled +
-    parity_max_bytes로 폴백. 비활성 시 None.
+    보관 디렉토리는 {metadata_db}.parity. 최대 용량은 provided_bytes * fraction
+    (정책 호혜 비율). provided_bytes 미지정 시 0(호스팅 안 함). 레거시 p2p.parity_max_bytes
+    지원. replication.enabled=false면 None.
     """
     repl = config.get("replication", {})
     p2p_config = config.get("p2p", {})
-    enabled = repl.get("enabled", p2p_config.get("parity_enabled", False))
-    if not enabled:
+    if not repl.get("enabled", True):  # 기본 활성
         return None
     from stardustlib.parity_store import ParityStore
 
     base_dir = config["metadata_db"] + ".parity"
     if "provided_bytes" in repl:
-        max_bytes = int(repl["provided_bytes"] * _RECIPROCITY_FRACTION)
+        max_bytes = int(repl["provided_bytes"] * fraction)
+    elif "parity_max_bytes" in p2p_config:
+        max_bytes = p2p_config["parity_max_bytes"]
     else:
-        max_bytes = p2p_config.get("parity_max_bytes")
+        max_bytes = 0  # 활성이지만 제공 용량 미설정 → 타인 청크 보관 안 함
     return ParityStore(base_dir, max_bytes)
 
 
@@ -366,19 +367,29 @@ async def startup_v2(config: dict, config_path: str) -> None:
     # 등록된 device_id를 JBOD에 주입 (파일 변경 추적용)
     jbod_manager.device_id = device_mgr.device_id
 
-    # (5-a) 리플리케이션 활성 시 제공 용량 신고 (호스팅 역할)
+    # (5-a) 리플리케이션 정책 다운로드(시작 1회) + 제공 용량 신고
+    # 기본 활성(replication.enabled 미지정 시 true), 호혜 비율 0.5.
     repl_config = config.get("replication", {})  # type: ignore[attr-defined]
-    if repl_config.get("enabled", False):
-        from stardustlib.replication_hosting import report_hosting
+    repl_enabled = repl_config.get("enabled", True)
+    repl_provided = int(repl_config.get("provided_bytes", 0))
+    repl_fraction = float(repl_config.get("reciprocity_fraction", _RECIPROCITY_FRACTION))
+    repl_min = int(repl_config.get("min_replicas", 3))
+    if repl_enabled:
+        from stardustlib.replication_hosting import fetch_policy, report_hosting
 
-        provided = int(repl_config.get("provided_bytes", 0))
-        if device_mgr.device_id and provided > 0:
+        policy = await fetch_policy(auth_client, server_url)
+        if policy:
+            repl_fraction = policy["reciprocity_fraction"]
+            repl_min = policy["min_replicas"]
+            logger.info("리플리케이션 정책 수신: 호혜 %.0f%%, 목표 복제본 %d",
+                        repl_fraction * 100, repl_min)
+        if device_mgr.device_id and repl_provided > 0:
             ok = await report_hosting(
-                auth_client, server_url, device_mgr.device_id, provided
+                auth_client, server_url, device_mgr.device_id, repl_provided
             )
             if ok:
                 logger.info("호스팅 용량 신고: %d bytes (호혜 %.0f%%)",
-                            provided, _RECIPROCITY_FRACTION * 100)
+                            repl_provided, repl_fraction * 100)
         elif not device_mgr.device_id:
             logger.warning("device 미등록 — 호스팅 신고를 건너뜁니다")
 
@@ -462,12 +473,14 @@ async def startup_v2(config: dict, config_path: str) -> None:
 
     p2p_server = None
     relay_worker = None
+    parity_store = None
     p2p_enabled = p2p_config.get("enabled", False)
 
     if p2p_enabled:
+        parity_store = _build_parity_store(config, repl_fraction)
         p2p_server = P2PServer(
             jbod_manager, auth_client, p2p_port, server_url,
-            parity_store=_build_parity_store(config),
+            parity_store=parity_store,
         )
         await p2p_server.start()
         await device_mgr.setup_upnp()
@@ -486,22 +499,35 @@ async def startup_v2(config: dict, config_path: str) -> None:
     await device_mgr.start_heartbeat()
     await sync_client.start_periodic_sync()
 
-    # (6-b) 리플리케이션 스케줄러 (자동 백업/heal) — replication.enabled 일 때만
+    # (6-b) 리플리케이션 스케줄러 (자동 백업/heal/정책 갱신) — 기본 활성
     repl_scheduler = None
-    if repl_config.get("enabled", False):
+    if repl_enabled:
+        from stardustlib.replication_hosting import fetch_policy
         from stardustlib.replication_manager import ReplicationManager
         from stardustlib.replication_scheduler import ReplicationScheduler
 
         repl_mgr = ReplicationManager(
             auth_client, server_url, metadata_store, jbod_manager,
-            min_replicas=repl_config.get("min_replicas", 3),
+            min_replicas=repl_min,
         )
+
+        def _apply_policy(policy: dict) -> None:
+            """주기적으로 내려받은 정책을 매니저/패리티에 반영한다."""
+            repl_mgr.set_min_replicas(policy["min_replicas"])
+            if parity_store is not None and repl_provided > 0:
+                parity_store.set_max_bytes(
+                    int(repl_provided * policy["reciprocity_fraction"])
+                )
+
         repl_scheduler = ReplicationScheduler(
             repl_mgr, metadata_store, device_mgr.device_id,
             backup_interval=repl_config.get("backup_interval_seconds", 300),
             heal_interval=repl_config.get("heal_interval_seconds", 3600),
             heal_grace_seconds=repl_config.get("heal_grace_seconds", 86400),
             max_files_per_cycle=repl_config.get("max_files_per_cycle", 20),
+            policy_fetcher=lambda: fetch_policy(auth_client, server_url),
+            on_policy=_apply_policy,
+            policy_interval=repl_config.get("policy_interval_seconds", 3600),
         )
         await repl_scheduler.start()
 

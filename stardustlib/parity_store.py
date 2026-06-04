@@ -55,6 +55,10 @@ class ParityStore:
     def _chunk_path(self, chunk_id: str) -> str:
         return os.path.join(self._dir, chunk_id + ".bin")
 
+    def set_max_bytes(self, max_bytes: int | None) -> None:
+        """호스팅 쿼터를 갱신한다(정책 변경 반영). None이면 무제한."""
+        self._max_bytes = max_bytes
+
     def used_bytes(self) -> int:
         return sum(meta.get("size", 0) for meta in self._index.values())
 

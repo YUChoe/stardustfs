@@ -109,11 +109,13 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
   결합 → 복호화 → 로컬 복원. 도달 불가 청크가 있으면 누락 chunk_id 명시 에러.
 - heal: 청크별 online 복제 수가 부족하면 온라인 홀더에서 받아(불변 청크) 새 홀더로
   복사. 호스트는 키가 없어 청크를 복호화할 수 없다.
-- 운영 활성화(`replication.enabled`): daemon이 시작 시 제공 용량(`provided_bytes`)을
-  서버에 신고하고 ParityStore를 `provided*0.5`로 켠다. `replication_scheduler`가
-  백그라운드로 미복제(none) 로컬 파일을 주기적으로 자동 backup하고, replicated/pending
-  파일을 주기적으로 heal한다(파일 단위 실패 격리, asyncio.to_thread로 루프 비차단).
-  기본 비활성이며, CLI `backup`/`restore`/`heal`은 수동 경로로 항상 사용 가능.
+- 운영 활성화(`replication.enabled`, 기본 활성): daemon이 시작 시 GET
+  `/replication/policy`로 호혜 비율·목표 복제본 수를 내려받아 적용하고(주기 갱신),
+  `provided_bytes`를 서버에 신고하며 ParityStore를 `provided*비율`로 켠다(provided
+  미설정 시 0=타인 보관 안 함). `replication_scheduler`가 백그라운드로 미복제(none)
+  로컬 파일을 자동 backup하고, degraded가 유예(`heal_grace_seconds`, 기본 24h) 이상
+  지속되면 heal한다(파일 단위 실패 격리, asyncio.to_thread로 루프 비차단). CLI
+  `backup`/`restore`/`heal`은 수동 경로로 항상 사용 가능.
 
 ## 설계 결정 (요약)
 

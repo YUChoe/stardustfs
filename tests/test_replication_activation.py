@@ -9,7 +9,7 @@ from aiohttp import web
 
 from stardustfs import _RECIPROCITY_FRACTION, _build_parity_store
 from stardustlib.auth_client import AuthClient
-from stardustlib.replication_hosting import report_hosting
+from stardustlib.replication_hosting import fetch_policy, report_hosting
 
 
 def _free_port() -> int:
@@ -34,7 +34,22 @@ def test_parity_disabled_returns_none(tmp_path):
     config = {"metadata_db": str(tmp_path / "m.db"),
               "replication": {"enabled": False}}
     assert _build_parity_store(config) is None
-    assert _build_parity_store({"metadata_db": str(tmp_path / "m.db")}) is None
+
+
+def test_parity_enabled_by_default_with_zero_host_capacity(tmp_path):
+    # replication 섹션이 없어도 기본 활성, provided 미설정 → max 0(타인 보관 안 함)
+    ps = _build_parity_store({"metadata_db": str(tmp_path / "m.db")})
+    assert ps is not None and ps._max_bytes == 0
+
+
+def test_parity_uses_policy_fraction(tmp_path):
+    config = {
+        "metadata_db": str(tmp_path / "m.db"),
+        "replication": {"enabled": True, "provided_bytes": 1000},
+    }
+    # 정책 비율 0.25를 주입 → max=250
+    ps = _build_parity_store(config, 0.25)
+    assert ps is not None and ps._max_bytes == 250
 
 
 def test_parity_legacy_p2p_flag(tmp_path):
@@ -71,6 +86,7 @@ class _HostingServer:
     async def start(self) -> None:
         app = web.Application()
         app.router.add_post("/replication/hosting", self._handle)
+        app.router.add_get("/replication/policy", self._policy)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, "127.0.0.1", self._port)
@@ -83,6 +99,11 @@ class _HostingServer:
     async def _handle(self, request: web.Request) -> web.Response:
         self.received = await request.json()
         return web.json_response({"status": "ok"}, status=self._status)
+
+    async def _policy(self, request: web.Request) -> web.Response:
+        return web.json_response(
+            {"reciprocity_fraction": 0.5, "min_replicas": 3}, status=self._status
+        )
 
 
 @pytest_asyncio.fixture
@@ -113,6 +134,24 @@ async def test_report_hosting_404_graceful():
     finally:
         await auth.close()
         await srv.stop()
+
+
+@pytest.mark.asyncio
+async def test_fetch_policy_success(hosting_server):
+    auth = _FakeAuth(hosting_server.url)
+    policy = await fetch_policy(auth, hosting_server.url)
+    await auth.close()
+    assert policy == {"reciprocity_fraction": 0.5, "min_replicas": 3}
+
+
+@pytest.mark.asyncio
+async def test_fetch_policy_unreachable_returns_none():
+    url = f"http://127.0.0.1:{_free_port()}"
+    auth = _FakeAuth(url)
+    try:
+        assert await fetch_policy(auth, url, timeout=1.0) is None
+    finally:
+        await auth.close()
 
 
 @pytest.mark.asyncio

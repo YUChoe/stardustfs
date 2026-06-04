@@ -114,6 +114,11 @@ class ReplicationManager:
         """목표 복제본 수."""
         return self._min_replicas
 
+    def set_min_replicas(self, n: int) -> None:
+        """목표 복제본 수를 갱신한다(정책 변경 반영)."""
+        if n >= 1:
+            self._min_replicas = n
+
     def _file_ref(self, virtual_path: str) -> str:
         uid = self._auth.user_id or ""
         return hashlib.sha256(

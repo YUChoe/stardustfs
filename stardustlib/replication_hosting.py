@@ -51,3 +51,38 @@ async def report_hosting(
         logger.warning("호스팅 신고 실패: HTTP %d", resp.status_code)
         return False
     return True
+
+
+async def fetch_policy(
+    auth_client: AuthClient, server_url: str, *, timeout: float = 10.0
+) -> dict | None:
+    """GET /replication/policy로 리플리케이션 정책을 내려받는다.
+
+    {"reciprocity_fraction": float, "min_replicas": int} 또는 실패 시 None
+    (인증/네트워크/미배포 — 호출자가 설정/기본값 사용).
+    """
+    try:
+        token = await auth_client.get_valid_token()
+    except AuthenticationError:
+        return None
+
+    url = f"{server_url.rstrip('/')}/replication/policy"
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(
+                url, headers={"Authorization": f"Bearer {token}"}
+            )
+    except (httpx.TimeoutException, httpx.NetworkError) as e:
+        logger.warning("정책 조회 실패(서버 도달 불가): %s", e)
+        return None
+
+    if resp.status_code != 200:
+        return None
+    try:
+        data = resp.json()
+        return {
+            "reciprocity_fraction": float(data["reciprocity_fraction"]),
+            "min_replicas": int(data["min_replicas"]),
+        }
+    except (ValueError, KeyError, TypeError):
+        return None
