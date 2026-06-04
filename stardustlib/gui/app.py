@@ -40,6 +40,7 @@ class StardustApp:
         self.worker = Worker()
         self._rows: dict[str, dict] = {}
         self._auto_started = False
+        self._last_meta_mtime = 0.0
         self.lang = i18n.detect_lang()
         self.t = i18n.get_text(self.lang)
 
@@ -53,6 +54,7 @@ class StardustApp:
 
         self.root.after(80, self._tick)
         self.root.after(200, self._refresh_daemon)
+        self.root.after(3000, self._poll_meta)
         if self.config_path:
             self.refresh()
         else:
@@ -171,7 +173,7 @@ class StardustApp:
         ttk.Button(pframe, text=t["refresh"], command=self.refresh).pack(side="left", padx=4)
 
         cols = ("type", "name", "size", "owner", "backup")
-        self.tree = ttk.Treeview(self.body, columns=cols, show="headings", selectmode="browse")
+        self.tree = ttk.Treeview(self.body, columns=cols, show="headings", selectmode="extended")
         for c, head, w in (
             ("type", t["col_type"], 60), ("name", t["col_name"], 320),
             ("size", t["col_size"], 100), ("owner", t["col_owner"], 90),
@@ -202,6 +204,32 @@ class StardustApp:
     def _tick(self) -> None:
         self.worker.poll()
         self.root.after(80, self._tick)
+
+    # --- 메타데이터 변경 감지 → 자동 새로고침 ---
+
+    def _mark_meta_seen(self) -> None:
+        """현재 메타데이터 mtime을 '본 것'으로 기록한다(자동 새로고침 기준점)."""
+        if self.config_path:
+            try:
+                self._last_meta_mtime = actions.metadata_mtime(self.config_path)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _poll_meta(self) -> None:
+        """daemon이 메타데이터를 갱신(동기화 등)하면 목록을 자동 새로고침한다.
+
+        목록만 가볍게 갱신(counts=False)해 삭제/추가가 수동 새로고침 없이 반영된다.
+        백업 수(온라인 조회)는 수동 새로고침에서만 갱신한다.
+        """
+        try:
+            if self.config_path and self._logged_in():
+                m = actions.metadata_mtime(self.config_path)
+                if m > self._last_meta_mtime:
+                    self._last_meta_mtime = m
+                    self.refresh(counts=False)
+        except Exception:  # noqa: BLE001 — 폴링 실패는 무시
+            pass
+        self.root.after(3000, self._poll_meta)
 
     def _submit(self, fn, on_ok=None, busy: str | None = None) -> None:
         if not self.config_path:
@@ -318,7 +346,7 @@ class StardustApp:
 
     # --- 탐색 ---
 
-    def refresh(self) -> None:
+    def refresh(self, counts: bool = True) -> None:
         self.vpath = self.path_var.get() or "/"
         if not self.config_path:
             self._populate([])
@@ -331,7 +359,8 @@ class StardustApp:
             return
         cfg = self.config_path
         vp = self.vpath
-        self._submit(lambda: actions.browse(cfg, vp), self._show_browse,
+        self._submit(lambda: actions.browse(cfg, vp),
+                     lambda d: self._show_browse(d, counts),
                      self.t["busy_browse"])
 
     def _logged_in(self) -> bool:
@@ -369,12 +398,16 @@ class StardustApp:
             )
             self._rows[iid] = r
 
-    def _show_browse(self, d: dict) -> None:
+    def _show_browse(self, d: dict, counts: bool = True) -> None:
         self._populate(d["rows"])
         self._set_status(self.t["cap"].format(
             used=_human(d["used"]), total=_human(d["total"]),
             avail=_human(d["available"]), pending=d["pending"],
         ))
+        # 방금 본 메타데이터 시점을 기록(자동 새로고침이 즉시 재발동하지 않도록).
+        self._mark_meta_seen()
+        if not counts:
+            return
         # 로컬 상태가 pending/replicated인 파일만 실제 복제본 수를 백그라운드 조회해
         # 병기한다. none(미백업) 뿐이면 서버 조회를 생략한다(불필요한 초기화/호출 방지).
         # (조용한 보강 — worker 콜백은 (ok, payload) 시그니처, 실패 시 상태만 유지)
@@ -406,6 +439,10 @@ class StardustApp:
     def _selected(self) -> dict | None:
         sel = self.tree.selection()
         return self._rows.get(sel[0]) if sel else None
+
+    def _selected_rows(self) -> list[dict]:
+        """다중 선택된 행 목록(없으면 빈 리스트)."""
+        return [self._rows[i] for i in self.tree.selection() if i in self._rows]
 
     def _join(self, name: str) -> str:
         return self.vpath.rstrip("/") + "/" + name
@@ -468,18 +505,20 @@ class StardustApp:
                      self.t["mkdir_busy"])
 
     def _delete(self) -> None:
-        row = self._selected()
-        if not row:
+        rows = self._selected_rows()
+        if not rows:
             return
-        if not messagebox.askyesno(
-            self.t["delete"], self.t["delete_confirm"].format(name=row["name"])
-        ):
+        if len(rows) == 1:
+            prompt = self.t["delete_confirm"].format(name=rows[0]["name"])
+        else:
+            prompt = self.t["delete_confirm_many"].format(count=len(rows))
+        if not messagebox.askyesno(self.t["delete"], prompt):
             return
         cfg = self.config_path
-        path = self._join(row["name"])
-        recursive = row["type"] == "dir"
-        self._submit(lambda: actions.remove(cfg, path, recursive),
-                     lambda _r: self._after_write(), self.t["delete_busy"])
+        items = [(self._join(r["name"]), r["type"] == "dir") for r in rows]
+        # 다중 선택도 온라인 세션 1회로 일괄 삭제 + 1회 전파.
+        self._submit(lambda: actions.remove_many(cfg, items),
+                     lambda _n: self._after_write(), self.t["delete_busy"])
 
     def _move(self) -> None:
         row = self._selected()

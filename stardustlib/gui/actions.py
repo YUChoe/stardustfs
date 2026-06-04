@@ -329,6 +329,50 @@ def remove(config_path: str, path: str, recursive: bool) -> None:
     asyncio.run(_run_online(config_path, aop, sync=True))
 
 
+def remove_many(config_path: str, items: list[tuple[str, bool]]) -> int:
+    """여러 경로를 한 번의 온라인 세션에서 삭제하고 1회만 서버에 전파한다.
+
+    items: (가상경로, recursive) 목록. 삭제 성공 수를 반환한다(이미 없는 항목은 무시).
+    파일마다 open_online을 반복하지 않아 일괄 삭제가 빠르다.
+    """
+    norm = [(_vpath(p), bool(r)) for p, r in items]
+
+    async def aop(s):
+        count = 0
+        for path, recursive in norm:
+            try:
+                if recursive:
+                    s.jbod.delete_directory(path)
+                else:
+                    s.jbod.delete_file(path)
+                count += 1
+            except FileNotFoundError:
+                pass  # 이미 삭제됨
+        await s.upload_if_online()
+        return count
+
+    return asyncio.run(_run_online(config_path, aop, sync=True))
+
+
+def metadata_mtime(config_path: str) -> float:
+    """메타데이터 DB의 최근 변경 시각(metadata.db / -wal 중 최대). 없으면 0.
+
+    GUI가 daemon(별도 프로세스)의 메타데이터 변경을 감지해 자동 새로고침하는 데 쓴다.
+    WAL 모드에서는 쓰기가 -wal에 먼저 반영되므로 두 파일 mtime의 최대를 본다.
+    """
+    config = ConfigLoader(config_path).load()
+    db = config.get("metadata_db")
+    if not db:
+        return 0.0
+    latest = 0.0
+    for suffix in ("", "-wal"):
+        try:
+            latest = max(latest, os.path.getmtime(db + suffix))
+        except OSError:
+            pass
+    return latest
+
+
 def move(config_path: str, src: str, dst: str) -> None:
     sv, dv = _vpath(src), _vpath(dst)
 
@@ -423,9 +467,22 @@ def daemon_signal_stop(config_path: str) -> dict:
 
 
 def daemon_start(config_path: str) -> int:
-    """daemon을 백그라운드 프로세스로 시작하고 pid를 반환한다."""
-    proc = subprocess.Popen(
-        [sys.executable, "stardustfs.py", "daemon", "--config", config_path],
-        cwd=_REPO_ROOT,
-    )
+    """daemon을 백그라운드 프로세스로 시작하고 pid를 반환한다.
+
+    daemon의 stdout/stderr는 {metadata_db}.daemon.log로 보낸다 — GUI 콘솔에
+    daemon 초기화 로그가 섞여 '초기화 반복'처럼 보이지 않도록 한다(daemon은 GUI와
+    별개 프로세스라 자체 코어 초기화를 수행한다).
+    """
+    config = ConfigLoader(config_path).load()
+    log_path = config["metadata_db"] + ".daemon.log"
+    log_file = open(log_path, "a", encoding="utf-8")
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "stardustfs.py", "daemon", "--config", config_path],
+            cwd=_REPO_ROOT,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
+    finally:
+        log_file.close()  # 자식이 자체 핸들을 보유하므로 부모 핸들은 닫는다
     return proc.pid

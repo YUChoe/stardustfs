@@ -57,6 +57,16 @@ def test_replica_counts_empty_when_offline(tmp_path):
     assert actions.replica_counts(cfg_path, "/", []) == {}
 
 
+def test_metadata_mtime(tmp_path):
+    base = tmp_path / "setup-mt"
+    cfg_path = actions.create_config(
+        str(base), "", "dev-mt", generate_key=True
+    )
+    # 설정 생성 시 metadata_db 경로가 잡히고, 코어 동작 후 파일이 생긴다.
+    mt = actions.metadata_mtime(cfg_path)
+    assert isinstance(mt, float) and mt >= 0.0
+
+
 def test_created_config_validates(tmp_path):
     from stardustlib.config_loader import ConfigLoader
 
