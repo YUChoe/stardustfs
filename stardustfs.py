@@ -33,6 +33,11 @@ def main() -> None:
     단발 CLI 명령(ls/df/...)이면 해당 명령을 실행한다. `--config`는 서브커맨드
     앞에 둔다 (예: `stardustfs.py --config dev-config.json ls /`).
     """
+    # Windows 콘솔(cp1252 등)에서 한글 출력 시 UnicodeEncodeError 방지.
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+
     from stardustlib.cli.dispatcher import (
         add_subcommands,
         is_cli_command,
