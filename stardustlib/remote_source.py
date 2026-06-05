@@ -241,6 +241,22 @@ class RemoteSource(StorageSource):
             )
         )
 
+    def push_blob(self, physical_path: str, data: bytes) -> str:
+        """at-rest 암호문 블록을 원격에 기록하고 사용된 원격 source_id를 반환한다.
+
+        evacuate(스토리지 분리 시 파일을 원격으로 이동)에서 사용한다. 데이터는 이미
+        암호문이므로 재암호화하지 않는다(zero-knowledge 유지).
+        """
+        self._check_active()
+        encoded = base64.b64encode(data).decode("ascii")
+        result = self._io.run_coroutine(
+            self._p2p_request(
+                "/p2p/write",
+                {"physical_path": physical_path, "data": encoded},
+            )
+        )
+        return result.get("source_id", "")
+
     def delete(self, physical_path: str) -> None:
         """P2P POST /p2p/delete 요청으로 파일을 삭제한다."""
         self._check_active()

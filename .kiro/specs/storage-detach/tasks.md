@@ -20,10 +20,13 @@ inclusion: manual
 - [x] 2.5 단위 테스트 6종: directory 거부 / 이동·무손실 / 용량부족 보류 / 빈 소스 ok /
       detach 제거 / unmoved 유지. GUI detach 버튼이 detach_source 호출.
 
-## Phase 3: 리모트(타 디바이스) evacuate (후속)
-- [ ] 3.1 로컬 용량 부족 파일을 온라인 리모트로 push(RemoteSource.write) + 메타
-      device_id/source_id/physical_path 갱신. 대상 소스 id 확보 방법 결정.
-- [ ] 3.2 오프라인/실패 시 unmoved(원본 보존). 테스트(mock 리모트).
+## Phase 3: 리모트(타 디바이스) evacuate
+- [x] 3.1 P2P /p2p/write가 사용한 source_id 반환 + RemoteSource.push_blob(raw 암호문
+      기록 후 원격 source_id 반환). jbod._evacuate_to_remote: 로컬 불가 파일을 온라인
+      리모트로 push → 메타 device_id/source_id/physical_path 갱신 → 원본 삭제.
+- [x] 3.2 도달 가능한 리모트 없거나 실패 시 unmoved(원본 보존). detach_source는
+      로그인 시 온라인 세션(로컬+리모트), 아니면 오프라인(로컬만). 테스트 mock 리모트
+      2종(로컬 만석→리모트 이동, 리모트 오프라인→unmoved).
 - [ ] (비범위) 타 사용자 리모트: 권한·인가 확장 — 별도.
 
 ## Phase 4: GUI 연동 + 문서

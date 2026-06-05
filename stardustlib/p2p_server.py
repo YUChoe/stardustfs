@@ -289,7 +289,8 @@ class P2PServer:
         # 상위 디렉토리 생성은 소스 구현에 위임한다(LoopbackSource는 동반
         # 디렉토리에 기록하며 내부에서 부모를 생성).
         source.write(physical_path, data)
-        return 200, {"bytes_written": len(data)}
+        # 사용된 소스 id를 알려준다(evacuate가 메타데이터 source_id 갱신에 사용).
+        return 200, {"bytes_written": len(data), "source_id": source.source_id}
 
     def _op_delete(self, body: dict) -> tuple[int, dict]:
         """파일 삭제 로직."""

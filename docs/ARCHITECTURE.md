@@ -54,7 +54,9 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
 - 스토리지 detach(분리)는 "evacuate 후 분리": `jbod.evacuate_source`가 그 소스의 활성
   파일을 남은 로컬 소스로 at-rest 암호문 그대로 이동(대상 기록 성공 후 원본 삭제=무손실)
   하고, 모든 파일이 이동된 경우에만 설정에서 소스를 제거한다(원자적). 로컬 용량 부족분은
-  미이동으로 남겨 detach 보류(리모트 디바이스로의 분산 evacuate는 후속).
+  온라인 리모트 디바이스(같은 사용자)로 분산 이동한다(`_evacuate_to_remote`: 암호문
+  블록을 /p2p/write로 push → 메타 device_id/source_id 갱신 → 원본 삭제). 도달 가능한
+  대상이 없으면 미이동으로 남겨 detach 보류(타 사용자 리모트는 후속).
 - `remote_source.py`: 원격 디바이스 프록시. 전용 백그라운드 이벤트 루프에서 P2P
   직접 연결 + 실패 시 릴레이 fallback. 동기 메서드로 자가 브리지.
 - `p2p_server.py` / `relay_client.py` / `relay_worker.py`: P2P 서버와 서버 경유 릴레이.

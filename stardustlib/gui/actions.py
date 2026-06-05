@@ -207,15 +207,33 @@ def remove_source(config_path: str, source_id: str) -> None:
 def detach_source(config_path: str, source_id: str) -> dict:
     """소스를 evacuate 후 분리한다.
 
-    그 소스의 활성 파일을 남은 로컬 소스로 이동(Phase 2)하고, 모두 이동되면 설정에서
-    소스를 제거한다(원자적). 미이동 파일이 있으면 소스를 유지하고 보고한다.
+    그 소스의 활성 파일을 남은 로컬 소스로, 로컬 용량 부족분은 온라인 리모트
+    디바이스로 분산 이동한 뒤, 모두 이동되면 설정에서 소스를 제거한다(원자적).
+    미이동 파일이 있으면 소스를 유지하고 보고한다.
     반환: {"ok", "moved": [...], "unmoved": [...], "detached": bool}.
 
-    주의: 캐시된 오프라인 세션의 로컬 코어로 물리 블록을 옮긴다. daemon이 같은
-    소스를 쓰고 있으면 충돌할 수 있으므로 호출 전 daemon 정지를 권장한다.
+    로그인 상태면 온라인 세션(로컬+리모트), 아니면 오프라인 세션(로컬만)으로 evacuate.
+    주의: daemon이 같은 소스를 쓰고 있으면 충돌할 수 있어 호출 전 daemon 정지 권장.
     """
-    session = _offline_session(config_path)
-    report = session.jbod.evacuate_source(source_id)
+    config = ConfigLoader(config_path).load()
+    server = config.get("server")
+    server_url = server.get("url") if isinstance(server, dict) else None
+    use_online = bool(server_url) and is_logged_in(config_path)
+
+    report: dict
+    if use_online:
+        async def aop(s):
+            r = s.jbod.evacuate_source(source_id)
+            await s.upload_if_online()  # 이동된 메타데이터 전파
+            return r
+
+        try:
+            report = asyncio.run(_run_online(config_path, aop, sync=True))
+        except Exception:  # noqa: BLE001 — 온라인 불가 시 로컬만
+            report = _offline_session(config_path).jbod.evacuate_source(source_id)
+    else:
+        report = _offline_session(config_path).jbod.evacuate_source(source_id)
+
     detached = False
     if report.get("ok"):
         remove_source(config_path, source_id)

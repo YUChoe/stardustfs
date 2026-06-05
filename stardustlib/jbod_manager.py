@@ -157,26 +157,65 @@ class JBODManager:
                     meta.file_size, exclude_ids=(source_id,)
                 )
             except InsufficientStorageError:
-                unmoved.append(meta.virtual_path)
-                continue
+                target = None
             try:
-                blob = src.read(meta.physical_path)
-                new_phys = self._generate_physical_path(meta.virtual_path)
-                target.write(new_phys, blob)  # 대상 기록 먼저
-                self.metadata_store.update(
-                    meta.virtual_path, file_size=meta.file_size,
-                    modified_at=meta.modified_at, device_id=self.device_id,
-                    source_id=target.source_id, physical_path=new_phys,
-                )
-                try:
-                    src.delete(meta.physical_path)  # 성공 확인 후 원본 삭제
-                except OSError:
-                    pass
-                moved.append(meta.virtual_path)
+                if target is not None:
+                    # 로컬 이동
+                    blob = src.read(meta.physical_path)
+                    new_phys = self._generate_physical_path(meta.virtual_path)
+                    target.write(new_phys, blob)  # 대상 기록 먼저
+                    self.metadata_store.update(
+                        meta.virtual_path, file_size=meta.file_size,
+                        modified_at=meta.modified_at, device_id=self.device_id,
+                        source_id=target.source_id, physical_path=new_phys,
+                    )
+                    try:
+                        src.delete(meta.physical_path)  # 성공 후 원본 삭제
+                    except OSError:
+                        pass
+                    moved.append(meta.virtual_path)
+                elif self._evacuate_to_remote(meta, src):
+                    moved.append(meta.virtual_path)
+                else:
+                    unmoved.append(meta.virtual_path)
             except Exception as e:  # noqa: BLE001 — 파일 단위 격리(원본 보존)
                 logger.error("evacuate 실패: %s: %s", meta.virtual_path, e)
                 unmoved.append(meta.virtual_path)
         return {"ok": not unmoved, "moved": moved, "unmoved": unmoved}
+
+    def _evacuate_to_remote(self, meta, src) -> bool:
+        """로컬 용량 부족 파일을 온라인 리모트 디바이스로 옮긴다(같은 사용자).
+
+        암호문 블록을 원격에 push → 메타데이터를 원격 소유로 갱신 → 원본 블록 삭제.
+        도달 가능한 리모트가 없으면 False(원본 보존, 미이동).
+        """
+        if not self._remote_devices:
+            return False
+        blob = src.read(meta.physical_path)
+        for device_id, remote in self._remote_devices.items():
+            if not getattr(remote, "is_active", False):
+                continue
+            try:
+                new_phys = self._generate_physical_path(meta.virtual_path)
+                remote_src_id = remote.push_blob(new_phys, blob)
+                if not remote_src_id:
+                    continue
+                self.metadata_store.update(
+                    meta.virtual_path, file_size=meta.file_size,
+                    modified_at=meta.modified_at, device_id=device_id,
+                    source_id=remote_src_id, physical_path=new_phys,
+                )
+                try:
+                    src.delete(meta.physical_path)  # 원격 기록 성공 후 원본 삭제
+                except OSError:
+                    pass
+                logger.info("evacuate→리모트: %s → device=%s",
+                            meta.virtual_path, device_id)
+                return True
+            except Exception as e:  # noqa: BLE001 — 다음 리모트 시도
+                logger.warning("리모트 evacuate 실패(%s): %s", device_id, e)
+                continue
+        return False
 
     # --- 파일 작업 ---
 

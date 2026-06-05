@@ -85,6 +85,56 @@ def test_evacuate_empty_source_ok(tmp_path):
     store.close()
 
 
+class _FakeRemote:
+    """evacuate 리모트 대상 mock(push_blob → source_id 반환)."""
+
+    def __init__(self, source_id="remote-src", active=True, fail=False):
+        self.source_id = source_id
+        self.is_active = active
+        self.fail = fail
+        self.stored: dict[str, bytes] = {}
+
+    def push_blob(self, physical_path: str, data: bytes) -> str:
+        if self.fail:
+            raise OSError("remote offline")
+        self.stored[physical_path] = data
+        return self.source_id
+
+
+def test_evacuate_to_remote_when_local_full(tmp_path):
+    # 단일 로컬 소스(이동 대상 없음) + 온라인 리모트 → 리모트로 이동
+    a = _loop(tmp_path, "only", size=10 * 1024 * 1024)
+    jbod, store = _jbod(tmp_path, [a])
+    remote = _FakeRemote(source_id="dev-b-src")
+    jbod.register_remote_device("dev-b", remote)
+    phys = jbod._generate_physical_path("/f")
+    a.write(phys, b"cipher-blob")
+    store.insert("/f", "only", phys, 11, 0.0, 0.0, device_id="devA")
+
+    report = jbod.evacuate_source("only")
+    assert report["ok"] is True
+    assert report["moved"] == ["/f"]
+    meta = store.lookup("/f")
+    assert meta.device_id == "dev-b"          # 원격 소유로 이전
+    assert meta.source_id == "dev-b-src"      # 원격 소스 id 반영
+    assert b"cipher-blob" in remote.stored.values()
+    store.close()
+
+
+def test_evacuate_unmoved_when_remote_offline(tmp_path):
+    a = _loop(tmp_path, "only2", size=10 * 1024 * 1024)
+    jbod, store = _jbod(tmp_path, [a])
+    jbod.register_remote_device("dev-b", _FakeRemote(active=False))
+    phys = jbod._generate_physical_path("/f")
+    a.write(phys, b"x")
+    store.insert("/f", "only2", phys, 1, 0.0, 0.0, device_id="devA")
+
+    report = jbod.evacuate_source("only2")
+    assert report["ok"] is False and report["unmoved"] == ["/f"]
+    assert a.read(phys) == b"x"  # 원본 보존
+    store.close()
+
+
 def test_detach_source_removes_from_config_when_evacuated(tmp_path, monkeypatch):
     # detach_source는 캐시된 오프라인 세션을 쓰므로, 세션의 jbod.evacuate_source를
     # 성공 모킹해 config에서 제거되는지 검증한다.
