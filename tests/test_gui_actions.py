@@ -96,13 +96,13 @@ def test_source_add_remove(tmp_path):
     cfg_path = actions.create_config(
         str(base), "https://s.example", "dev", generate_key=True
     )
-    extra = tmp_path / "extra"
-    extra.mkdir()
+    img = tmp_path / "extra.img"
     before = len(actions.list_sources(cfg_path))
-    sid = actions.add_source(cfg_path, "directory", str(extra))
+    sid = actions.add_source(cfg_path, "loopback", str(img),
+                             size=10 * 1024 * 1024)
     srcs = actions.list_sources(cfg_path)
     assert len(srcs) == before + 1
-    assert any(s["id"] == sid and s["path"] == _os.path.abspath(str(extra))
+    assert any(s["id"] == sid and s["path"] == _os.path.abspath(str(img))
                for s in srcs)
     actions.remove_source(cfg_path, sid)
     assert all(s["id"] != sid for s in actions.list_sources(cfg_path))

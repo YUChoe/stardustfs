@@ -102,6 +102,16 @@ _KO: dict[str, str] = {
         "소스 '{id}'를 설정에서 제거할까요?\n물리 데이터는 삭제되지 않으나 해당 "
         "소스의 파일은 접근 불가가 되며, 실행 중인 daemon은 재시작해야 반영됩니다."
     ),
+    "src_detach_confirm": (
+        "소스 '{id}'를 분리할까요?\n그 소스의 파일을 남은 로컬 소스로 모두 이동한 "
+        "뒤에야 분리됩니다(.img는 삭제되지 않음). daemon은 정지 상태를 권장합니다."
+    ),
+    "src_detach_busy": "분리 준비(파일 이동) 중...",
+    "src_detach_done": "분리 완료: {moved}개 파일 이동",
+    "src_detach_blocked": (
+        "분리 보류: {unmoved}개 파일을 옮길 곳이 없습니다(로컬 용량 부족). "
+        "용량 확보 후 다시 시도하세요."
+    ),
     # 로그인
     "login_email": "이메일:",
     "login_password": "비밀번호:",
@@ -226,6 +236,17 @@ _EN: dict[str, str] = {
     "src_remove_confirm": (
         "Remove source '{id}' from the config?\nThe physical data is not deleted, "
         "but its files become inaccessible, and a running daemon must be restarted."
+    ),
+    "src_detach_confirm": (
+        "Detach source '{id}'?\nAll its files are first moved to remaining local "
+        "sources, then the source is detached (the .img is not deleted). Stopping "
+        "the daemon first is recommended."
+    ),
+    "src_detach_busy": "Preparing detach (moving files)...",
+    "src_detach_done": "Detached: {moved} files moved",
+    "src_detach_blocked": (
+        "Detach blocked: {unmoved} files have nowhere to move (insufficient local "
+        "capacity). Free space and retry."
     ),
     "login_email": "Email:",
     "login_password": "Password:",

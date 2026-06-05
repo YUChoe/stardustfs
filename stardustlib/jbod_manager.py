@@ -73,11 +73,14 @@ class JBODManager:
 
     # --- 소스 관리 ---
 
-    def select_source(self, file_size: int) -> StorageSource:
+    def select_source(
+        self, file_size: int, exclude_ids: tuple[str, ...] = ()
+    ) -> StorageSource:
         """파일 크기 이상의 여유 공간을 가진 소스 중 가용 공간이 가장 많은 소스 선택.
 
         Args:
             file_size: 저장할 파일 크기 (바이트).
+            exclude_ids: 제외할 source_id 목록(evacuate 시 원본 소스 제외).
 
         Returns:
             선택된 StorageSource.
@@ -90,6 +93,8 @@ class JBODManager:
 
         for source in self.sources:
             if not source.is_active or source.is_remote:
+                continue
+            if source.source_id in exclude_ids:
                 continue
             available = source.get_available_space()
             if available >= file_size and available > best_space:
@@ -128,6 +133,50 @@ class JBODManager:
             file_part = f"{uuid.uuid4().hex}_{parts[-1]}"
             return f"{dir_part}/{file_part}"
         return f"{uuid.uuid4().hex}_{parts[0]}"
+
+    def evacuate_source(self, source_id: str) -> dict:
+        """소스의 활성 파일을 남은 로컬 소스로 이동한다(detach 전 evacuate, 로컬).
+
+        각 파일: 대상 로컬 소스 선택(원본 제외) → at-rest 암호문을 raw로 복사 →
+        메타 source_id/physical_path 갱신 → 기록 성공 후 원본 블록 삭제(무손실).
+        용량 부족(로컬 대상 없음)은 unmoved(추후 리모트 evacuate, Phase 3).
+
+        반환: {"ok": bool(미이동 0), "moved": [vpath...], "unmoved": [vpath...]}.
+        """
+        src = self._get_source_by_id(source_id)
+        if src is None:
+            return {"ok": False, "moved": [], "unmoved": [], "error": "no source"}
+        moved: list[str] = []
+        unmoved: list[str] = []
+        for meta in self.metadata_store.list_files_in_source(source_id):
+            # 로컬 소유(또는 레거시 NULL)만 이동. 원격 소유는 그 디바이스가 보관.
+            if meta.device_id is not None and meta.device_id != self.device_id:
+                continue
+            try:
+                target = self.select_source(
+                    meta.file_size, exclude_ids=(source_id,)
+                )
+            except InsufficientStorageError:
+                unmoved.append(meta.virtual_path)
+                continue
+            try:
+                blob = src.read(meta.physical_path)
+                new_phys = self._generate_physical_path(meta.virtual_path)
+                target.write(new_phys, blob)  # 대상 기록 먼저
+                self.metadata_store.update(
+                    meta.virtual_path, file_size=meta.file_size,
+                    modified_at=meta.modified_at, device_id=self.device_id,
+                    source_id=target.source_id, physical_path=new_phys,
+                )
+                try:
+                    src.delete(meta.physical_path)  # 성공 확인 후 원본 삭제
+                except OSError:
+                    pass
+                moved.append(meta.virtual_path)
+            except Exception as e:  # noqa: BLE001 — 파일 단위 격리(원본 보존)
+                logger.error("evacuate 실패: %s: %s", meta.virtual_path, e)
+                unmoved.append(meta.virtual_path)
+        return {"ok": not unmoved, "moved": moved, "unmoved": unmoved}
 
     # --- 파일 작업 ---
 

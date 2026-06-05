@@ -49,7 +49,12 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
 - `metadata_store.py`: SQLite 메타데이터(SQLCipher 가능 시 암호화, 아니면 평문 폴백).
   WAL 모드. files 테이블에 device_id/version/sync_status/deleted(tombstone).
 - `storage_source.py`: `DirectorySource`/`LoopbackSource`(로컬) + `is_remote` 속성.
-  LoopbackSource는 `<path>.d/` 동반 디렉토리에 `<hex32>_<name>`으로 저장.
+  LoopbackSource는 `<path>.d/` 동반 디렉토리에 `<hex32>_<name>`으로 저장. 신규 소스
+  추가(attach)는 loopback만 허용(디렉터리 타입 폐지, 기존 설정은 하위호환 로드).
+- 스토리지 detach(분리)는 "evacuate 후 분리": `jbod.evacuate_source`가 그 소스의 활성
+  파일을 남은 로컬 소스로 at-rest 암호문 그대로 이동(대상 기록 성공 후 원본 삭제=무손실)
+  하고, 모든 파일이 이동된 경우에만 설정에서 소스를 제거한다(원자적). 로컬 용량 부족분은
+  미이동으로 남겨 detach 보류(리모트 디바이스로의 분산 evacuate는 후속).
 - `remote_source.py`: 원격 디바이스 프록시. 전용 백그라운드 이벤트 루프에서 P2P
   직접 연결 + 실패 시 릴레이 fallback. 동기 메서드로 자가 브리지.
 - `p2p_server.py` / `relay_client.py` / `relay_worker.py`: P2P 서버와 서버 경유 릴레이.

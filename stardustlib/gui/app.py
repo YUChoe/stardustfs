@@ -748,18 +748,6 @@ class StardustApp:
                 tree.insert("", "end", values=(
                     s.get("id"), s.get("type"), s.get("path"), size))
 
-        def add_dir():
-            d = filedialog.askdirectory(title=t["src_pick_dir"])
-            if not d:
-                return
-            try:
-                actions.add_source(cfg, "directory", d)
-            except Exception as e:  # noqa: BLE001
-                messagebox.showerror(t["err"], str(e))
-                return
-            reload()
-            self.refresh()
-
         def add_loop():
             path = filedialog.asksaveasfilename(
                 title=t["src_loop_path"], defaultextension=".img")
@@ -783,18 +771,30 @@ class StardustApp:
                 return
             sid = tree.item(sel[0], "values")[0]
             if not messagebox.askyesno(
-                t["src_remove"], t["src_remove_confirm"].format(id=sid)
+                t["src_remove"], t["src_detach_confirm"].format(id=sid)
             ):
                 return
-            actions.remove_source(cfg, sid)
-            reload()
-            self.refresh()
+
+            def done(ok, report):
+                if not ok:
+                    messagebox.showerror(t["err"], str(report))
+                    return
+                if report.get("detached"):
+                    messagebox.showinfo(t["src_remove"], t["src_detach_done"].format(
+                        moved=len(report.get("moved", []))))
+                else:
+                    messagebox.showwarning(t["src_remove"], t["src_detach_blocked"].format(
+                        unmoved=len(report.get("unmoved", []))))
+                reload()
+                self.refresh()
+
+            self._set_status(t["src_detach_busy"])
+            self.worker.submit(lambda: actions.detach_source(cfg, sid), done)
 
         bar = ttk.Frame(win, padding=6)
         bar.pack(fill="x")
-        ttk.Button(bar, text=t["src_add_dir"], command=add_dir).pack(side="left")
-        ttk.Button(bar, text=t["src_add_loop"], command=add_loop).pack(side="left", padx=4)
-        ttk.Button(bar, text=t["src_remove"], command=remove).pack(side="left")
+        ttk.Button(bar, text=t["src_add_loop"], command=add_loop).pack(side="left")
+        ttk.Button(bar, text=t["src_remove"], command=remove).pack(side="left", padx=4)
         ttk.Button(bar, text=t["close"], command=win.destroy).pack(side="right")
         reload()
 

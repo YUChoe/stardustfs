@@ -177,21 +177,22 @@ def _save_sources(config_path: str, sources: list[dict]) -> None:
 def add_source(
     config_path: str, stype: str, path: str, size: int | None = None
 ) -> str:
-    """directory/loopback 소스를 추가한다. 생성된 source_id를 반환한다."""
+    """loopback 소스를 추가한다(디렉터리 타입 폐지). 생성된 source_id를 반환한다."""
     import uuid
 
-    if stype not in ("directory", "loopback"):
-        raise ValueError(f"지원하지 않는 소스 유형: {stype}")
+    if stype != "loopback":
+        raise ValueError(
+            f"지원하지 않는 소스 유형: {stype} (loopback만 추가할 수 있습니다)"
+        )
+    if not size:
+        raise ValueError("loopback 소스는 size(바이트)가 필요합니다.")
     sources = list_sources(config_path)
     entry: dict = {
-        "type": stype,
-        "id": f"{stype}-{uuid.uuid4().hex[:6]}",
+        "type": "loopback",
+        "id": f"loopback-{uuid.uuid4().hex[:6]}",
         "path": os.path.abspath(path),
+        "size": int(size),
     }
-    if stype == "loopback":
-        if not size:
-            raise ValueError("loopback 소스는 size(바이트)가 필요합니다.")
-        entry["size"] = int(size)
     sources.append(entry)
     _save_sources(config_path, sources)
     return entry["id"]
@@ -201,6 +202,27 @@ def remove_source(config_path: str, source_id: str) -> None:
     """source_id 소스를 설정에서 제거한다(물리 데이터는 삭제하지 않음)."""
     sources = [s for s in list_sources(config_path) if s.get("id") != source_id]
     _save_sources(config_path, sources)
+
+
+def detach_source(config_path: str, source_id: str) -> dict:
+    """소스를 evacuate 후 분리한다.
+
+    그 소스의 활성 파일을 남은 로컬 소스로 이동(Phase 2)하고, 모두 이동되면 설정에서
+    소스를 제거한다(원자적). 미이동 파일이 있으면 소스를 유지하고 보고한다.
+    반환: {"ok", "moved": [...], "unmoved": [...], "detached": bool}.
+
+    주의: 캐시된 오프라인 세션의 로컬 코어로 물리 블록을 옮긴다. daemon이 같은
+    소스를 쓰고 있으면 충돌할 수 있으므로 호출 전 daemon 정지를 권장한다.
+    """
+    session = _offline_session(config_path)
+    report = session.jbod.evacuate_source(source_id)
+    detached = False
+    if report.get("ok"):
+        remove_source(config_path, source_id)
+        invalidate(config_path)  # 소스 목록 변경 → 다음 조회 시 코어 재빌드
+        detached = True
+    report["detached"] = detached
+    return report
 
 
 # --- 온라인(서버/원격) ---

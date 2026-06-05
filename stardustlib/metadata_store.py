@@ -407,6 +407,26 @@ class MetadataStore:
         ).fetchone()
         return row["replication_status"] if row is not None else None
 
+    def list_files_in_source(self, source_id: str) -> list[FileMetadata]:
+        """해당 소스에 저장된 활성(deleted=0) 파일 목록을 반환한다(evacuate 대상)."""
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "SELECT virtual_path, source_id, physical_path, file_size, "
+            "created_at, modified_at, version, device_id, sync_status, deleted "
+            "FROM files WHERE source_id = ? AND deleted = 0",
+            (source_id,),
+        )
+        return [
+            FileMetadata(
+                virtual_path=row["virtual_path"], source_id=row["source_id"],
+                physical_path=row["physical_path"], file_size=row["file_size"],
+                created_at=row["created_at"], modified_at=row["modified_at"],
+                version=row["version"], device_id=row["device_id"],
+                sync_status=row["sync_status"], deleted=bool(row["deleted"]),
+            )
+            for row in cursor.fetchall()
+        ]
+
     def list_virtual_paths_for_replication(
         self, statuses: tuple[str, ...], owner_device_id: str | None = None
     ) -> list[str]:
