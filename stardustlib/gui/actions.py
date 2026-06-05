@@ -486,9 +486,12 @@ def daemon_start(config_path: str) -> int:
     else:
         cmd = [sys.executable, "stardustfs.py", "daemon", "--config", config_path]
         cwd = _REPO_ROOT
+    # Windows: 자식(daemon) 콘솔 창이 뜨지 않도록 CREATE_NO_WINDOW.
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         proc = subprocess.Popen(
             cmd, cwd=cwd, stdout=log_file, stderr=subprocess.STDOUT, env=env,
+            creationflags=creationflags,
         )
     finally:
         log_file.close()  # 자식이 자체 핸들을 보유하므로 부모 핸들은 닫는다

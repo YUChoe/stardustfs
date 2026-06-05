@@ -728,8 +728,29 @@ class StardustApp:
                      self.t["daemon_stop_busy"])
 
 
+def _hide_console_if_frozen() -> None:
+    """프로즌(PyInstaller) Windows exe로 GUI를 띄울 때 콘솔 창을 숨긴다.
+
+    콘솔 빌드라 CLI 출력은 유지하되, GUI 더블클릭 시 함께 뜨는 cmd 창만 감춘다.
+    소스 실행(개발)에서는 사용자의 터미널을 숨기지 않도록 frozen일 때만 동작.
+    """
+    import sys
+
+    if not getattr(sys, "frozen", False) or os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
+    except Exception:  # noqa: BLE001 — 콘솔 숨김 실패는 무시
+        pass
+
+
 def run_gui(config_path: str | None) -> None:
     """GUI를 실행한다 (블로킹)."""
+    _hide_console_if_frozen()
     root = tk.Tk()
     StardustApp(root, config_path)
     root.mainloop()
