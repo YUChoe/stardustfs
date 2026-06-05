@@ -728,11 +728,18 @@ class StardustApp:
         if not self.config_path:
             messagebox.showwarning(self.t["app_title"], self.t["need_config"])
             return
+        if self._focus_existing("_sources_win"):
+            return
         t = self.t
         cfg = self.config_path
         win = tk.Toplevel(self.root)
+        self._sources_win = win
         win.title(t["sources_title"])
-        win.geometry("580x300")
+        win.geometry("640x360")
+        win.minsize(520, 280)
+        # 버튼 바를 먼저 하단에 고정(트리 expand에 가려지지 않도록)
+        bar = ttk.Frame(win, padding=8)
+        bar.pack(fill="x", side="bottom")
         tree = ttk.Treeview(win, columns=("id", "type", "path", "size"),
                             show="headings")
         for c, w in (("id", 120), ("type", 80), ("path", 290), ("size", 80)):
@@ -791,8 +798,6 @@ class StardustApp:
             self._set_status(t["src_detach_busy"])
             self.worker.submit(lambda: actions.detach_source(cfg, sid), done)
 
-        bar = ttk.Frame(win, padding=6)
-        bar.pack(fill="x")
         ttk.Button(bar, text=t["src_add_loop"], command=add_loop).pack(side="left")
         ttk.Button(bar, text=t["src_remove"], command=remove).pack(side="left", padx=4)
         ttk.Button(bar, text=t["close"], command=win.destroy).pack(side="right")
@@ -800,7 +805,19 @@ class StardustApp:
 
     # --- 디바이스 ---
 
+    def _focus_existing(self, attr: str) -> bool:
+        """단일 인스턴스 창: 이미 열려 있으면 앞으로 가져오고 True를 반환한다."""
+        win = getattr(self, attr, None)
+        if win is not None and win.winfo_exists():
+            win.deiconify()
+            win.lift()
+            win.focus_force()
+            return True
+        return False
+
     def _devices(self) -> None:
+        if self._focus_existing("_devices_win"):
+            return
         cfg = self.config_path
         self._submit(lambda: actions.devices_list(cfg), self._show_devices,
                      self.t["devices_busy"])
@@ -808,6 +825,7 @@ class StardustApp:
     def _show_devices(self, devs: list[dict]) -> None:
         t = self.t
         win = tk.Toplevel(self.root)
+        self._devices_win = win
         win.title(t["devices_title"])
         win.geometry("440x260")
         tree = ttk.Treeview(win, columns=("id", "name", "online", "self"),
@@ -894,9 +912,13 @@ class StardustApp:
 
     def _daemon_start(self) -> None:
         cfg = self.config_path
+        # 시작 후 pid를 상태바에 쓰지 않는다(daemon 상태는 좌측 점이 폴링으로 표시).
+        # 시작 직후 1회 상태 점검으로 점을 갱신한다(별도 폴링 루프 추가 없이).
         self._submit(
             lambda: actions.daemon_start(cfg),
-            lambda pid: self._set_status(self.t["daemon_started"].format(pid=pid)),
+            lambda _pid: self.worker.submit(
+                lambda: actions.daemon_status(cfg), self._on_daemon
+            ),
             self.t["daemon_start_busy"],
         )
 
