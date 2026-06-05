@@ -140,6 +140,9 @@ def browse(config_path: str, vpath: str) -> dict:
         "available": available,
         "pending": len(session.metadata.get_pending_files()),
         "backup_summary": _replication_summary(session),
+        "sources": sum(
+            1 for s in session.jbod.sources if not getattr(s, "is_remote", False)
+        ),
     }
 
 
@@ -210,6 +213,21 @@ async def _run_online(config_path: str, aop, sync: bool):
         return await aop(session)
     finally:
         await session.aclose()
+
+
+def devices_summary(config_path: str) -> dict:
+    """디바이스 온라인/전체 요약 {online, total}. 미로그인/오프라인이면 {}."""
+    async def aop(s):
+        devs = s.my_devices or []
+        return {
+            "online": sum(1 for d in devs if d.get("is_online")),
+            "total": len(devs),
+        }
+
+    try:
+        return asyncio.run(_run_online(config_path, aop, sync=False))
+    except Exception:  # noqa: BLE001 — 미로그인/오프라인
+        return {}
 
 
 def devices_list(config_path: str) -> list[dict]:

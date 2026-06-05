@@ -51,7 +51,8 @@ class StardustApp:
         self.theme = "light"
 
         root.title(self.t["app_title"])
-        root.geometry("860x580")
+        root.geometry("900x620")
+        root.minsize(760, 480)
         self._apply_theme()
         self._build_menu()
         self.body = ttk.Frame(root)
@@ -60,6 +61,7 @@ class StardustApp:
         self._setup_tray()
 
         self.root.after(80, self._tick)
+        self.root.after(150, self._apply_titlebar)  # 매핑 후 제목표시줄 색 재적용
         self.root.after(200, self._refresh_daemon)
         self.root.after(3000, self._poll_meta)
         if self.config_path:
@@ -71,6 +73,10 @@ class StardustApp:
 
     def _build_menu(self) -> None:
         menubar = tk.Menu(self.root)
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label=self.t["new_config"], command=self._new_config)
+        file_menu.add_command(label=self.t["choose_config"], command=self._choose_config)
+        menubar.add_cascade(label=self.t["menu_file"], menu=file_menu)
         lang_menu = tk.Menu(menubar, tearoff=0)
         lang_menu.add_command(label=self.t["lang_ko"],
                               command=lambda: self._set_language("ko"))
@@ -84,15 +90,86 @@ class StardustApp:
         theme_menu.add_command(label=self.t["theme_dark"],
                                command=lambda: self._set_theme("dark"))
         menubar.add_cascade(label=self.t["menu_theme"], menu=theme_menu)
+
+        # 관리: 스토리지/디바이스/daemon 제어(상단 밀집 해소 위해 메뉴로 이동)
+        manage = tk.Menu(menubar, tearoff=0)
+        manage.add_command(label=self.t["storage"], command=self._sources)
+        manage.add_command(label=self.t["devices"], command=self._devices)
+        manage.add_separator()
+        manage.add_command(label=self.t["daemon_start"], command=self._daemon_start)
+        manage.add_command(label=self.t["daemon_stop"], command=self._daemon_stop)
+        menubar.add_cascade(label=self.t["menu_manage"], menu=manage)
+        self.manage_menu = manage
+        self._daemon_start_idx = 3  # 스토리지,디바이스,sep,시작,정지
+        self._daemon_stop_idx = 4
         self.root.config(menu=menubar)
 
+    def _update_title(self) -> None:
+        """창 제목에 앱 이름 + 설정 파일명을 표시한다."""
+        if self.config_path:
+            name = os.path.basename(self.config_path)
+            self.root.title(f"{self.t['app_title']} — {name}")
+        else:
+            self.root.title(self.t["app_title"])
+
     def _apply_theme(self) -> None:
-        """현대적 테마(sv-ttk)를 적용한다. 미설치 시 무시(기본 ttk)."""
+        """현대적 테마(sv-ttk) + 맑은 고딕 폰트를 적용한다."""
         if sv_ttk is not None:
             try:
                 sv_ttk.set_theme(self.theme)
             except Exception:  # noqa: BLE001
                 pass
+        self._apply_font()
+        self._apply_titlebar()
+
+    def _apply_font(self) -> None:
+        """한글 폰트를 맑은 고딕으로 통일하고 리스트 행 높이를 넉넉히 한다."""
+        try:
+            import tkinter.font as tkfont
+
+            for fname in ("TkDefaultFont", "TkTextFont", "TkMenuFont",
+                          "TkHeadingFont", "TkFixedFont"):
+                try:
+                    tkfont.nametofont(fname).configure(family="Malgun Gothic")
+                except Exception:  # noqa: BLE001
+                    pass
+            fnt = ("Malgun Gothic", 10)
+            style = ttk.Style()
+            style.configure(".", font=fnt)
+            # sv-ttk가 위젯 스타일별로 자체 폰트를 지정하므로 각 스타일에 직접 적용.
+            for st in ("TLabel", "TButton", "Accent.TButton", "TEntry",
+                       "TMenubutton", "TCheckbutton", "TRadiobutton",
+                       "Toolbutton", "TLabelframe.Label", "TNotebook.Tab",
+                       "Treeview", "Treeview.Heading"):
+                try:
+                    style.configure(st, font=fnt)
+                except Exception:  # noqa: BLE001
+                    pass
+            style.configure("Treeview", rowheight=28)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _apply_titlebar(self) -> None:
+        """Windows 11에서 제목 표시줄 색을 테마에 맞춘다(기본 강조색/주황 제거)."""
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            dark = self.theme == "dark"
+            flag = ctypes.c_int(1 if dark else 0)
+            # DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, 20, ctypes.byref(flag), ctypes.sizeof(flag)
+            )
+            # DWMWA_CAPTION_COLOR = 35 (Win11 22000+), COLORREF 0x00BBGGRR
+            color = ctypes.c_int(0x001C1C1C if dark else 0x00FAFAFA)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, 35, ctypes.byref(color), ctypes.sizeof(color)
+            )
+        except Exception:  # noqa: BLE001 — 구버전 Windows 등은 무시
+            pass
 
     def _set_theme(self, name: str) -> None:
         self.theme = name
@@ -166,66 +243,69 @@ class StardustApp:
 
     def _build_body(self) -> None:
         t = self.t
-        top = ttk.Frame(self.body, padding=6)
-        top.pack(fill="x")
-        ttk.Button(top, text=t["new_config"], command=self._new_config).pack(side="left")
-        ttk.Button(top, text=t["choose_config"], command=self._choose_config).pack(side="left", padx=4)
-        self.cfg_label = ttk.Label(top, text=self.config_path or "—")
-        self.cfg_label.pack(side="left", padx=6)
-        self.login_btn = ttk.Button(top, text=t["login"], command=self._login)
-        self.login_btn.pack(side="right")
-        self.logout_btn = ttk.Button(top, text=t["logout"], command=self._logout)
-        self.logout_btn.pack(side="right", padx=4)
-
-        dframe = ttk.Frame(self.body, padding=(6, 0))
-        dframe.pack(fill="x")
-        self.daemon_label = ttk.Label(dframe, text=t["daemon_unknown"])
-        self.daemon_label.pack(side="left")
-        self.daemon_start_btn = ttk.Button(dframe, text=t["daemon_start"], command=self._daemon_start)
-        self.daemon_start_btn.pack(side="left", padx=4)
-        self.daemon_stop_btn = ttk.Button(dframe, text=t["daemon_stop"], command=self._daemon_stop)
-        self.daemon_stop_btn.pack(side="left")
-        ttk.Button(dframe, text=t["devices"], command=self._devices).pack(side="right")
-        ttk.Button(dframe, text=t["storage"], command=self._sources).pack(side="right", padx=4)
-
-        pframe = ttk.Frame(self.body, padding=6)
+        # 경로/계정 바 (설정 진입은 '파일' 메뉴로 이동, 설정 파일명은 창 제목에 표시)
+        pframe = ttk.Frame(self.body, padding=(10, 8))
         pframe.pack(fill="x")
+        self.login_btn = ttk.Button(pframe, text=t["login"], command=self._login)
+        self.login_btn.pack(side="right")
+        self.logout_btn = ttk.Button(pframe, text=t["logout"], command=self._logout)
+        self.logout_btn.pack(side="right", padx=(0, 6))
         ttk.Button(pframe, text=t["up"], command=self._up).pack(side="left")
         self.path_var = tk.StringVar(value=self.vpath)
         entry = ttk.Entry(pframe, textvariable=self.path_var)
-        entry.pack(side="left", fill="x", expand=True, padx=6)
+        entry.pack(side="left", fill="x", expand=True, padx=8)
         entry.bind("<Return>", lambda _e: self._go())
         ttk.Button(pframe, text=t["go"], command=self._go).pack(side="left")
-        ttk.Button(pframe, text=t["refresh"], command=self.refresh).pack(side="left", padx=4)
+        ttk.Button(pframe, text=t["refresh"], command=self.refresh).pack(side="left", padx=(6, 10))
+        self._update_title()
 
-        cols = ("type", "name", "size", "owner", "backup")
+        # 파일 목록: 아이콘을 이름 앞에 붙여 Windows 11 탐색기 같은 경험(소유자 컬럼 제거)
+        cols = ("name", "size", "backup")
         self.tree = ttk.Treeview(self.body, columns=cols, show="headings", selectmode="extended")
-        for c, head, w in (
-            ("type", t["col_type"], 60), ("name", t["col_name"], 320),
-            ("size", t["col_size"], 100), ("owner", t["col_owner"], 90),
-            ("backup", t["col_backup"], 110),
+        for c, head, w, anchor in (
+            ("name", t["col_name"], 440, "w"),
+            ("size", t["col_size"], 110, "e"),
+            ("backup", t["col_backup"], 140, "w"),
         ):
             self.tree.heading(c, text=head)
-            self.tree.column(c, width=w, anchor="w")
+            self.tree.column(c, width=w, anchor=anchor)
         self.tree.pack(fill="both", expand=True, padx=6)
         self.tree.bind("<Double-1>", self._on_double)
 
-        tb = ttk.Frame(self.body, padding=6)
-        tb.pack(fill="x")
-        for text, cmd in (
-            (t["upload"], self._upload), (t["download"], self._download),
-            (t["mkdir"], self._mkdir), (t["delete"], self._delete),
-            (t["move"], self._move), (t["copy"], self._copy),
-            (t["backup_now"], self._backup_selected),
-            (t["heal_now"], self._heal_selected),
-        ):
-            ttk.Button(tb, text=text, command=cmd).pack(side="left", padx=2)
+        # 하단 상태바(VSCode 풍): ● daemon · 스토리지 · 디바이스 · (전송 상태) · 백업
+        statusbar = ttk.Frame(self.body, padding=(10, 4))
+        statusbar.pack(fill="x", side="bottom")
+        self.daemon_label = ttk.Label(statusbar, text=t["daemon_unknown"])
+        self.daemon_label.pack(side="left")
+        ttk.Separator(statusbar, orient="vertical").pack(side="left", fill="y", padx=8)
+        self.storage_label = ttk.Label(statusbar, text="")
+        self.storage_label.pack(side="left")
+        ttk.Separator(statusbar, orient="vertical").pack(side="left", fill="y", padx=8)
+        self.device_label = ttk.Label(statusbar, text="")
+        self.device_label.pack(side="left")
+        self.backup_status = ttk.Label(statusbar, text="", anchor="e")
+        self.backup_status.pack(side="right")
+        self.status = ttk.Label(statusbar, text="", anchor="w")
+        self.status.pack(side="right", padx=10)
+        ttk.Separator(self.body, orient="horizontal").pack(fill="x", side="bottom")
 
-        self.status = ttk.Label(self.body, text="", relief="sunken", anchor="w", padding=4)
-        self.status.pack(fill="x", side="bottom")
-        # 백업 현황(완료/대기/미백업) 표시 줄
-        self.backup_status = ttk.Label(self.body, text="", anchor="w", padding=(6, 0))
-        self.backup_status.pack(fill="x", side="bottom")
+        # 액션 툴바: 전송 | 파일작업 | 백업 그룹(구분선), 주요 동작은 Accent 강조
+        tb = ttk.Frame(self.body, padding=(8, 6))
+        tb.pack(fill="x", side="bottom")
+
+        def _btn(text, cmd, accent=False):
+            style = "Accent.TButton" if (accent and sv_ttk is not None) else "TButton"
+            return ttk.Button(tb, text=text, command=cmd, style=style)
+
+        _btn(t["upload"], self._upload, accent=True).pack(side="left")
+        _btn(t["download"], self._download).pack(side="left", padx=(6, 0))
+        ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=10)
+        for text, cmd in ((t["mkdir"], self._mkdir), (t["delete"], self._delete),
+                          (t["move"], self._move), (t["copy"], self._copy)):
+            _btn(text, cmd).pack(side="left", padx=(0, 6))
+        ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=10)
+        _btn(t["backup_now"], self._backup_selected, accent=True).pack(side="left")
+        _btn(t["heal_now"], self._heal_selected).pack(side="left", padx=(6, 0))
 
         self._refresh_login_state()
         self._set_daemon_buttons(None)
@@ -302,13 +382,23 @@ class StardustApp:
         self._enable(self.logout_btn, logged)
 
     def _set_daemon_buttons(self, running) -> None:
-        """daemon 상태(running True/False, None=미상/설정없음)에 따라 시작/정지 버튼."""
-        if running is None:
-            self._enable(self.daemon_start_btn, False)
-            self._enable(self.daemon_stop_btn, False)
+        """daemon 상태에 따라 '관리' 메뉴의 시작/정지 항목 활성/비활성."""
+        menu = getattr(self, "manage_menu", None)
+        if menu is None:
             return
-        self._enable(self.daemon_start_btn, not running)
-        self._enable(self.daemon_stop_btn, running)
+
+        def _entry(idx, on):
+            try:
+                menu.entryconfig(idx, state="normal" if on else "disabled")
+            except Exception:  # noqa: BLE001
+                pass
+
+        if running is None:
+            _entry(self._daemon_start_idx, False)
+            _entry(self._daemon_stop_idx, False)
+            return
+        _entry(self._daemon_start_idx, not running)
+        _entry(self._daemon_stop_idx, running)
 
     # --- 설정 ---
 
@@ -343,7 +433,7 @@ class StardustApp:
                 messagebox.showerror(t["err"], str(payload))
                 return
             self.config_path = payload
-            self.cfg_label.config(text=payload)
+            self._update_title()
             self.vpath = "/"
             self.path_var.set("/")
             self._auto_started = False
@@ -366,7 +456,7 @@ class StardustApp:
         )
         if path:
             self.config_path = path
-            self.cfg_label.config(text=path)
+            self._update_title()
             self.vpath = "/"
             self.path_var.set("/")
             self._auto_started = False
@@ -421,19 +511,22 @@ class StardustApp:
         self.tree.delete(*self.tree.get_children())
         self._rows = {}
         for r in rows:
-            size = _human(r["size"]) if r["type"] == "file" else ""
-            backup = self._backup_label(r.get("backup", "")) if r["type"] == "file" else ""
+            is_file = r["type"] == "file"
+            size = _human(r["size"]) if is_file else ""
+            backup = self._backup_label(r.get("backup", "")) if is_file else ""
+            icon = "📄" if is_file else "📁"
             iid = self.tree.insert(
                 "", "end",
-                values=(r["type"], r["name"], size, r["owner"], backup),
+                values=(f"{icon}  {r['name']}", size, backup),
             )
             self._rows[iid] = r
 
     def _show_browse(self, d: dict, counts: bool = True) -> None:
         self._populate(d["rows"])
-        self._set_status(self.t["cap"].format(
-            used=_human(d["used"]), total=_human(d["total"]),
-            avail=_human(d["available"]), pending=d["pending"],
+        # 스토리지 상태: 소스 수 + 사용/총 용량
+        self.storage_label.config(text=self.t["storage_status"].format(
+            sources=d.get("sources", 0), used=_human(d["used"]),
+            total=_human(d["total"]),
         ))
         bs = d.get("backup_summary")
         if bs:
@@ -445,6 +538,13 @@ class StardustApp:
         self._mark_meta_seen()
         if not counts:
             return
+        # 디바이스 상태(온라인/전체)는 로그인 시 백그라운드 조회로 갱신.
+        if self._logged_in():
+            cfg = self.config_path
+            self.worker.submit(
+                lambda: actions.devices_summary(cfg),
+                lambda ok, s: self._show_device_summary(s) if ok else None,
+            )
         # 로컬 상태가 pending/replicated인 파일만 실제 복제본 수를 백그라운드 조회해
         # 병기한다. none(미백업) 뿐이면 서버 조회를 생략한다(불필요한 초기화/호출 방지).
         # (조용한 보강 — worker 콜백은 (ok, payload) 시그니처, 실패 시 상태만 유지)
@@ -472,6 +572,14 @@ class StardustApp:
             label = self._backup_label(row.get("backup", ""))
             text = f"{label} ({info['online']}/{info['min']})"
             self.tree.set(iid, "backup", text)
+
+    def _show_device_summary(self, s: dict) -> None:
+        """디바이스 온라인/전체 요약을 상태바에 표시한다."""
+        if not s:
+            return
+        self.device_label.config(text=self.t["device_status"].format(
+            online=s.get("online", 0), total=s.get("total", 0),
+        ))
 
     def _selected(self) -> dict | None:
         sel = self.tree.selection()
@@ -759,21 +867,25 @@ class StardustApp:
             self.worker.submit(lambda: actions.daemon_status(cfg), self._on_daemon)
         self.root.after(5000, self._refresh_daemon)
 
+    def _daemon_dot(self, text: str, color: str) -> None:
+        self.daemon_label.config(text="● " + text, foreground=color)
+
     def _on_daemon(self, ok, payload) -> None:
+        grey, green, orange = "#9aa0a6", "#2da44e", "#d29922"
         if not ok:
-            self.daemon_label.config(text=self.t["daemon_unknown"])
+            self._daemon_dot(self.t["daemon_unknown"], grey)
             self._set_daemon_buttons(None)
             return
         if payload.get("running"):
-            self.daemon_label.config(
-                text=self.t["daemon_running"].format(pid=payload.get("pid"))
+            self._daemon_dot(
+                self.t["daemon_running"].format(pid=payload.get("pid")), green
             )
             self._set_daemon_buttons(True)
         elif payload.get("stale"):
-            self.daemon_label.config(text=self.t["daemon_stale"])
+            self._daemon_dot(self.t["daemon_stale"], orange)
             self._set_daemon_buttons(False)
         else:
-            self.daemon_label.config(text=self.t["daemon_stopped"])
+            self._daemon_dot(self.t["daemon_stopped"], grey)
             self._set_daemon_buttons(False)
             if self.config_path and not self._auto_started:
                 self._auto_started = True
