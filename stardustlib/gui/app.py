@@ -190,11 +190,16 @@ class StardustApp:
             (t["upload"], self._upload), (t["download"], self._download),
             (t["mkdir"], self._mkdir), (t["delete"], self._delete),
             (t["move"], self._move), (t["copy"], self._copy),
+            (t["backup_now"], self._backup_selected),
+            (t["heal_now"], self._heal_selected),
         ):
             ttk.Button(tb, text=text, command=cmd).pack(side="left", padx=2)
 
         self.status = ttk.Label(self.body, text="", relief="sunken", anchor="w", padding=4)
         self.status.pack(fill="x", side="bottom")
+        # 백업 현황(완료/대기/미백업) 표시 줄
+        self.backup_status = ttk.Label(self.body, text="", anchor="w", padding=(6, 0))
+        self.backup_status.pack(fill="x", side="bottom")
 
         self._refresh_login_state()
         self._set_daemon_buttons(None)
@@ -404,6 +409,12 @@ class StardustApp:
             used=_human(d["used"]), total=_human(d["total"]),
             avail=_human(d["available"]), pending=d["pending"],
         ))
+        bs = d.get("backup_summary")
+        if bs:
+            self.backup_status.config(text=self.t["backup_summary"].format(
+                replicated=bs["replicated"], pending=bs["pending"],
+                none=bs["none"],
+            ))
         # 방금 본 메타데이터 시점을 기록(자동 새로고침이 즉시 재발동하지 않도록).
         self._mark_meta_seen()
         if not counts:
@@ -519,6 +530,36 @@ class StardustApp:
         # 다중 선택도 온라인 세션 1회로 일괄 삭제 + 1회 전파.
         self._submit(lambda: actions.remove_many(cfg, items),
                      lambda _n: self._after_write(), self.t["delete_busy"])
+
+    def _backup_selected(self) -> None:
+        files = [r for r in self._selected_rows() if r["type"] == "file"]
+        if not files:
+            messagebox.showinfo(self.t["app_title"], self.t["backup_pick"])
+            return
+        cfg = self.config_path
+        paths = [self._join(r["name"]) for r in files]
+        self._submit(
+            lambda: actions.backup_paths(cfg, paths),
+            self._show_backup_result, self.t["backup_busy"],
+        )
+
+    def _heal_selected(self) -> None:
+        files = [r for r in self._selected_rows() if r["type"] == "file"]
+        if not files:
+            messagebox.showinfo(self.t["app_title"], self.t["backup_pick"])
+            return
+        cfg = self.config_path
+        paths = [self._join(r["name"]) for r in files]
+        self._submit(
+            lambda: actions.heal_paths(cfg, paths),
+            self._show_backup_result, self.t["heal_busy"],
+        )
+
+    def _show_backup_result(self, results: list) -> None:
+        ok = sum(1 for r in results if r.get("status") == "replicated")
+        pending = sum(1 for r in results if r.get("status") != "replicated")
+        self._set_status(self.t["backup_done"].format(ok=ok, pending=pending))
+        self.refresh()  # 상태 컬럼·요약 갱신
 
     def _move(self) -> None:
         row = self._selected()

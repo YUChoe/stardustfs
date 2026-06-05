@@ -57,6 +57,16 @@ def test_replica_counts_empty_when_offline(tmp_path):
     assert actions.replica_counts(cfg_path, "/", []) == {}
 
 
+def test_browse_includes_backup_summary(tmp_path):
+    base = tmp_path / "setup-bs"
+    cfg_path = actions.create_config(
+        str(base), "", "dev-bs", generate_key=True
+    )
+    d = actions.browse(cfg_path, "/")
+    assert set(d["backup_summary"]) == {"none", "pending", "replicated", "total"}
+    actions.invalidate(cfg_path)
+
+
 def test_metadata_mtime(tmp_path):
     base = tmp_path / "setup-mt"
     cfg_path = actions.create_config(

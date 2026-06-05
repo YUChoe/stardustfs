@@ -139,7 +139,19 @@ def browse(config_path: str, vpath: str) -> dict:
         "used": total - available,
         "available": available,
         "pending": len(session.metadata.get_pending_files()),
+        "backup_summary": _replication_summary(session),
     }
+
+
+def _replication_summary(session) -> dict:
+    """전체 파일의 백업 상태 집계: {none, pending, replicated, total}."""
+    meta = session.metadata
+    counts = {
+        st: len(meta.list_virtual_paths_for_replication((st,), None))
+        for st in ("none", "pending", "replicated")
+    }
+    counts["total"] = counts["none"] + counts["pending"] + counts["replicated"]
+    return counts
 
 
 # --- 스토리지 소스 관리 (config 편집) ---
@@ -279,6 +291,51 @@ def replica_counts(config_path: str, vpath: str, names: list[str]) -> dict:
         return asyncio.run(run())
     except Exception:  # noqa: BLE001 — 오프라인/미로그인 시 상태만 표시
         return {}
+
+
+def backup_paths(config_path: str, vpaths: list[str]) -> list[dict]:
+    """선택한 파일들을 지금 즉시 복제(백업)한다(온라인 세션 1회).
+
+    {path, status(replicated|pending), error?} 목록을 반환한다.
+    """
+    norm = [_vpath(p) for p in vpaths]
+
+    async def aop(s):
+        mgr = s.make_replication_manager()
+        out: list[dict] = []
+        try:
+            for vp in norm:
+                try:
+                    result = await asyncio.to_thread(mgr.replicate, vp)
+                    out.append({"path": vp, "status": result.status})
+                except Exception as e:  # noqa: BLE001 — 파일 단위 격리
+                    out.append({"path": vp, "status": "error", "error": str(e)})
+        finally:
+            mgr.close()
+        return out
+
+    return asyncio.run(_run_online(config_path, aop, sync=False))
+
+
+def heal_paths(config_path: str, vpaths: list[str]) -> list[dict]:
+    """선택한 파일들의 복제본 부족분을 지금 보충(재복제)한다(온라인 세션 1회)."""
+    norm = [_vpath(p) for p in vpaths]
+
+    async def aop(s):
+        mgr = s.make_replication_manager()
+        out: list[dict] = []
+        try:
+            for vp in norm:
+                try:
+                    report = await asyncio.to_thread(mgr.ensure_replicas, vp)
+                    out.append({"path": vp, "status": report.status})
+                except Exception as e:  # noqa: BLE001 — 파일 단위 격리
+                    out.append({"path": vp, "status": "error", "error": str(e)})
+        finally:
+            mgr.close()
+        return out
+
+    return asyncio.run(_run_online(config_path, aop, sync=False))
 
 
 def put_file(config_path: str, local: str, remote: str) -> int:
