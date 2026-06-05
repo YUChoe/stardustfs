@@ -416,6 +416,15 @@ async def startup_v2(config: dict, config_path: str) -> None:
         elif not device_mgr.device_id:
             logger.warning("device 미등록 — 호스팅 신고를 건너뜁니다")
 
+    # 로컬 소스 인벤토리를 서버에 신고(리모트 디바이스 GUI의 스토리지 목록용).
+    # 실패해도 시작을 막지 않는다.
+    if device_mgr.device_id:
+        from stardustlib.device_manager import build_local_source_inventory
+
+        inventory = build_local_source_inventory(jbod_manager)
+        if await device_mgr.report_sources(inventory):
+            logger.info("로컬 소스 인벤토리 신고: %d개 소스", len(inventory))
+
     # 내 계정에 등록된 디바이스 목록 조회 (remote 소스 설정 참고용)
     my_devices = await device_mgr.list_devices()
     if my_devices:

@@ -740,20 +740,51 @@ class StardustApp:
         # 버튼 바를 먼저 하단에 고정(트리 expand에 가려지지 않도록)
         bar = ttk.Frame(win, padding=8)
         bar.pack(fill="x", side="bottom")
-        tree = ttk.Treeview(win, columns=("id", "type", "path", "size"),
-                            show="headings")
-        for c, w in (("id", 120), ("type", 80), ("path", 290), ("size", 80)):
-            tree.heading(c, text=c)
+        cols = ("scope", "name", "status", "cap", "path")
+        heads = (t["col_scope"], t["col_src_name"], t["col_status"],
+                 t["col_capacity"], t["col_path"])
+        widths = (70, 150, 80, 130, 240)
+        tree = ttk.Treeview(win, columns=cols, show="headings")
+        for c, h, w in zip(cols, heads, widths):
+            tree.heading(c, text=h)
             tree.column(c, width=w)
         tree.pack(fill="both", expand=True)
+        row_meta: dict[str, dict] = {}  # iid → {scope, id|device_id}
+
+        def _cap(d: dict) -> str:
+            total = d.get("total")
+            if total:
+                avail = d.get("available")
+                used = total - avail if avail is not None else None
+                if used is None:
+                    return _human(total)
+                return f"{_human(used)} / {_human(total)}"
+            used = d.get("used")  # 리모트: 사용 바이트만 알 수 있음
+            if used is not None:
+                return _human(used)
+            return "-"
 
         def reload():
-            tree.delete(*tree.get_children())
-            for s in actions.list_sources(cfg):
-                size = (_human(s["size"]) if s.get("type") == "loopback"
-                        and s.get("size") else "")
-                tree.insert("", "end", values=(
-                    s.get("id"), s.get("type"), s.get("path"), size))
+            def done(ok, ov):
+                tree.delete(*tree.get_children())
+                row_meta.clear()
+                if not ok:
+                    return
+                for s in ov.get("local", []):
+                    iid = tree.insert("", "end", values=(
+                        t["scope_local"], s.get("id"), "-",
+                        _cap(s), s.get("path", "")))
+                    row_meta[iid] = {"scope": "local", "id": s.get("id")}
+                for d in ov.get("remote", []):
+                    status = (t["status_online"] if d.get("online")
+                              else t["status_offline"])
+                    iid = tree.insert("", "end", values=(
+                        t["scope_remote"], d.get("name"), status,
+                        _cap(d), d.get("device", "")))
+                    row_meta[iid] = {
+                        "scope": "remote", "device_id": d.get("device_id")}
+
+            self.worker.submit(lambda: actions.storage_overview(cfg), done)
 
         def add_loop():
             path = filedialog.asksaveasfilename(
@@ -769,14 +800,18 @@ class StardustApp:
             except Exception as e:  # noqa: BLE001
                 messagebox.showerror(t["err"], str(e))
                 return
-            reload()
-            self.refresh()
+            self._after_write()  # 캐시 세션 무효화 → 새 소스 마운트·상태바 반영
+            reload()             # 재빌드된 세션 기준으로 목록 갱신
 
         def remove():
             sel = tree.selection()
             if not sel:
                 return
-            sid = tree.item(sel[0], "values")[0]
+            meta = row_meta.get(sel[0], {})
+            if meta.get("scope") != "local":
+                messagebox.showinfo(t["src_remove"], t["src_remote_no_detach"])
+                return
+            sid = meta.get("id")
             if not messagebox.askyesno(
                 t["src_remove"], t["src_detach_confirm"].format(id=sid)
             ):

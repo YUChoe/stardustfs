@@ -72,6 +72,35 @@ def _get_os_info() -> str:
     return f"{platform.system()} {platform.release()} ({platform.machine()})"
 
 
+def build_local_source_inventory(jbod_manager) -> list[dict]:
+    """JBOD의 로컬 소스에서 서버 신고용 인벤토리를 만든다.
+
+    원격 소스(is_remote=True)는 제외한다. 각 항목은 식별자/타입/용량/사용 바이트만
+    포함하고 물리 경로·파일명은 포함하지 않는다(zero-knowledge).
+    type은 클래스명에서 'Source'를 떼고 소문자로 매핑한다(LoopbackSource→loopback).
+    """
+    inventory: list[dict] = []
+    for source in jbod_manager.sources:
+        if getattr(source, "is_remote", False):
+            continue
+        try:
+            total = int(source.get_total_space())
+            available = int(source.get_available_space())
+        except Exception:  # noqa: BLE001 — 용량 조회 실패 시 0으로 신고
+            total = available = 0
+        used = max(0, total - available)
+        stype = type(source).__name__
+        if stype.endswith("Source"):
+            stype = stype[: -len("Source")]
+        inventory.append({
+            "source_id": source.source_id,
+            "type": stype.lower(),
+            "capacity_bytes": total,
+            "used_bytes": used,
+        })
+    return inventory
+
+
 class DeviceManager:
     """디바이스 등록 및 heartbeat 관리."""
 
@@ -200,6 +229,52 @@ class DeviceManager:
             return []
         except Exception as e:
             logger.warning("디바이스 목록 조회 중 예외: %s", e)
+            return []
+
+    async def report_sources(self, sources: list[dict]) -> bool:
+        """이 디바이스의 소스 인벤토리를 서버에 신고한다(전량 교체).
+
+        PUT /devices/{device_id}/sources. device_id가 없거나 실패하면 False를
+        반환한다(예외 없음 — 시작 차단 금지).
+        """
+        if self._device_id is None:
+            logger.warning("device_id 없음 — 소스 신고를 건너뜁니다")
+            return False
+        try:
+            token = await self._auth_client.get_valid_token()
+            response = await self._client.put(
+                f"{self._server_url}/devices/{self._device_id}/sources",
+                json={"sources": sources},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if response.status_code < 400:
+                return True
+            logger.warning("소스 신고 실패: HTTP %d", response.status_code)
+            return False
+        except Exception as e:  # noqa: BLE001
+            logger.warning("소스 신고 중 예외: %s", e)
+            return False
+
+    async def list_all_sources(self) -> list[dict]:
+        """내 모든 디바이스의 소스 인벤토리를 서버에서 조회한다.
+
+        GET /devices/sources. 각 항목은 device_id, device_name, source_id, type,
+        capacity_bytes, used_bytes, is_online, updated_at을 포함한다. 실패 시 빈
+        리스트를 반환한다(예외 없음).
+        """
+        try:
+            token = await self._auth_client.get_valid_token()
+            response = await self._client.get(
+                f"{self._server_url}/devices/sources",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if response.status_code < 400:
+                data = response.json()
+                return data if isinstance(data, list) else []
+            logger.warning("소스 목록 조회 실패: HTTP %d", response.status_code)
+            return []
+        except Exception as e:  # noqa: BLE001
+            logger.warning("소스 목록 조회 중 예외: %s", e)
             return []
 
     async def start_heartbeat(self) -> None:

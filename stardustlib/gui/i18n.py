@@ -112,6 +112,19 @@ _KO: dict[str, str] = {
         "분리 보류: {unmoved}개 파일을 옮길 곳이 없습니다(로컬 용량 부족). "
         "용량 확보 후 다시 시도하세요."
     ),
+    "src_remote_no_detach": (
+        "리모트(다른 디바이스) 스토리지는 여기서 분리할 수 없습니다. "
+        "해당 디바이스에서 관리하세요."
+    ),
+    "col_scope": "위치",
+    "col_src_name": "이름",
+    "col_status": "상태",
+    "col_capacity": "용량",
+    "col_path": "경로",
+    "scope_local": "로컬",
+    "scope_remote": "리모트",
+    "status_online": "온라인",
+    "status_offline": "오프라인",
     # 로그인
     "login_email": "이메일:",
     "login_password": "비밀번호:",
@@ -248,6 +261,19 @@ _EN: dict[str, str] = {
         "Detach blocked: {unmoved} files have nowhere to move (insufficient local "
         "capacity). Free space and retry."
     ),
+    "src_remote_no_detach": (
+        "Remote (other device) storage cannot be detached here. "
+        "Manage it on that device."
+    ),
+    "col_scope": "Location",
+    "col_src_name": "Name",
+    "col_status": "Status",
+    "col_capacity": "Capacity",
+    "col_path": "Path",
+    "scope_local": "Local",
+    "scope_remote": "Remote",
+    "status_online": "Online",
+    "status_offline": "Offline",
     "login_email": "Email:",
     "login_password": "Password:",
     "login_keypw": "Master-key backup password (optional, leave blank to skip):",

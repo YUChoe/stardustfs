@@ -77,6 +77,34 @@ def test_evacuate_blocks_when_no_capacity(tmp_path):
     store.close()
 
 
+def test_build_local_source_inventory(tmp_path):
+    from stardustlib.device_manager import build_local_source_inventory
+
+    a, b = _loop(tmp_path, "inv-a"), _loop(tmp_path, "inv-b")
+    jbod, store = _jbod(tmp_path, [a, b])
+    phys = jbod._generate_physical_path("/f")
+    a.write(phys, b"x" * 100)
+    inv = {i["source_id"]: i for i in build_local_source_inventory(jbod)}
+    assert set(inv) == {"inv-a", "inv-b"}
+    assert all(i["type"] == "loopback" for i in inv.values())
+    assert inv["inv-a"]["capacity_bytes"] == 10 * 1024 * 1024
+    assert inv["inv-a"]["used_bytes"] >= 100  # 기록한 블록 반영
+    store.close()
+
+
+def test_inventory_excludes_remote(tmp_path):
+    from stardustlib.device_manager import build_local_source_inventory
+
+    a = _loop(tmp_path, "inv-local")
+    jbod, store = _jbod(tmp_path, [a])
+    jbod.register_remote_device("dev-b", _FakeRemote())
+    # 원격 디바이스는 jbod.sources에 없으면 자연히 제외되지만, 마운트된 원격
+    # 소스가 sources에 있어도 is_remote로 걸러짐을 가정. 여기서는 로컬만 신고됨.
+    inv = build_local_source_inventory(jbod)
+    assert [i["source_id"] for i in inv] == ["inv-local"]
+    store.close()
+
+
 def test_evacuate_empty_source_ok(tmp_path):
     a, b = _loop(tmp_path, "e-a"), _loop(tmp_path, "e-b")
     jbod, store = _jbod(tmp_path, [a, b])

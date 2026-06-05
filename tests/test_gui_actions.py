@@ -57,6 +57,24 @@ def test_replica_counts_empty_when_offline(tmp_path):
     assert actions.replica_counts(cfg_path, "/", []) == {}
 
 
+def test_storage_overview_local_only_when_offline(tmp_path):
+    # 오프라인 설정 → 로컬 소스만, remote는 빈 목록
+    base = tmp_path / "setup-ov"
+    cfg_path = actions.create_config(
+        str(base), "", "dev-ov", generate_key=True
+    )
+    sid = actions.add_source(
+        cfg_path, "loopback", str(base / "v.img"), size=10 * 1024 * 1024
+    )
+    actions.invalidate(cfg_path)
+    ov = actions.storage_overview(cfg_path)
+    assert ov["remote"] == []
+    ids = {s["id"] for s in ov["local"]}
+    assert sid in ids                       # 추가한 루프백 포함
+    assert all(s["scope"] == "local" for s in ov["local"])
+    actions.invalidate(cfg_path)
+
+
 def test_browse_includes_backup_summary(tmp_path):
     base = tmp_path / "setup-bs"
     cfg_path = actions.create_config(
