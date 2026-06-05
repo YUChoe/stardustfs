@@ -18,6 +18,11 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from stardustlib.gui import actions, i18n, tray
 from stardustlib.gui.worker import Worker
 
+try:  # 현대적 플랫 테마(Windows 11 풍). 미설치 시 기본 ttk로 폴백.
+    import sv_ttk
+except Exception:  # noqa: BLE001
+    sv_ttk = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -43,9 +48,11 @@ class StardustApp:
         self._last_meta_mtime = 0.0
         self.lang = i18n.detect_lang()
         self.t = i18n.get_text(self.lang)
+        self.theme = "light"
 
         root.title(self.t["app_title"])
-        root.geometry("800x540")
+        root.geometry("860x580")
+        self._apply_theme()
         self._build_menu()
         self.body = ttk.Frame(root)
         self.body.pack(fill="both", expand=True)
@@ -70,7 +77,26 @@ class StardustApp:
         lang_menu.add_command(label=self.t["lang_en"],
                               command=lambda: self._set_language("en"))
         menubar.add_cascade(label=self.t["menu_language"], menu=lang_menu)
+
+        theme_menu = tk.Menu(menubar, tearoff=0)
+        theme_menu.add_command(label=self.t["theme_light"],
+                               command=lambda: self._set_theme("light"))
+        theme_menu.add_command(label=self.t["theme_dark"],
+                               command=lambda: self._set_theme("dark"))
+        menubar.add_cascade(label=self.t["menu_theme"], menu=theme_menu)
         self.root.config(menu=menubar)
+
+    def _apply_theme(self) -> None:
+        """현대적 테마(sv-ttk)를 적용한다. 미설치 시 무시(기본 ttk)."""
+        if sv_ttk is not None:
+            try:
+                sv_ttk.set_theme(self.theme)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _set_theme(self, name: str) -> None:
+        self.theme = name
+        self._apply_theme()
 
     def _setup_tray(self) -> None:
         self.tray_icon = tray.build_icon(

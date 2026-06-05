@@ -23,6 +23,9 @@ async-upnp-client==0.42.0
 pystray==0.19.5
 Pillow==10.4.0
 
+# GUI 현대적 테마(Windows 11 풍 플랫). 미설치 시 기본 ttk로 폴백(pure-python)
+sv-ttk==2.6.1
+
 # 테스트
 hypothesis==6.152.9
 pytest==8.3.4
