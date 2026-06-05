@@ -82,6 +82,13 @@ def main() -> None:
         run_gui(getattr(args, "config", None))
         return
 
+    # 인자 없이 실행(예: exe 더블클릭) → GUI를 연다(설정은 GUI에서 선택).
+    if args.command is None and not args.config:
+        from stardustlib.gui.app import run_gui
+
+        run_gui(None)
+        return
+
     # daemon (서브커맨드 없음 또는 'daemon [action]')
     if not args.config:
         parser.error("--config 가 필요합니다 (daemon 모드)")

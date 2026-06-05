@@ -478,13 +478,17 @@ def daemon_start(config_path: str) -> int:
     log_file = open(log_path, "a", encoding="utf-8")
     # 자식 프로세스가 로그를 UTF-8로 쓰도록 강제(Windows 기본 cp949 → 파일 mojibake 방지).
     env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+    # 프로즌(PyInstaller) exe에는 stardustfs.py 소스가 없으므로 exe 자신의 daemon
+    # 서브커맨드를 직접 호출한다. 소스 실행 시에는 python으로 stardustfs.py를 호출.
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable, "daemon", "--config", config_path]
+        cwd = None
+    else:
+        cmd = [sys.executable, "stardustfs.py", "daemon", "--config", config_path]
+        cwd = _REPO_ROOT
     try:
         proc = subprocess.Popen(
-            [sys.executable, "stardustfs.py", "daemon", "--config", config_path],
-            cwd=_REPO_ROOT,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            env=env,
+            cmd, cwd=cwd, stdout=log_file, stderr=subprocess.STDOUT, env=env,
         )
     finally:
         log_file.close()  # 자식이 자체 핸들을 보유하므로 부모 핸들은 닫는다
