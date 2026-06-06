@@ -17,10 +17,11 @@ inclusion: manual
 - [ ] 2.2 reflexive UDP 주소를 device 라우팅에 게시(서버 routing/devices 확장 또는 신규).
 - [ ] 2.3 서버 rendezvous 기본 활성(설정) + 같은 user connect 중개 확인(기존 테스트 활용).
 
-## Phase 3: 신뢰성 UDP 메시지 채널 (rudp.py)
-- [ ] 3.1 프레임 인코딩/디코딩(헤더 + 프래그먼트). PBT: fragment∘reassemble 항등.
-- [ ] 3.2 송수신 reliability(ack/재전송/타임아웃/재조립). 가짜 소켓 유실·재정렬 테스트.
-- [ ] 3.3 요청-응답 다중화(msg_id).
+## Phase 3: 신뢰성 UDP 메시지 채널 (rudp.py) — 완료
+- [x] 3.1 프레임 인코딩/디코딩(_encode/_decode, 11B 헤더) + fragment(). 항등 테스트.
+- [x] 3.2 RudpEndpoint: feed/send/recv. 프래그먼트별 ACK + 타임아웃 재전송 + 재조립,
+      완성 메시지 1회 전달(중복 방지). 가짜 라우터로 유실·재정렬·타임아웃·중복 테스트(13종).
+- [x] 3.3 msg_id 다중화(send에 msg_id 지정 가능 → 응답 에코용). RudpProtocol 소켓 어댑터.
 
 ## Phase 4: P2P over UDP + 전송 선택
 - [ ] 4.1 p2p_udp: rudp 위 P2P op 서버(dispatch_async 재사용)/클라이언트 send_op.
