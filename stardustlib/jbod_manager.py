@@ -124,6 +124,17 @@ class JBODManager:
         self.sources.append(source)
         self._source_map[source.source_id] = source
 
+    def replace_local_sources(self, new_local_sources: list[StorageSource]) -> None:
+        """로컬 소스를 새 목록으로 in-place 교체한다(config 리로드용).
+
+        원격 소스(is_remote=True)와 _remote_devices, _recover_fn은 보존하고 로컬
+        소스만 교체한다. 같은 JBODManager 객체를 갱신하므로 p2p_server/sync_client 등
+        기존 참조가 즉시 새 소스를 사용한다(객체 교체 아님).
+        """
+        remote = [s for s in self.sources if getattr(s, "is_remote", False)]
+        self.sources = list(new_local_sources) + remote
+        self._source_map = {s.source_id: s for s in self.sources}
+
     def _generate_physical_path(self, virtual_path: str) -> str:
         """가상 경로에서 물리 경로를 생성한다.
 

@@ -39,6 +39,10 @@ def _stop_path(metadata_db: str) -> str:
     return metadata_db + ".daemon.stop"
 
 
+def _reload_path(metadata_db: str) -> str:
+    return metadata_db + ".daemon.reload"
+
+
 def _write_control(path: str, started_at: float, heartbeat_at: float) -> None:
     """제어 파일을 원자적으로 기록한다(tmp + replace)."""
     tmp = path + ".tmp"
@@ -90,6 +94,16 @@ def signal_stop(metadata_db: str) -> dict:
     return {"signalled": True}
 
 
+def signal_reload(metadata_db: str) -> dict:
+    """리로드 센티넬을 생성한다(대기 없음). daemon은 다음 틱에 config의 로컬 소스를
+    다시 읽어 remount한다. 제어 파일이 없으면 not_running."""
+    if not os.path.exists(_control_path(metadata_db)):
+        return {"signalled": False, "reason": "not_running"}
+    with open(_reload_path(metadata_db), "w", encoding="utf-8") as f:
+        f.write("reload")
+    return {"signalled": True}
+
+
 def request_stop(metadata_db: str) -> dict:
     """정지 센티넬을 만들고 daemon이 제어 파일을 지울 때까지 대기한다.
 
@@ -115,22 +129,27 @@ class _StopState:
 
 
 async def serve(
-    metadata_db: str, cleanup: Callable[[], Awaitable[None]]
+    metadata_db: str,
+    cleanup: Callable[[], Awaitable[None]],
+    on_reload: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """제어 파일을 쓰고 정지 신호까지 heartbeat 루프를 돈 뒤 cleanup을 실행한다.
 
     정지 신호: SIGINT/SIGTERM(가능한 플랫폼) 또는 정지 센티넬 파일.
+    리로드 신호: 리로드 센티넬 파일 → on_reload 콜백 실행(있으면) 후 센티넬 제거.
     종료 시 cleanup 코루틴 실행 후 제어/센티넬 파일을 정리한다.
     """
     control = _control_path(metadata_db)
     stop = _stop_path(metadata_db)
+    reload_sentinel = _reload_path(metadata_db)
 
     # 이전 실행의 잔존 센티넬 제거
-    if os.path.exists(stop):
-        try:
-            os.remove(stop)
-        except OSError:
-            pass
+    for sentinel in (stop, reload_sentinel):
+        if os.path.exists(sentinel):
+            try:
+                os.remove(sentinel)
+            except OSError:
+                pass
 
     state = _StopState()
 
@@ -161,13 +180,28 @@ async def serve(
             tick += 1
             if tick % _HEARTBEAT_EVERY_TICKS == 0:
                 _write_control(control, started, time.time())
+            # 리로드 센티넬: config 로컬 소스를 다시 읽어 remount(무중단)
+            if os.path.exists(reload_sentinel):
+                try:
+                    os.remove(reload_sentinel)
+                except OSError:
+                    pass
+                if on_reload is not None:
+                    try:
+                        await on_reload()
+                        logger.info("daemon config 리로드 완료")
+                    except Exception as e:  # noqa: BLE001 — 기존 구성 유지
+                        logger.error(
+                            "daemon config 리로드 실패(기존 구성 유지): %s",
+                            e, exc_info=True,
+                        )
     finally:
         logger.info("daemon 종료 중...")
         try:
             await cleanup()
         except Exception as e:  # noqa: BLE001
             logger.error("daemon cleanup 중 예외: %s", e, exc_info=True)
-        for path in (control, stop):
+        for path in (control, stop, reload_sentinel):
             try:
                 if os.path.exists(path):
                     os.remove(path)

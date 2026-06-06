@@ -61,6 +61,53 @@ def test_signal_stop_creates_sentinel(tmp_path):
     assert os.path.exists(daemon._stop_path(db))
 
 
+def test_signal_reload_not_running(tmp_path):
+    db = str(tmp_path / "meta.db")
+    assert daemon.signal_reload(db) == {"signalled": False, "reason": "not_running"}
+
+
+def test_signal_reload_creates_sentinel(tmp_path):
+    db = str(tmp_path / "meta.db")
+    now = time.time()
+    daemon._write_control(daemon._control_path(db), now, now)
+    res = daemon.signal_reload(db)
+    assert res["signalled"] is True
+    assert os.path.exists(daemon._reload_path(db))
+
+
+def test_serve_invokes_on_reload(tmp_path):
+    db = str(tmp_path / "meta.db")
+    reloaded = {"n": 0}
+
+    async def _cleanup():
+        pass
+
+    async def _on_reload():
+        reloaded["n"] += 1
+
+    def _run():
+        asyncio.run(daemon.serve(db, _cleanup, on_reload=_on_reload))
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    for _ in range(100):
+        if daemon.read_status(db).get("running"):
+            break
+        time.sleep(0.05)
+
+    daemon.signal_reload(db)
+    # 다음 틱(~1s)에 on_reload 호출 + 센티넬 제거
+    for _ in range(100):
+        if reloaded["n"] > 0:
+            break
+        time.sleep(0.05)
+    assert reloaded["n"] >= 1
+    assert not os.path.exists(daemon._reload_path(db))  # 센티넬 소비됨
+
+    daemon.request_stop(db)
+    worker.join(timeout=5)
+
+
 def test_serve_lifecycle_start_status_stop(tmp_path):
     db = str(tmp_path / "meta.db")
     cleaned = {"done": False}

@@ -537,7 +537,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
         await device_mgr.start_source_report(
             lambda: build_local_source_inventory(jbod_manager),
             interval=config.get("p2p", {}).get(
-                "source_report_interval_seconds", 300
+                "source_report_interval_seconds", 60
             ),
         )
     await sync_client.start_periodic_sync()
@@ -605,8 +605,23 @@ async def startup_v2(config: dict, config_path: str) -> None:
         await auth_client.close()
         metadata_store.close()
 
+    async def _on_reload() -> None:
+        """config의 로컬 소스를 다시 읽어 jbod에 remount하고 즉시 재신고한다(무중단)."""
+        from stardustlib.config_loader import ConfigLoader
+
+        fresh = ConfigLoader(config_path).load()
+        new_sources = _build_local_sources(fresh)
+        jbod_manager.replace_local_sources(new_sources)
+        logger.info("로컬 소스 remount: %d개", len(new_sources))
+        if device_mgr.device_id:
+            from stardustlib.device_manager import build_local_source_inventory
+
+            await device_mgr.report_sources(
+                build_local_source_inventory(jbod_manager)
+            )
+
     from stardustlib import daemon
-    await daemon.serve(config["metadata_db"], _cleanup)
+    await daemon.serve(config["metadata_db"], _cleanup, on_reload=_on_reload)
 
 
 def _mount_remote_sources(
@@ -707,6 +722,27 @@ async def _eviction_loop(jbod_manager, repl_mgr, cfg: dict) -> None:
             logger.warning("축출 루프 오류: %s", e)
 
 
+def _build_local_sources(config: dict) -> list:
+    """config의 로컬 소스(directory/loopback)를 생성·initialize해 반환한다(remote 제외).
+
+    _build_core와 config 리로드(remount)가 공유한다.
+    """
+    from stardustlib.storage_source import DirectorySource, LoopbackSource
+
+    sources = []
+    for cfg in config.get("sources", []):
+        source_type = cfg.get("type")
+        if source_type == "directory":
+            source = DirectorySource(cfg["id"], cfg["path"])
+        elif source_type == "loopback":
+            source = LoopbackSource(cfg["id"], cfg["path"], cfg["size"])
+        else:
+            continue  # remote 타입은 건너뜀
+        source.initialize()
+        sources.append(source)
+    return sources
+
+
 def _build_core(config: dict) -> tuple:
     """로컬 스토리지 핵심 컴포넌트를 조립해 반환한다 (WebDAV 비의존).
 
@@ -795,18 +831,7 @@ def _build_core(config: dict) -> tuple:
     encryption_engine = EncryptionEngine(key)
 
     # 로컬 소스만 생성 (remote 제외)
-    sources: list[StorageSource] = []
-    for cfg in config.get("sources", []):  # type: ignore[attr-defined]
-        source_type = cfg["type"]
-        if source_type == "directory":
-            source = DirectorySource(cfg["id"], cfg["path"])
-        elif source_type == "loopback":
-            source = LoopbackSource(cfg["id"], cfg["path"], cfg["size"])
-        else:
-            # remote 타입은 여기서 건너뜀
-            continue
-        source.initialize()
-        sources.append(source)
+    sources = _build_local_sources(config)
 
     assert metadata_store is not None
     jbod_manager = JBODManager(sources, metadata_store, encryption_engine)

@@ -721,6 +721,12 @@ def daemon_signal_stop(config_path: str) -> dict:
     return daemon.signal_stop(config["metadata_db"])
 
 
+def daemon_signal_reload(config_path: str) -> dict:
+    """config 리로드 신호를 보낸다(daemon이 로컬 소스를 다시 mount). 대기 없음."""
+    config = ConfigLoader(config_path).load()
+    return daemon.signal_reload(config["metadata_db"])
+
+
 def daemon_start(config_path: str) -> int:
     """daemon을 백그라운드 프로세스로 시작하고 pid를 반환한다.
 

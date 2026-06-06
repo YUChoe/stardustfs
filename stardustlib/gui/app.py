@@ -785,7 +785,7 @@ class StardustApp:
                 return
             self._after_write()  # 캐시 세션 무효화 → 새 소스 마운트·상태바 반영
             reload()             # 재빌드된 세션 기준으로 목록 갱신
-            self._restart_daemon()  # daemon이 새 소스를 mount·재신고하도록 재기동
+            self._reload_daemon()  # daemon이 새 소스를 remount·재신고하도록 리로드
 
         def remove():
             sel = tree.selection()
@@ -810,8 +810,8 @@ class StardustApp:
                         moved=len(report.get("moved", []))))
                     reload()
                     self.refresh()
-                    # daemon이 분리된 소스를 더는 mount·재신고하지 않도록 재기동
-                    self._restart_daemon()
+                    # daemon이 분리된 소스를 더는 mount·재신고하지 않도록 리로드
+                    self._reload_daemon()
                 else:
                     messagebox.showwarning(t["src_remove"], t["src_detach_blocked"].format(
                         unmoved=len(report.get("unmoved", []))))
@@ -945,20 +945,19 @@ class StardustApp:
             self._daemon_dot(self.t["daemon_stopped"], grey)
         self._ensure_daemon()
 
-    def _restart_daemon(self) -> None:
-        """실행 중인 daemon을 정지시켜 감독 로직이 새 config로 재기동하게 한다.
+    def _reload_daemon(self) -> None:
+        """실행 중인 daemon에 config 리로드 신호를 보낸다(무중단 remount).
 
         소스 추가/분리 후 호출한다 — daemon은 시작 시 config로 소스를 mount하므로,
-        재기동해야 변경된 소스 목록을 다시 읽고 서버 레지스트리에 재신고한다.
-        정지 신호만 보내고(대기 없음), 다음 폴링에서 _ensure_daemon이 재시작한다.
+        리로드해야 변경된 로컬 소스를 다시 읽어 remount하고 서버 레지스트리에 즉시
+        재신고한다. 전체 재시작과 달리 P2P/동기화를 중단하지 않는다.
         """
         cfg = self.config_path
         if not cfg:
             return
-        self._daemon_restart_until = 0.0  # 쿨다운 리셋 → 즉시 재시작 허용
         self._set_status(self.t["daemon_restart"])
         self.worker.submit(
-            lambda: actions.daemon_signal_stop(cfg), lambda *_a: None
+            lambda: actions.daemon_signal_reload(cfg), lambda *_a: None
         )
 
     def _ensure_daemon(self) -> None:

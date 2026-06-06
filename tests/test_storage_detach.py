@@ -105,6 +105,25 @@ def test_inventory_excludes_remote(tmp_path):
     store.close()
 
 
+def test_replace_local_sources_keeps_remote_and_recover(tmp_path):
+    # config 리로드: 로컬 소스만 교체, 원격·_recover_fn 보존.
+    a, b = _loop(tmp_path, "old-a"), _loop(tmp_path, "old-b")
+    jbod, store = _jbod(tmp_path, [a])
+    jbod.register_remote_device("dev-b", _FakeRemote())
+    # 원격 소스 객체도 sources에 있다고 가정(마운트). 간단히 is_remote 속성을 갖는 더미.
+    sentinel = object()
+    jbod._recover_fn = sentinel
+
+    jbod.replace_local_sources([b])  # old-a → old-b 교체
+    local_ids = [s.source_id for s in jbod.sources if not getattr(s, "is_remote", False)]
+    assert local_ids == ["old-b"]            # 로컬 교체됨
+    assert jbod._get_source_by_id("old-b") is b
+    assert jbod._get_source_by_id("old-a") is None
+    assert jbod._remote_devices.get("dev-b") is not None  # 원격 보존
+    assert jbod._recover_fn is sentinel                   # 복구 콜백 보존
+    store.close()
+
+
 def test_write_spills_over_to_remote_when_local_full(tmp_path):
     # 로컬 소스가 없으면(만석 등가) 신규 쓰기는 온라인 리모트로 스필오버된다.
     jbod, store = _jbod(tmp_path, [])

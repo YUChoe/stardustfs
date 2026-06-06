@@ -494,6 +494,10 @@ class TestSourceReportLoop:
 
         assert reported and reported[0] == inv
 
+    def test_default_interval_is_60s(self):
+        from stardustlib.device_manager import _SOURCE_REPORT_INTERVAL
+        assert _SOURCE_REPORT_INTERVAL == 60
+
     @pytest.mark.asyncio
     async def test_no_device_id_is_noop(self, device_manager):
         """device_id가 없으면 루프를 시작하지 않는다."""
