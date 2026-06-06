@@ -106,6 +106,9 @@ class ReplicationManager:
         self._max_concurrent_repair = max_concurrent_repair
         self._io = io or _EventLoopThread.get_instance()
         self._client = httpx.AsyncClient(timeout=timeout)
+        # 직접 UDP(홀펀칭) 전송 콜백: async (device_id, op, payload) -> (status, result).
+        # 데몬이 HolePunchService.send_op를 주입한다. 같은 _io 루프에서 await된다.
+        self._udp_send = None
 
     # ------------------------------------------------------------------
     # 식별자 (서버에 가상경로 비노출 — SHA-256 해시)
@@ -120,6 +123,14 @@ class ReplicationManager:
         """목표 복제본 수를 갱신한다(정책 변경 반영)."""
         if n >= 1:
             self._min_replicas = n
+
+    def set_udp_transport(self, fn) -> None:
+        """직접 UDP(홀펀칭) 전송 콜백을 설정한다.
+
+        fn은 async (device_id, op, payload) -> (status, result). 홀더 전송 시 직접
+        TCP가 도달 불가하면 릴레이 전에 이 경로를 시도한다(직접 우선, 릴레이 최후).
+        """
+        self._udp_send = fn
 
     def _file_ref(self, virtual_path: str) -> str:
         uid = self._auth.user_id or ""
@@ -467,33 +478,41 @@ class ReplicationManager:
     ) -> bool:
         """홀더에 청크 암호문을 push한다. 직접 연결 실패 시 릴레이로 fallback한다.
 
-        직접 200 → True. 직접 비-200(쿼터 등) → False(릴레이해도 동일). 직접 연결
-        불가(NAT) → 같은 사용자 릴레이 시도. 모두 실패 시 False(다음 홀더로 진행).
+        전송 순서: (1) 직접 TCP(광고 주소, 주로 LAN) → (2) 직접 UDP(홀펀칭) →
+        (3) 릴레이(정책 허가 시, 최후). 각 단계에서 200=성공(True), 비-200(쿼터 등)은
+        재경로 무의미하므로 False, 도달 불가(타임아웃/연결 실패)면 다음 단계로 넘어간다.
         """
         encoded = base64.b64encode(data).decode("ascii")
         body = {"chunk_id": chunk_id, "data": encoded}
+        authed = {**body, "auth_token": token}
+        # (1) 직접 TCP
         if address:
             try:
                 resp = await self._client.post(
                     f"http://{address}/p2p/replica_store",
-                    json={**body, "auth_token": token},
-                    timeout=DIRECT_HOLDER_TIMEOUT,
+                    json=authed, timeout=DIRECT_HOLDER_TIMEOUT,
                 )
                 return resp.status_code == 200
             except (httpx.TimeoutException, httpx.NetworkError):
-                pass  # 직접 실패 → 릴레이 fallback
+                pass  # 도달 불가 → 다음 경로
+        # (2) 직접 UDP(홀펀칭)
+        if self._udp_send is not None and device_id:
+            try:
+                status, _result = await self._udp_send(
+                    device_id, "replica_store", authed
+                )
+                return status == 200  # 비-200(쿼터 등)은 릴레이해도 동일
+            except Exception:  # noqa: BLE001 — 펀치/전송 실패 → 릴레이
+                pass
+        # (3) 릴레이(정책 허가 시) — 타 사용자 홀더면 소유자 토큰으로 인가
         if not device_id:
             return False
         try:
-            # 릴레이는 타 사용자 홀더일 수 있으므로 소유자 토큰을 포함한다(홀더가
-            # 요청자=소유자를 도출해 ParityStore 인가에 사용).
-            await self._relay_op(
-                device_id, "replica_store", {**body, "auth_token": token}
-            )
+            await self._relay_op(device_id, "replica_store", authed)
             return True
         except Exception as e:  # noqa: BLE001
             logger.info(
-                "홀더 store 실패(direct+relay) dev=%s addr=%s: %s",
+                "홀더 store 실패(direct+udp+relay) dev=%s addr=%s: %s",
                 device_id, address, e,
             )
             return False
@@ -501,33 +520,52 @@ class ReplicationManager:
     async def _holder_fetch(
         self, device_id: str, address: str, chunk_id: str, token: str
     ) -> bytes | None:
-        """홀더에서 청크 암호문을 받는다. 직접 실패 시 릴레이로 fallback(실패 시 None)."""
+        """홀더에서 청크 암호문을 받는다.
+
+        전송 순서: 직접 TCP → 직접 UDP(홀펀칭) → 릴레이(정책, 최후). 도달 불가면 다음
+        단계로, 비-200은 재경로 무의미하므로 None. 모두 실패 시 None(다음 홀더로 진행).
+        """
         body = {"chunk_id": chunk_id}
+        authed = {**body, "auth_token": token}
+
+        def _data_from(result: dict) -> bytes | None:
+            try:
+                return base64.b64decode(result["data"])
+            except (KeyError, ValueError, TypeError):
+                return None
+
+        # (1) 직접 TCP
         if address:
             try:
                 resp = await self._client.post(
                     f"http://{address}/p2p/replica_fetch",
-                    json={**body, "auth_token": token},
-                    timeout=DIRECT_HOLDER_TIMEOUT,
+                    json=authed, timeout=DIRECT_HOLDER_TIMEOUT,
                 )
                 if resp.status_code == 200:
-                    try:
-                        return base64.b64decode(resp.json()["data"])
-                    except (KeyError, ValueError):
-                        return None
-                return None  # 404/403 등은 릴레이해도 동일
+                    return _data_from(resp.json())
+                return None  # 404/403 등은 재경로 무의미
             except (httpx.TimeoutException, httpx.NetworkError):
-                pass  # 직접 실패 → 릴레이 fallback
+                pass  # 도달 불가 → 다음 경로
+        # (2) 직접 UDP(홀펀칭)
+        if self._udp_send is not None and device_id:
+            try:
+                status, result = await self._udp_send(
+                    device_id, "replica_fetch", authed
+                )
+                if status == 200:
+                    return _data_from(result)
+                return None
+            except Exception:  # noqa: BLE001 — 펀치/전송 실패 → 릴레이
+                pass
+        # (3) 릴레이(정책 허가 시)
         if not device_id:
             return None
         try:
-            result = await self._relay_op(
-                device_id, "replica_fetch", {**body, "auth_token": token}
-            )
-            return base64.b64decode(result["data"])
+            result = await self._relay_op(device_id, "replica_fetch", authed)
+            return _data_from(result)
         except Exception as e:  # noqa: BLE001
             logger.info(
-                "홀더 fetch 실패(direct+relay) dev=%s addr=%s: %s",
+                "홀더 fetch 실패(direct+udp+relay) dev=%s addr=%s: %s",
                 device_id, address, e,
             )
             return None

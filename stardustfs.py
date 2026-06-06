@@ -527,6 +527,34 @@ async def startup_v2(config: dict, config_path: str) -> None:
             )
             await relay_worker.start()
 
+    # (6-a) 홀펀칭 직접 전송 서비스 — 공유 IO 루프에서 랑데부 등록 + 펀치 + rudp.
+    # 직접 UDP(홀펀칭)를 릴레이보다 우선하는 전송 경로. 시작 실패는 비치명(릴레이 fallback).
+    holepunch_service = None
+    if p2p_enabled and device_mgr.device_id:
+        try:
+            from urllib.parse import urlparse
+
+            from stardustlib.holepunch_service import HolePunchService
+            from stardustlib.remote_source import _EventLoopThread
+
+            rv_host = urlparse(server_url).hostname
+            rv_port = int(p2p_config.get("rendezvous_port", 9091))
+            if rv_host:
+                holepunch_service = HolePunchService(
+                    rv_host, rv_port, auth_client.get_valid_token,
+                    device_mgr.device_id, p2p_server.dispatch_async,
+                )
+                _EventLoopThread.get_instance().run_coroutine(
+                    holepunch_service.start()
+                )
+                logger.info(
+                    "홀펀칭 서비스 시작 (랑데부 %s:%d, reflexive=%s)",
+                    rv_host, rv_port, holepunch_service.reflexive,
+                )
+        except Exception as e:  # noqa: BLE001 — 비치명, 릴레이로 fallback
+            logger.warning("홀펀칭 서비스 시작 실패(릴레이 fallback): %s", e)
+            holepunch_service = None
+
     await device_mgr.start_heartbeat()
     # 소스 인벤토리 주기 재신고(리모트 GUI 용량/사용량 최신화). 시작 1회 신고 외에
     # 용량 변동을 반영한다. device_id 없으면 no-op.
@@ -575,6 +603,11 @@ async def startup_v2(config: dict, config_path: str) -> None:
         await repl_scheduler.start()
         # 축출 파일 읽기 시 복제 홀더에서 복구해 로컬 재구체화하는 콜백 주입.
         jbod_manager._recover_fn = repl_mgr.recover
+        # 홀더 전송을 직접 TCP→직접 UDP(홀펀칭)→릴레이 순으로. 같은 IO 루프에서 await.
+        if holepunch_service is not None:
+            repl_mgr.set_udp_transport(
+                lambda did, op, pl: holepunch_service.send_op(did, op, pl)
+            )
 
     # (6-c) 콜드 축출: 로컬 공간 부족 시 복제본이 충분한 파일의 로컬 원본 비움.
     # 기본 비활성(eviction.enabled). 안전: 삭제 직전 온라인 복제본 수를 실측.
@@ -595,6 +628,14 @@ async def startup_v2(config: dict, config_path: str) -> None:
                 pass
         if repl_scheduler is not None:
             await repl_scheduler.stop()
+        if holepunch_service is not None:
+            from stardustlib.remote_source import _EventLoopThread
+            try:
+                _EventLoopThread.get_instance().run_coroutine(
+                    holepunch_service.stop()
+                )
+            except Exception as e:  # noqa: BLE001 — 종료 경로
+                logger.debug("홀펀칭 서비스 종료 중 예외: %s", e)
         await sync_client.stop()
         await device_mgr.stop()
         if relay_worker is not None:

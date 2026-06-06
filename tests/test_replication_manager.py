@@ -332,6 +332,78 @@ async def test_holder_store_no_relay_on_non_connection_error(key):
     assert ok is False and relayed["called"] is False
 
 
+@pytest.mark.asyncio
+async def test_holder_store_udp_before_relay(key):
+    """직접 TCP 도달 불가 시 UDP(홀펀칭)를 릴레이보다 먼저 시도, UDP 성공이면 릴레이 안 함."""
+    mgr = _bare_manager(key)
+    seen = {}
+
+    async def boom(*a, **k):
+        raise httpx.ConnectError("unreachable")
+
+    async def udp(device_id, op, payload):
+        seen.update(device_id=device_id, op=op, token=payload.get("auth_token"))
+        return (200, {"bytes_written": 1})
+
+    async def fake_relay(device_id, op, payload):
+        seen["relay"] = True
+        return {}
+
+    mgr._client.post = boom
+    mgr.set_udp_transport(udp)
+    mgr._relay_op = fake_relay
+    ok = await mgr._holder_store("devX", "1.2.3.4:9090", "c1", b"cipher", "tok")
+    assert ok is True
+    assert seen == {"device_id": "devX", "op": "replica_store", "token": "tok"}
+    assert "relay" not in seen  # UDP 성공 → 릴레이 미사용
+
+
+@pytest.mark.asyncio
+async def test_holder_store_relay_after_udp_fails(key):
+    """UDP가 예외(펀치 실패)면 릴레이로 fallback한다."""
+    mgr = _bare_manager(key)
+    relayed = {"called": False}
+
+    async def boom(*a, **k):
+        raise httpx.ConnectError("unreachable")
+
+    async def udp(device_id, op, payload):
+        raise OSError("punch failed")
+
+    async def fake_relay(device_id, op, payload):
+        relayed["called"] = True
+        return {"bytes_written": 1}
+
+    mgr._client.post = boom
+    mgr.set_udp_transport(udp)
+    mgr._relay_op = fake_relay
+    ok = await mgr._holder_store("devX", "1.2.3.4:9090", "c1", b"x", "tok")
+    assert ok is True and relayed["called"] is True
+
+
+@pytest.mark.asyncio
+async def test_holder_fetch_udp_before_relay(key):
+    mgr = _bare_manager(key)
+
+    async def boom(*a, **k):
+        raise httpx.ConnectError("unreachable")
+
+    async def udp(device_id, op, payload):
+        return (200, {"data": base64.b64encode(b"cipher").decode("ascii")})
+
+    relayed = {"called": False}
+
+    async def fake_relay(device_id, op, payload):
+        relayed["called"] = True
+        return {}
+
+    mgr._client.post = boom
+    mgr.set_udp_transport(udp)
+    mgr._relay_op = fake_relay
+    data = await mgr._holder_fetch("devX", "1.2.3.4:9090", "c1", "tok")
+    assert data == b"cipher" and relayed["called"] is False
+
+
 def test_file_ref_does_not_leak_path(key):
     jbod = _FakeJbod(key)
     meta = _FakeMeta(set())
