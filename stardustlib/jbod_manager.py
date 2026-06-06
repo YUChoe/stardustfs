@@ -56,6 +56,9 @@ class JBODManager:
         self._remote_devices: dict = {}
         # orphan GC 디바운스: 소유권 이전/병합 감지 시 set, 사이클당 1회 스캔
         self._gc_needed: bool = False
+        # 축출(evicted) 파일 재구체화 콜백: recover_fn(virtual_path) → 복제 홀더에서
+        # 복구해 로컬에 재기록(쓰기로 evicted 해제). 온라인 세션/데몬에서 주입.
+        self._recover_fn = None
 
     def mark_gc_needed(self) -> None:
         """orphan GC가 필요함을 표시한다 (다음 사이클에 1회 스캔).
@@ -217,6 +220,100 @@ class JBODManager:
                 continue
         return False
 
+    def _write_to_remote(
+        self, virtual_path: str, encrypted: bytes, file_size: int
+    ) -> bool:
+        """로컬 만석 시 신규 파일을 온라인 리모트 디바이스(같은 계정)에 기록한다.
+
+        암호문을 원격에 push → 메타데이터를 그 디바이스 소유로 insert. 도달 가능한
+        온라인 리모트가 없거나 모두 실패하면 False(미기록). _evacuate_to_remote의
+        신규 insert판(원본 삭제 단계 없음).
+        """
+        if not self._remote_devices:
+            return False
+        for device_id, remote in self._remote_devices.items():
+            if not getattr(remote, "is_active", False):
+                continue
+            try:
+                new_phys = self._generate_physical_path(virtual_path)
+                remote_src_id = remote.push_blob(new_phys, encrypted)
+                if not remote_src_id:
+                    continue
+                now = time.time()
+                self.metadata_store.insert(
+                    virtual_path=virtual_path,
+                    source_id=remote_src_id,
+                    physical_path=new_phys,
+                    file_size=file_size,
+                    created_at=now,
+                    modified_at=now,
+                    device_id=device_id,
+                )
+                logger.info("스필오버→리모트: %s → device=%s",
+                            virtual_path, device_id)
+                return True
+            except Exception as e:  # noqa: BLE001 — 다음 리모트 시도
+                logger.warning("리모트 스필오버 실패(%s): %s", device_id, e)
+                continue
+        return False
+
+    def _materialize_evicted(self, metadata):
+        """축출된 파일을 복제 홀더에서 복구해 로컬에 재구체화하고 갱신된 메타를 반환한다.
+
+        _recover_fn(virtual_path)이 복구→write_file(로컬 재기록, evicted 해제)을 수행한다.
+        콜백이 없으면(오프라인) 읽을 수 없으므로 OSError. 재구체화 후 lookup이
+        evicted=0인 메타를 돌려줘야 한다.
+        """
+        if self._recover_fn is None:
+            raise OSError(
+                f"축출된 파일은 온라인 복구가 필요합니다(복구 콜백 없음): "
+                f"{metadata.virtual_path}"
+            )
+        self._recover_fn(metadata.virtual_path)
+        fresh = self.metadata_store.lookup(metadata.virtual_path)
+        if fresh is None or getattr(fresh, "evicted", False):
+            raise OSError(
+                f"축출 파일 복구 실패: {metadata.virtual_path}"
+            )
+        return fresh
+
+    def evict_cold(self, is_safe, bytes_to_free: int) -> dict:
+        """복제본이 충분한 콜드 파일의 로컬 원본을 비워 공간을 회수한다.
+
+        replicated·미축출·로컬 소유 파일을 오래된 순으로 순회하며, is_safe(virtual_path)이
+        True(현재 온라인 복제본 수 ≥ min_replicas 실측)인 것만 로컬 블록을 삭제하고
+        mark_evicted한다. 누적 회수량이 bytes_to_free 이상이면 멈춘다. 대상을 확보한
+        뒤에만 삭제하므로 무손실이다(복제본이 없으면 건너뜀).
+
+        반환: {"evicted": [virtual_path...], "freed": int}.
+        """
+        evicted: list[str] = []
+        freed = 0
+        for meta in self.metadata_store.list_eviction_candidates():
+            if freed >= bytes_to_free:
+                break
+            # 로컬 소유 + 로컬 소스에 실제 존재하는 것만 대상
+            owner = meta.device_id
+            if owner is not None and owner != self.device_id:
+                continue
+            source = self._get_source_by_id(meta.source_id)
+            if source is None or getattr(source, "is_remote", False):
+                continue
+            if not is_safe(meta.virtual_path):
+                continue  # 온라인 복제본 미달 → 보존(스테일 플래그 삭제 금지)
+            try:
+                if source.exists(meta.physical_path):
+                    source.delete(meta.physical_path)
+                self.metadata_store.mark_evicted(meta.virtual_path)
+                evicted.append(meta.virtual_path)
+                freed += meta.file_size
+                logger.info("콜드 축출: %s (%d bytes)",
+                            meta.virtual_path, meta.file_size)
+            except OSError as e:
+                logger.warning("축출 실패(%s): %s", meta.virtual_path, e)
+                continue
+        return {"evicted": evicted, "freed": freed}
+
     # --- 파일 작업 ---
 
     def read_file(self, virtual_path: str) -> bytes:
@@ -235,6 +332,10 @@ class JBODManager:
         metadata = self.metadata_store.lookup(virtual_path)
         if metadata is None:
             raise FileNotFoundError(f"파일을 찾을 수 없습니다: {virtual_path}")
+
+        # 축출된(복제본 전용) 파일: 복제 홀더에서 복구해 로컬에 재구체화한 뒤 읽는다.
+        if getattr(metadata, "evicted", False):
+            metadata = self._materialize_evicted(metadata)
 
         owner = metadata.device_id
         # 로컬 소유 또는 레거시(NULL) → 로컬 읽기
@@ -345,8 +446,14 @@ class JBODManager:
                 self.metadata_store.rollback()
                 raise
         else:
-            # 새 파일 생성
-            source = self.select_source(len(encrypted))
+            # 새 파일 생성. 로컬 소스가 모두 만석이면 온라인 리모트(같은 계정)로
+            # 스필오버한다(JBOD를 로컬+리모트로 확장). 리모트도 불가하면 무손실 에러.
+            try:
+                source = self.select_source(len(encrypted))
+            except InsufficientStorageError:
+                if self._write_to_remote(virtual_path, encrypted, len(data)):
+                    return
+                raise
             physical_path = self._generate_physical_path(virtual_path)
 
             self.metadata_store.begin_transaction()

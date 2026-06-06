@@ -27,6 +27,32 @@ def store_with_file(store):
     return store
 
 
+class TestEviction:
+    """evicted 컬럼 + mark_evicted + list_eviction_candidates."""
+
+    def test_mark_evicted_and_lookup(self, store):
+        now = time.time()
+        store.insert("/e", "src-1", "e.enc", 100, now, now, device_id="devA")
+        assert store.lookup("/e").evicted is False
+        store.mark_evicted("/e")
+        meta = store.lookup("/e")
+        assert meta.evicted is True
+        # 재구체화(update)는 evicted를 해제한다
+        store.update("/e", file_size=100, modified_at=now + 1)
+        assert store.lookup("/e").evicted is False
+
+    def test_candidates_only_replicated_non_evicted_oldest_first(self, store):
+        store.insert("/a", "src-1", "a.enc", 10, 1.0, 1.0, device_id="devA")
+        store.insert("/b", "src-1", "b.enc", 10, 2.0, 2.0, device_id="devA")
+        store.insert("/c", "src-1", "c.enc", 10, 3.0, 3.0, device_id="devA")
+        store.set_replication_status("/a", "replicated")
+        store.set_replication_status("/b", "replicated")
+        # /c는 none → 후보 아님
+        store.mark_evicted("/b")  # 이미 축출 → 후보 아님
+        cands = [m.virtual_path for m in store.list_eviction_candidates()]
+        assert cands == ["/a"]  # replicated·미축출만, 오래된 순
+
+
 class TestInsertDefaults:
     """insert() 시 version=1, sync_status='pending' 기본값 테스트."""
 

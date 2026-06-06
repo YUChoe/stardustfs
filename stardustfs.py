@@ -574,9 +574,26 @@ async def startup_v2(config: dict, config_path: str) -> None:
             policy_interval=repl_config.get("policy_interval_seconds", 3600),
         )
         await repl_scheduler.start()
+        # 축출 파일 읽기 시 복제 홀더에서 복구해 로컬 재구체화하는 콜백 주입.
+        jbod_manager._recover_fn = repl_mgr.recover
+
+    # (6-c) 콜드 축출: 로컬 공간 부족 시 복제본이 충분한 파일의 로컬 원본 비움.
+    # 기본 비활성(eviction.enabled). 안전: 삭제 직전 온라인 복제본 수를 실측.
+    evict_task = None
+    evict_config = config.get("eviction", {})  # type: ignore[attr-defined]
+    if repl_enabled and evict_config.get("enabled", False):
+        evict_task = asyncio.create_task(
+            _eviction_loop(jbod_manager, repl_mgr, evict_config)
+        )
 
     # (7) 상주 루프 (정지 신호까지 — Ctrl+C 또는 'daemon stop')
     async def _cleanup() -> None:
+        if evict_task is not None:
+            evict_task.cancel()
+            try:
+                await evict_task
+            except asyncio.CancelledError:
+                pass
         if repl_scheduler is not None:
             await repl_scheduler.stop()
         await sync_client.stop()
@@ -648,6 +665,46 @@ def _mount_remote_sources(
             if dev_id in mounted_device_ids:
                 continue  # 설정에 이미 명시된 디바이스 중복 방지
             _mount(f"remote-{dev_id}", dev_id)
+
+
+async def _eviction_loop(jbod_manager, repl_mgr, cfg: dict) -> None:
+    """로컬 여유가 low_watermark 미만이면 콜드(replicated) 파일을 축출해 회수한다.
+
+    high_watermark까지 회복하도록 필요분만 축출한다. 삭제 직전 온라인 복제본 수를
+    실측(replication_health.min_online ≥ min_replicas)해 미달이면 보존한다(무손실).
+    """
+    logger = logging.getLogger(__name__)
+    interval = cfg.get("interval_seconds", 300)
+    low = int(cfg.get("low_watermark_bytes", 200 * 1024 * 1024))
+    high = int(cfg.get("high_watermark_bytes", 500 * 1024 * 1024))
+    min_repl = repl_mgr.min_replicas
+
+    def _is_safe(virtual_path: str) -> bool:
+        try:
+            health = repl_mgr.replication_health(virtual_path)
+            return health.min_online >= min_repl
+        except Exception:  # noqa: BLE001 — 안전 미확인 시 보존
+            return False
+
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            free = jbod_manager.get_available_space()
+            if free >= low:
+                continue
+            need = max(0, high - free)
+            report = await asyncio.to_thread(
+                jbod_manager.evict_cold, _is_safe, need
+            )
+            if report["evicted"]:
+                logger.info(
+                    "콜드 축출: %d개 파일, %d bytes 회수",
+                    len(report["evicted"]), report["freed"],
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — 다음 주기 재시도
+            logger.warning("축출 루프 오류: %s", e)
 
 
 def _build_core(config: dict) -> tuple:

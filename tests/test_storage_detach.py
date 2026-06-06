@@ -105,6 +105,93 @@ def test_inventory_excludes_remote(tmp_path):
     store.close()
 
 
+def test_write_spills_over_to_remote_when_local_full(tmp_path):
+    # 로컬 소스가 없으면(만석 등가) 신규 쓰기는 온라인 리모트로 스필오버된다.
+    jbod, store = _jbod(tmp_path, [])
+    remote = _FakeRemote(source_id="dev-b-src")
+    jbod.register_remote_device("dev-b", remote)
+    jbod.write_file("/big", b"hello-remote")
+    meta = store.lookup("/big")
+    assert meta.device_id == "dev-b"       # 리모트 소유로 기록
+    assert meta.source_id == "dev-b-src"
+    assert b"hello-remote" in remote.stored.values()
+    store.close()
+
+
+def test_write_raises_when_local_full_and_no_reachable_remote(tmp_path):
+    from stardustlib.exceptions import InsufficientStorageError
+
+    jbod, store = _jbod(tmp_path, [])
+    jbod.register_remote_device("dev-b", _FakeRemote(active=False))  # 오프라인
+    with pytest.raises(InsufficientStorageError):
+        jbod.write_file("/x", b"data")
+    store.close()
+
+
+def test_write_prefers_local_when_space_available(tmp_path):
+    # 로컬 여유가 있으면 리모트가 있어도 로컬에 기록한다(로컬 우선 유지).
+    a = _loop(tmp_path, "loc")
+    jbod, store = _jbod(tmp_path, [a])
+    remote = _FakeRemote()
+    jbod.register_remote_device("dev-b", remote)
+    jbod.write_file("/s", b"small")
+    meta = store.lookup("/s")
+    assert meta.device_id == "devA" and meta.source_id == "loc"
+    assert remote.stored == {}  # 리모트 미사용
+    store.close()
+
+
+def test_evict_cold_deletes_local_only_when_safe(tmp_path):
+    # replicated 파일을 안전(복제본 충분)일 때만 로컬 삭제 + evicted 표시.
+    a = _loop(tmp_path, "ev")
+    jbod, store = _jbod(tmp_path, [a])
+    for vp in ("/safe", "/unsafe"):
+        phys = jbod._generate_physical_path(vp)
+        a.write(phys, b"blob-" + vp.encode())
+        store.insert(vp, "ev", phys, 5, 1.0, 1.0, device_id="devA")
+        store.set_replication_status(vp, "replicated")
+
+    safe = {"/safe"}
+    report = jbod.evict_cold(lambda vp: vp in safe, bytes_to_free=10**9)
+    assert report["evicted"] == ["/safe"]
+    assert store.lookup("/safe").evicted is True
+    assert store.lookup("/unsafe").evicted is False  # 미안전 → 보존
+    # 로컬 블록: safe는 삭제, unsafe는 보존
+    safe_meta = store.lookup("/safe")
+    assert not a.exists(safe_meta.physical_path)
+    store.close()
+
+
+def test_read_evicted_triggers_recover(tmp_path):
+    # 축출 파일 읽기 시 _recover_fn으로 재구체화 후 읽는다.
+    a = _loop(tmp_path, "rv")
+    jbod, store = _jbod(tmp_path, [a])
+    phys = jbod._generate_physical_path("/f")
+    store.insert("/f", "rv", phys, 4, 1.0, 1.0, device_id="devA")
+    store.set_replication_status("/f", "replicated")
+    store.mark_evicted("/f")  # 로컬 블록 없음 + evicted
+
+    def fake_recover(vp):
+        # 복구 모사: 로컬에 재기록(write_file이 evicted 해제)
+        jbod.write_file(vp, b"data")
+
+    jbod._recover_fn = fake_recover
+    assert jbod.read_file("/f") == b"data"
+    assert store.lookup("/f").evicted is False
+    store.close()
+
+
+def test_read_evicted_without_recover_raises(tmp_path):
+    a = _loop(tmp_path, "rv2")
+    jbod, store = _jbod(tmp_path, [a])
+    phys = jbod._generate_physical_path("/f")
+    store.insert("/f", "rv2", phys, 4, 1.0, 1.0, device_id="devA")
+    store.mark_evicted("/f")
+    with pytest.raises(OSError):
+        jbod.read_file("/f")  # 복구 콜백 없음 → 온라인 필요 에러
+    store.close()
+
+
 def test_evacuate_empty_source_ok(tmp_path):
     a, b = _loop(tmp_path, "e-a"), _loop(tmp_path, "e-b")
     jbod, store = _jbod(tmp_path, [a, b])

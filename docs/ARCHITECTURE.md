@@ -57,6 +57,17 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
   온라인 리모트 디바이스(같은 사용자)로 분산 이동한다(`_evacuate_to_remote`: 암호문
   블록을 /p2p/write로 push → 메타 device_id/source_id 갱신 → 원본 삭제). 도달 가능한
   대상이 없으면 미이동으로 남겨 detach 보류(타 사용자 리모트는 후속).
+- JBOD 스필오버(쓰기): 신규 파일이 로컬 소스 어디에도 안 들어가면(`select_source`가
+  InsufficientStorageError) `_write_to_remote`로 온라인 리모트 디바이스(같은 계정)에
+  암호문을 push하고 메타를 그 디바이스 소유로 등록한다(읽기는 기존 원격 라우팅). 도달
+  가능한 리모트가 없으면 무손실 에러. 로컬 소스 간 분산은 select_source가 여유 최대를
+  고른다(로컬 우선).
+- 콜드 축출(티어링, 기본 비활성 `eviction.enabled`): 로컬 여유가 low_watermark 미만이면
+  `jbod.evict_cold`가 replicated·로컬 소유 파일을 오래된 순으로, 삭제 직전 온라인 복제본
+  수를 실측(≥min_replicas)한 것만 로컬 블록 삭제 + `evicted` 표시(무손실). 메타는
+  device-로컬 상태라 동기화로 전파되지 않는다. evicted 파일 읽기는 `_recover_fn`
+  (ReplicationManager.recover)으로 복제 홀더에서 복구→로컬 재기록(evicted 해제) 후
+  제공한다. (교차 디바이스 P2P 읽기의 축출 폴백은 후속 — 그래서 기본 비활성.)
 - `remote_source.py`: 원격 디바이스 프록시. 전용 백그라운드 이벤트 루프에서 P2P
   직접 연결 + 실패 시 릴레이 fallback. 동기 메서드로 자가 브리지.
 - `p2p_server.py` / `relay_client.py` / `relay_worker.py`: P2P 서버와 서버 경유 릴레이.

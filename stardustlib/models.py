@@ -106,6 +106,7 @@ class FileMetadata:
     device_id: str | None = None    # 마지막 수정 디바이스 ID
     sync_status: str = "synced"     # synced | pending | conflict
     deleted: bool = False   # tombstone 여부 (삭제 동기화용)
+    evicted: bool = False   # 로컬 원본 축출(복제본 전용) 여부 — 읽기는 복제 복구
 
 
 @dataclass

@@ -101,6 +101,7 @@ class MetadataStore:
         self._migrate_to_v2()
         self._migrate_to_v3()
         self._migrate_to_v4()
+        self._migrate_to_v5()
         self._initialized = True
         logger.info("Metadata Store 초기화 완료: %s", self._db_path)
 
@@ -260,6 +261,33 @@ class MetadataStore:
             logger.error("v4 스키마 마이그레이션 실패, 롤백 수행: %s", e)
             raise
 
+    def _migrate_to_v5(self) -> None:
+        """v4 → v5: files에 evicted 컬럼 추가 (로컬 원본 축출=복제본 전용 표시).
+
+        이미 컬럼이 있으면 아무 작업도 하지 않는다. 기존 레코드는 DEFAULT 0.
+        """
+        conn = self._get_conn()
+        cursor = conn.execute("PRAGMA table_info(files)")
+        columns = [row["name"] for row in cursor.fetchall()]
+        if "evicted" in columns:
+            return
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN evicted INTEGER NOT NULL DEFAULT 0"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_version (id, version, migrated_at) "
+                "VALUES (1, 5, ?)",
+                (time.time(),),
+            )
+            conn.commit()
+            logger.info("MetadataStore v5 스키마 마이그레이션 완료 (evicted)")
+        except Exception as e:
+            conn.rollback()
+            logger.error("v5 스키마 마이그레이션 실패, 롤백 수행: %s", e)
+            raise
+
     # --- 파일 메타데이터 CRUD ---
 
     _VALID_SYNC_STATUSES = ("synced", "pending", "conflict")
@@ -330,6 +358,7 @@ class MetadataStore:
             "modified_at = ?",
             "version = version + 1",
             "sync_status = 'pending'",
+            "evicted = 0",  # 내용/위치 갱신 = 재구체화 → 축출 플래그 해제
         ]
         params: list = [file_size, modified_at]
         if device_id is not None:
@@ -406,6 +435,48 @@ class MetadataStore:
             (virtual_path,),
         ).fetchone()
         return row["replication_status"] if row is not None else None
+
+    def mark_evicted(self, virtual_path: str) -> None:
+        """로컬 원본 축출(복제본 전용)로 표시한다. evicted는 디바이스-로컬 상태로
+        version/sync_status를 바꾸지 않는다(동기화로 전파되지 않음)."""
+        conn = self._get_conn()
+        conn.execute(
+            "UPDATE files SET evicted = 1 WHERE virtual_path = ?",
+            (virtual_path,),
+        )
+        conn.commit()
+
+    def list_eviction_candidates(self) -> list[FileMetadata]:
+        """축출 후보(replicated·미축출·활성)를 오래된 순(modified_at ASC)으로 반환한다.
+
+        로컬 소유 여부는 호출자(jbod)가 소스로 필터한다.
+        """
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "SELECT virtual_path, source_id, physical_path, file_size, "
+            "created_at, modified_at, version, device_id, sync_status, deleted, "
+            "evicted FROM files WHERE deleted = 0 AND evicted = 0 "
+            "AND replication_status = 'replicated' ORDER BY modified_at ASC",
+        )
+        return [self._row_to_metadata(row) for row in cursor.fetchall()]
+
+    @staticmethod
+    def _row_to_metadata(row) -> FileMetadata:
+        """files 행을 FileMetadata로 변환한다(evicted 포함, 키 없으면 False)."""
+        keys = row.keys()
+        return FileMetadata(
+            virtual_path=row["virtual_path"],
+            source_id=row["source_id"],
+            physical_path=row["physical_path"],
+            file_size=row["file_size"],
+            created_at=row["created_at"],
+            modified_at=row["modified_at"],
+            version=row["version"],
+            device_id=row["device_id"],
+            sync_status=row["sync_status"],
+            deleted=bool(row["deleted"]),
+            evicted=bool(row["evicted"]) if "evicted" in keys else False,
+        )
 
     def list_files_in_source(self, source_id: str) -> list[FileMetadata]:
         """해당 소스에 저장된 활성(deleted=0) 파일 목록을 반환한다(evacuate 대상)."""
@@ -523,25 +594,14 @@ class MetadataStore:
         conn = self._get_conn()
         cursor = conn.execute(
             "SELECT virtual_path, source_id, physical_path, file_size, "
-            "created_at, modified_at, version, device_id, sync_status, deleted "
-            "FROM files WHERE virtual_path = ? AND deleted = 0",
+            "created_at, modified_at, version, device_id, sync_status, deleted, "
+            "evicted FROM files WHERE virtual_path = ? AND deleted = 0",
             (virtual_path,),
         )
         row = cursor.fetchone()
         if row is None:
             return None
-        return FileMetadata(
-            virtual_path=row["virtual_path"],
-            source_id=row["source_id"],
-            physical_path=row["physical_path"],
-            file_size=row["file_size"],
-            created_at=row["created_at"],
-            modified_at=row["modified_at"],
-            version=row["version"],
-            device_id=row["device_id"],
-            sync_status=row["sync_status"],
-            deleted=bool(row["deleted"]),
-        )
+        return self._row_to_metadata(row)
 
     def lookup_any(self, virtual_path: str) -> FileMetadata | None:
         """tombstone을 포함하여 가상 경로로 레코드를 조회한다 (동기화 병합용)."""
