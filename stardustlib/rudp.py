@@ -87,14 +87,17 @@ class RudpEndpoint:
         self._ack_timeout = ack_timeout
         self._max_retries = max_retries
         self._next_id = 1
-        self._send_states: dict[int, _SendState] = {}
+        # 송신 상태는 (addr, msg_id)로 키잉한다 — 한 엔드포인트가 서로 다른 피어에
+        # 같은 msg_id로 동시 송신(자기 요청 + 원격 id 에코 응답)해도 충돌하지 않게.
+        self._send_states: dict[tuple, _SendState] = {}
         # 수신 재조립 버퍼: (addr, msg_id) → {idx: payload}
         self._recv: dict[tuple, dict[int, bytes]] = {}
         # 이미 완성·전달한 메시지(재전송 DATA의 중복 전달 방지). ACK는 계속 보낸다.
         self._delivered: set[tuple] = set()
         self._inbox: asyncio.Queue = asyncio.Queue()
 
-    def _alloc_id(self) -> int:
+    def new_msg_id(self) -> int:
+        """새 메시지 id를 할당한다(요청 전 future 등록 등에 미리 필요할 때)."""
         mid = self._next_id
         self._next_id = self._next_id + 1 if self._next_id < 0xFFFFFFFF else 1
         return mid
@@ -110,12 +113,12 @@ class RudpEndpoint:
             return
         msg_type, msg_id, frag_idx, frag_count, payload = decoded
         if msg_type == _TYPE_ACK:
-            self._on_ack(msg_id, frag_idx)
+            self._on_ack(addr, msg_id, frag_idx)
         elif msg_type == _TYPE_DATA:
             self._on_data(addr, msg_id, frag_idx, frag_count, payload)
 
-    def _on_ack(self, msg_id: int, frag_idx: int) -> None:
-        state = self._send_states.get(msg_id)
+    def _on_ack(self, addr: tuple, msg_id: int, frag_idx: int) -> None:
+        state = self._send_states.get((addr, msg_id))
         if state is None:
             return
         state.acked.add(frag_idx)
@@ -156,7 +159,7 @@ class RudpEndpoint:
         msg_id를 주면(요청에 대한 응답을 같은 id로 에코) 그 id를 쓰고, 없으면 새로 할당.
         """
         if msg_id is None:
-            msg_id = self._alloc_id()
+            msg_id = self.new_msg_id()
         frags = fragment(data, self._max_payload)
         if len(frags) > _MAX_FRAGMENTS:
             raise ValueError(
@@ -164,7 +167,8 @@ class RudpEndpoint:
             )
         count = len(frags)
         state = _SendState(count)
-        self._send_states[msg_id] = state
+        skey = (addr, msg_id)
+        self._send_states[skey] = state
         try:
             for _attempt in range(self._max_retries):
                 for idx, payload in enumerate(frags):
@@ -186,7 +190,7 @@ class RudpEndpoint:
                 f"{len(state.acked)}/{count} 프래그먼트만 ACK됨"
             )
         finally:
-            self._send_states.pop(msg_id, None)
+            self._send_states.pop(skey, None)
 
 
 class RudpProtocol(asyncio.DatagramProtocol):

@@ -24,10 +24,12 @@ inclusion: manual
 - [x] 3.3 msg_id 다중화(send에 msg_id 지정 가능 → 응답 에코용). RudpProtocol 소켓 어댑터.
 
 ## Phase 4: P2P over UDP + 전송 선택
-- [ ] 4.1 p2p_udp: rudp 위 P2P op 서버(dispatch_async 재사용)/클라이언트 send_op.
-- [ ] 4.2 daemon UDP 수신 루프(펀치 수락 + rudp 서버) 기동.
-- [ ] 4.3 replication_manager/remote_source 직접 전송을 펀치 UDP→릴레이(정책) 순으로 대체.
-- [ ] 4.4 테스트: 로컬 2-소켓 op 왕복(replica 4MiB), 우선순위/ fallback.
+- [x] 4.1 p2p_udp.P2pUdpNode: rudp 위 P2P op 서버(dispatch 주입=dispatch_async 재사용)
+      /클라이언트 send_op. REQ/RESP 태그 + msg_id 에코 매칭. rudp 송신 상태를
+      (addr,msg_id)로 키잉(에코 응답 충돌 방지). 테스트 4종(소/대(4MiB)/오류/동시).
+- [ ] 4.2 daemon UDP 수신 루프(펀치 수락 + P2pUdpNode 기동) — Phase 2 이후.
+- [ ] 4.3 replication_manager/remote_source 직접 전송을 펀치 UDP→릴레이(정책) 순으로
+      대체 — Phase 2(피어 UDP 주소 학습) 이후.
 
 ## Phase 5: 검증/문서
 - [ ] 5.1 통합 e2e(펀치→직접 UDP replica 왕복 일치, 펀치 실패→릴레이 fallback).
