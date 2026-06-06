@@ -61,6 +61,28 @@ def test_signal_stop_creates_sentinel(tmp_path):
     assert os.path.exists(daemon._stop_path(db))
 
 
+def test_write_control_tolerates_replace_failure(tmp_path, monkeypatch):
+    """os.replace가 PermissionError(WinError 5 등)면 크래시하지 않고 False 반환."""
+    db = str(tmp_path / "meta.db")
+    calls = {"n": 0}
+
+    def boom(_a, _b):
+        calls["n"] += 1
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(daemon.os, "replace", boom)
+    ok = daemon._write_control(daemon._control_path(db), 1.0, 1.0)
+    assert ok is False
+    assert calls["n"] == 3  # 재시도 3회 후 포기
+
+
+def test_write_control_success_returns_true(tmp_path):
+    db = str(tmp_path / "meta.db")
+    now = time.time()
+    assert daemon._write_control(daemon._control_path(db), now, now) is True
+    assert daemon.read_status(db)["running"] is True
+
+
 def test_signal_reload_not_running(tmp_path):
     db = str(tmp_path / "meta.db")
     assert daemon.signal_reload(db) == {"signalled": False, "reason": "not_running"}

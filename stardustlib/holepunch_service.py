@@ -249,3 +249,13 @@ class HolePunchService:
             t = asyncio.create_task(self._punch(peer_addr))
             self._punch_tasks.add(t)
             t.add_done_callback(self._punch_tasks.discard)
+        elif op == "error":
+            # 랑데부가 토큰 거부 등으로 오류 응답 — 대기 중인 register/connect를 즉시
+            # 실패 처리해(타임아웃까지 기다리지 않음) 원인을 로그로 드러낸다.
+            logger.warning(
+                "랑데부 오류 응답: %s (토큰 거부면 서버 랑데부의 JWT 시크릿/배포 확인)",
+                msg.get("error"),
+            )
+            for fut in (self._reg_fut, self._peer_fut):
+                if fut is not None and not fut.done():
+                    fut.set_result(None)

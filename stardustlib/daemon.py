@@ -43,17 +43,38 @@ def _reload_path(metadata_db: str) -> str:
     return metadata_db + ".daemon.reload"
 
 
-def _write_control(path: str, started_at: float, heartbeat_at: float) -> None:
-    """제어 파일을 원자적으로 기록한다(tmp + replace)."""
+def _write_control(path: str, started_at: float, heartbeat_at: float) -> bool:
+    """제어 파일을 원자적으로 기록한다(tmp + replace). 성공 여부를 반환한다.
+
+    Windows에서 os.replace는 대상이 다른 프로세스(백신/인덱서/OneDrive/다른 daemon
+    인스턴스 등)에 잠겨 있으면 PermissionError(WinError 5)로 실패할 수 있다. heartbeat
+    한 번의 기록 실패가 daemon 전체를 죽이면 안 되므로, 짧게 재시도하고 그래도 실패하면
+    경고만 남기고 False를 반환한다(다음 heartbeat에서 회복; 상태는 heartbeat 신선도로 판정).
+    """
     tmp = path + ".tmp"
     payload = {
         "pid": os.getpid(),
         "started_at": started_at,
         "heartbeat_at": heartbeat_at,
     }
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f)
-    os.replace(tmp, path)
+    for attempt in range(3):
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            os.replace(tmp, path)
+            return True
+        except OSError as e:
+            if attempt < 2:
+                time.sleep(0.05)  # 일시적 파일 잠금 — 짧게 재시도
+                continue
+            logger.warning("제어 파일 기록 실패(무시, 다음 heartbeat 재시도): %s", e)
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            return False
+    return False
 
 
 def read_status(metadata_db: str) -> dict:
