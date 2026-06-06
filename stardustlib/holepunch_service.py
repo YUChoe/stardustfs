@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
 
 from stardustlib.holepunch import _PUNCH, _PUNCH_ACK, parse_addr
 from stardustlib.p2p_udp import P2pUdpNode
@@ -84,6 +85,18 @@ class HolePunchService:
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
+        # 랑데부 호스트명을 IPv4로 해석한다. asyncio UDP transport.sendto는 호스트명을
+        # 해석하지 않으므로(IP 필요), 호스트명을 그대로 두면 패킷이 잘못 전달돼 응답이
+        # 오지 않는다(Windows에서 특히). 해석 실패 시 원래 값 유지(루프백 등).
+        host, port = self._server
+        try:
+            infos = await loop.getaddrinfo(
+                host, port, family=socket.AF_INET, type=socket.SOCK_DGRAM
+            )
+            if infos:
+                self._server = infos[0][4]  # (ip, port)
+        except OSError as e:
+            logger.warning("랑데부 호스트 해석 실패(%s): %s", host, e)
         transport, mux = await loop.create_datagram_endpoint(
             _MuxProtocol, local_addr=("0.0.0.0", self._local_port)
         )

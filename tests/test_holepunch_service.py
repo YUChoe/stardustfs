@@ -95,6 +95,25 @@ async def test_register_connect_punch_send_op_roundtrip():
 
 
 @pytest.mark.asyncio
+async def test_register_resolves_hostname():
+    # 호스트명(localhost)을 IP로 해석해 전송해야 등록이 성공한다.
+    rv = _FakeRendezvous()
+    await rv.start()
+
+    async def dispatch(op, payload):
+        return (200, {})
+
+    a = HolePunchService("localhost", rv.port, _token, "devA", dispatch)
+    await a.start()
+    try:
+        assert a.reflexive is not None  # 해석·등록 성공(타임아웃이면 None)
+        assert a.reflexive[0] == "127.0.0.1"
+    finally:
+        await a.stop()
+        rv.close()
+
+
+@pytest.mark.asyncio
 async def test_connect_unavailable_peer_returns_none():
     rv = _FakeRendezvous()
     await rv.start()
