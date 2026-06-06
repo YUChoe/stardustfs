@@ -33,6 +33,7 @@ _REGISTER_MAX_RETRIES = 5
 _HEARTBEAT_NORMAL_INTERVAL = 60  # 초
 _HEARTBEAT_DEGRADED_INTERVAL = 120  # 초
 _HEARTBEAT_FAILURE_THRESHOLD = 3
+_SOURCE_REPORT_INTERVAL = 300  # 초 — 소스 인벤토리 주기 재신고(용량 변동 반영)
 _REQUEST_TIMEOUT = 10.0  # 초
 _UPNP_LEASE_DESCRIPTION = "StardustFS P2P"
 
@@ -118,6 +119,7 @@ class DeviceManager:
 
         self._device_id: str | None = None
         self._heartbeat_task: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._source_report_task: asyncio.Task | None = None  # type: ignore[type-arg]
         self._heartbeat_interval: int = _HEARTBEAT_NORMAL_INTERVAL
         self._consecutive_failures: int = 0
         self._connection_address: str = f"{_get_local_ip()}:{p2p_port}"
@@ -277,6 +279,37 @@ class DeviceManager:
             logger.warning("소스 목록 조회 중 예외: %s", e)
             return []
 
+    async def start_source_report(
+        self, inventory_provider, interval: int = _SOURCE_REPORT_INTERVAL
+    ) -> None:
+        """소스 인벤토리를 주기적으로 재신고하는 백그라운드 루프를 시작한다.
+
+        리모트 디바이스 GUI의 스토리지 용량/사용량이 시간이 지나도 최신값을 보도록
+        한다(시작 1회 신고만으로는 용량 변동이 반영되지 않음). device_id가 없으면
+        시작하지 않는다. inventory_provider는 매 주기 호출되어 신고할 인벤토리
+        목록(build_local_source_inventory 결과)을 반환한다.
+        """
+        if self._device_id is None:
+            logger.warning("device_id 없음, 소스 주기 신고 시작 불가")
+            return
+        if self._source_report_task is not None and not self._source_report_task.done():
+            return
+        self._source_report_task = asyncio.create_task(
+            self._source_report_loop(inventory_provider, interval)
+        )
+        logger.info("소스 주기 신고 루프 시작 (간격: %ds)", interval)
+
+    async def _source_report_loop(self, inventory_provider, interval: int) -> None:
+        """interval마다 inventory_provider()를 신고한다(실패는 로깅 후 계속)."""
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self.report_sources(inventory_provider())
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 — 신고 실패는 다음 주기 재시도
+                logger.warning("소스 주기 신고 실패: %s", e)
+
     async def start_heartbeat(self) -> None:
         """백그라운드 heartbeat 루프를 시작한다.
 
@@ -294,15 +327,20 @@ class DeviceManager:
         logger.info("heartbeat 루프 시작 (간격: %ds)", self._heartbeat_interval)
 
     async def stop(self) -> None:
-        """heartbeat 루프를 중지하고 리소스를 정리한다."""
-        if self._heartbeat_task is not None and not self._heartbeat_task.done():
-            self._heartbeat_task.cancel()
-            try:
-                await self._heartbeat_task
-            except asyncio.CancelledError:
-                pass
-            self._heartbeat_task = None
-            logger.info("heartbeat 루프 중지")
+        """heartbeat·소스 신고 루프를 중지하고 리소스를 정리한다."""
+        for attr, name in (
+            ("_heartbeat_task", "heartbeat"),
+            ("_source_report_task", "소스 주기 신고"),
+        ):
+            task = getattr(self, attr)
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                setattr(self, attr, None)
+                logger.info("%s 루프 중지", name)
 
         await self.teardown_upnp()
         await self._client.aclose()

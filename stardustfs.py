@@ -529,6 +529,17 @@ async def startup_v2(config: dict, config_path: str) -> None:
             await relay_worker.start()
 
     await device_mgr.start_heartbeat()
+    # 소스 인벤토리 주기 재신고(리모트 GUI 용량/사용량 최신화). 시작 1회 신고 외에
+    # 용량 변동을 반영한다. device_id 없으면 no-op.
+    if device_mgr.device_id:
+        from stardustlib.device_manager import build_local_source_inventory
+
+        await device_mgr.start_source_report(
+            lambda: build_local_source_inventory(jbod_manager),
+            interval=config.get("p2p", {}).get(
+                "source_report_interval_seconds", 300
+            ),
+        )
     await sync_client.start_periodic_sync()
 
     # (6-b) 리플리케이션 스케줄러 (자동 백업/heal/정책 갱신) — 기본 활성

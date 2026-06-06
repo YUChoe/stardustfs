@@ -470,3 +470,36 @@ class TestHeartbeatPublishesAddress:
 
         assert captured["json"]["connection_address"] == "113.10.5.125:9090"
         assert "dev-123/heartbeat" in captured["url"]
+
+
+class TestSourceReportLoop:
+    """start_source_report — 주기적 소스 인벤토리 재신고."""
+
+    @pytest.mark.asyncio
+    async def test_periodic_report_invokes_provider_and_report(
+        self, device_manager
+    ):
+        """짧은 간격으로 inventory_provider 결과를 report_sources로 신고한다."""
+        device_manager._device_id = "dev-1"
+        reported = []
+        device_manager.report_sources = AsyncMock(
+            side_effect=lambda inv: reported.append(inv) or True
+        )
+        inv = [{"source_id": "loop-1", "type": "loopback",
+                "capacity_bytes": 10, "used_bytes": 1}]
+
+        await device_manager.start_source_report(lambda: inv, interval=0.01)
+        await asyncio.sleep(0.05)
+        await device_manager.stop()
+
+        assert reported and reported[0] == inv
+
+    @pytest.mark.asyncio
+    async def test_no_device_id_is_noop(self, device_manager):
+        """device_id가 없으면 루프를 시작하지 않는다."""
+        device_manager._device_id = None
+        device_manager.report_sources = AsyncMock(return_value=True)
+        await device_manager.start_source_report(lambda: [], interval=0.01)
+        await asyncio.sleep(0.03)
+        assert device_manager._source_report_task is None
+        device_manager.report_sources.assert_not_called()

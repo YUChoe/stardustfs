@@ -25,6 +25,12 @@ inclusion: manual
 - [x] 3.3 디바이스 온라인 카운트: refresh()마다 devices_summary로 갱신됨(확인 완료).
       스크린샷 1/2는 IPG 접속 전 값의 staleness — 새로고침 시 정정.
 
+## Phase 4: 주기 재신고
+- [x] 4.1 DeviceManager.start_source_report(inventory_provider, interval) +
+      _source_report_loop: 시작 1회 신고 외에 interval(기본 300s)마다 재신고. stop()에서
+      heartbeat와 함께 취소. daemon startup_v2에서 build_local_source_inventory를
+      provider로 시작(p2p.source_report_interval_seconds 설정).
+- [x] 4.2 테스트: 주기 신고가 provider 결과를 report_sources로 전달, device_id 없으면 no-op.
+
 ## 비범위(후속)
-- 주기적 재신고(용량 변동 반영) — 시작 1회로 시작, 필요 시 주기화.
 - 타 사용자 스토리지 노출(현재 같은 계정만).
