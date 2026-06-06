@@ -240,6 +240,54 @@ class P2PServer:
             logger.error("Relay dispatch op=%s 실패: %s", op, e, exc_info=True)
             return 500, {"error": "Internal error"}
 
+    async def dispatch_async(self, op: str, payload: dict) -> tuple[int, dict]:
+        """릴레이 워커용 비동기 디스패치.
+
+        복제본 op(replica_*)는 상호 호스팅이라 요청자가 로컬 사용자와 다를 수 있으므로,
+        payload의 auth_token을 중앙 서버에 검증(same_user=False)해 요청자 user_id를
+        도출하고 그 요청자로 ParityStore 인가를 집행한다(없거나 무효면 401). 그 외
+        파일 op는 같은-user 릴레이가 서버에서 보장되므로 동기 dispatch에 위임한다.
+        """
+        replica_map = {
+            "replica_store": self._op_replica_store,
+            "replica_fetch": self._op_replica_fetch,
+            "replica_delete": self._op_replica_delete,
+        }
+        handler = replica_map.get(op)
+        if handler is None:
+            return self.dispatch(op, payload)
+        requester = await self._resolve_token_user(payload.get("auth_token"))
+        if requester is None:
+            return 401, {"error": "Invalid or missing auth_token"}
+        try:
+            return handler(payload, requester)
+        except Exception as e:  # noqa: BLE001
+            logger.error("Relay replica op=%s 실패: %s", op, e, exc_info=True)
+            return 500, {"error": "Internal error"}
+
+    async def _resolve_token_user(self, token: str | None) -> str | None:
+        """auth_token을 /auth/verify로 검증해 user_id를 반환한다(무효/없음/도달불가면 None).
+
+        교차 사용자 복제본 op의 요청자(=소유자) 신원 도출용. user_id 일치는 요구하지
+        않는다(소유자=요청자 인가는 ParityStore가 청크 단위로 집행).
+        """
+        if not token:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=AUTH_VERIFY_TIMEOUT) as client:
+                resp = await client.post(
+                    f"{self._server_url}/auth/verify", json={"token": token}
+                )
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            logger.warning("토큰 검증 실패(서버 도달 불가): %s", e)
+            return None
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if not data.get("valid"):
+            return None
+        return data.get("user_id")
+
     # --- 작업 로직 (handle_* 와 dispatch 가 공유) ---
 
     def _op_read(self, body: dict) -> tuple[int, dict]:

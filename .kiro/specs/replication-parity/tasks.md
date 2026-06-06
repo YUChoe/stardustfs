@@ -38,10 +38,10 @@ pytest 그린 유지, 전송/복구는 로컬 서버 E2E로 검증.
       목록 조회 → 청크별 온라인·도달 가능한 홀더에서 fetch(스웜) → join → 복호화 →
       jbod.write_file 복원. 도달 불가 청크가 있으면 RecoveryError(누락 chunk_id 명시).
       서버 추가: ReplicationService.list_chunks + GET /replication/chunks/{file_ref}.
-- [~] 4.3 전송 fallback: 직접 push/fetch 구현. 홀더 도달 불가 시 해당 홀더만 실패
+- [x] 4.3 전송 fallback: 직접 push/fetch 구현. 홀더 도달 불가 시 해당 홀더만 실패
       처리하고 다음 홀더로 진행(스웜으로 복구 가능). 교차 사용자 릴레이 fallback은
-      릴레이 허브가 같은 user_id 간만 허용하므로 서버 확장 필요 → Phase 6로 이관.
-      홀펀칭은 Phase 5.
+      `.kiro/specs/cross-user-replica-relay/`로 해소(복제본 op 한정 교차 사용자 릴레이
+      허용 + 홀더가 payload 토큰으로 요청자=소유자 도출). 홀펀칭은 Phase 5.
 - [x] 4.4 CLI: `backup`/`restore` 명령(온라인+동기화). 종료 코드 0/3/4, pending 경고.
 - [x] 4.5 단위 테스트: replicate→recover 라운드트립(암호화 일치, Property 3),
       홀더<3 → pending, 홀더 실패 건너뛰기, 누락/오프라인 복구 RecoveryError,
@@ -75,9 +75,10 @@ pytest 그린 유지, 전송/복구는 로컬 서버 E2E로 검증.
 - [x] 6.3 호혜 쿼터 집행: placement가 avail=provided*0.5-hosted ≥ size 인 온라인
       device만 후보로(미제공 device는 avail 0 → 제외). 정책값 RECIPROCITY_FRACTION=0.5.
       테스트: 미제공 device 미배치 + (Phase 2) 용량·호혜·exclude.
-- [~] (이관) 교차 사용자 릴레이 fallback: 릴레이 허브가 같은 user_id 간만 중개하므로
-      타 사용자 홀더로의 replica 릴레이는 허브 인가 모델 재설계(보안 민감) 필요 →
-      별도 스펙으로 분리. 직접 push/fetch + 스웜(≥3) + 홀펀칭으로 도달성 확보.
+- [x] (해소) 교차 사용자 릴레이 fallback: `.kiro/specs/cross-user-replica-relay/`에서
+      구현. 릴레이 허브는 복제본 op(replica_*)에 한해 교차 사용자 중계를 허용하고,
+      홀더는 payload의 소유자 토큰을 검증(same_user=False)해 ParityStore 인가에 사용한다.
+      파일 데이터 op는 여전히 같은 user_id만 릴레이.
 
 ## Phase 7: 검증 / 문서
 - [x] 7.1 E2E(tests/test_replication_e2e.py): 실제 P2PServer 홀더 + ParityStore +

@@ -114,8 +114,11 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
   복제본 수(`min_replicas`, 기본 1=원본 외 1부)를 확보하면 replicated, 아니면
   pending(경고). file_ref/chunk_id는 가상경로 SHA-256(서버에 경로 비노출).
 - 복제본 전송: 홀더로 직접 HTTP push/fetch를 짧은 타임아웃(`DIRECT_HOLDER_TIMEOUT`,
-  3s)으로 시도하고, 직접 연결 실패(NAT·이중 NAT) 시 같은 사용자 릴레이로 fallback한다
-  (RemoteSource와 동일 원리). 직접 비-200(쿼터 등)은 릴레이하지 않는다.
+  3s)으로 시도하고, 직접 연결 실패(NAT·이중 NAT) 시 서버 릴레이로 fallback한다
+  (RemoteSource와 동일 원리). 직접 비-200(쿼터 등)은 릴레이하지 않는다. 복제본
+  op(replica_*)는 상호 호스팅이라 타 사용자 홀더로의 릴레이도 허용되며, 릴레이 payload에
+  소유자 auth_token을 실어 홀더가 요청자=소유자를 도출(/auth/verify same_user=False)해
+  ParityStore 인가에 사용한다. 파일 데이터 op는 같은 사용자 디바이스 간만 릴레이한다.
 - restore: 서버에서 청크 목록 조회 → 청크별 온라인·도달 가능한 홀더에서 fetch(스웜,
   직접→릴레이) → 결합 → 복호화 → 로컬 복원. 도달 불가 청크가 있으면 누락 chunk_id
   명시 에러.

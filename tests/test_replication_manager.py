@@ -277,14 +277,17 @@ async def test_holder_store_relay_fallback_on_connect_error(key):
         raise httpx.ConnectError("unreachable")
 
     async def fake_relay(device_id, op, payload):
-        seen.update(device_id=device_id, op=op, chunk=payload["chunk_id"])
+        seen.update(device_id=device_id, op=op, chunk=payload["chunk_id"],
+                    token=payload.get("auth_token"))
         return {"bytes_written": 5}
 
     mgr._client.post = boom
     mgr._relay_op = fake_relay
     ok = await mgr._holder_store("devX", "1.2.3.4:9090", "c1", b"cipher", "tok")
     assert ok is True
-    assert seen == {"device_id": "devX", "op": "replica_store", "chunk": "c1"}
+    # 교차 사용자 홀더 인가용 소유자 토큰이 릴레이 payload에 포함돼야 한다
+    assert seen == {"device_id": "devX", "op": "replica_store",
+                    "chunk": "c1", "token": "tok"}
 
 
 @pytest.mark.asyncio
@@ -294,13 +297,17 @@ async def test_holder_fetch_relay_fallback_on_connect_error(key):
     async def boom(*a, **k):
         raise httpx.ConnectError("unreachable")
 
+    captured = {}
+
     async def fake_relay(device_id, op, payload):
+        captured["token"] = payload.get("auth_token")
         return {"data": base64.b64encode(b"cipher").decode("ascii")}
 
     mgr._client.post = boom
     mgr._relay_op = fake_relay
     data = await mgr._holder_fetch("devX", "1.2.3.4:9090", "c1", "tok")
     assert data == b"cipher"
+    assert captured["token"] == "tok"  # 릴레이 payload에 소유자 토큰 포함
 
 
 @pytest.mark.asyncio

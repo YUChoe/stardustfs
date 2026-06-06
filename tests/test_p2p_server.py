@@ -610,6 +610,76 @@ class TestDispatch:
         assert result["exists"] is True
 
 
+class TestDispatchAsyncReplica:
+    """dispatch_async — 교차 사용자 복제본 op의 요청자(소유자) 도출 + ParityStore 인가."""
+
+    _CHUNK = "a" * 64  # 유효한 SHA-256 형식 chunk_id
+
+    @pytest.fixture
+    def parity_server(self, jbod_manager, mock_auth_client, tmp_path):
+        from stardustlib.parity_store import ParityStore
+
+        store = ParityStore(str(tmp_path / "parity"))
+        return P2PServer(
+            jbod_manager=jbod_manager,
+            auth_client=mock_auth_client,
+            port=9999,
+            server_url="http://localhost:8000",
+            parity_store=store,
+        )
+
+    def _set_requester(self, server, user):
+        async def _resolve(_token):
+            return user
+        server._resolve_token_user = _resolve
+
+    @pytest.mark.asyncio
+    async def test_store_then_fetch_as_owner(self, parity_server):
+        data = base64.b64encode(b"cipher-chunk").decode("ascii")
+        self._set_requester(parity_server, "ownerA")
+        status, _ = await parity_server.dispatch_async(
+            "replica_store",
+            {"chunk_id": self._CHUNK, "data": data, "auth_token": "tokA"},
+        )
+        assert status == 200
+        status, result = await parity_server.dispatch_async(
+            "replica_fetch", {"chunk_id": self._CHUNK, "auth_token": "tokA"}
+        )
+        assert status == 200
+        assert base64.b64decode(result["data"]) == b"cipher-chunk"
+
+    @pytest.mark.asyncio
+    async def test_fetch_by_non_owner_forbidden(self, parity_server):
+        data = base64.b64encode(b"x").decode("ascii")
+        self._set_requester(parity_server, "ownerA")
+        await parity_server.dispatch_async(
+            "replica_store",
+            {"chunk_id": self._CHUNK, "data": data, "auth_token": "tokA"},
+        )
+        # 다른 요청자(소유자 불일치) → 403
+        self._set_requester(parity_server, "ownerB")
+        status, _ = await parity_server.dispatch_async(
+            "replica_fetch", {"chunk_id": self._CHUNK, "auth_token": "tokB"}
+        )
+        assert status == 403
+
+    @pytest.mark.asyncio
+    async def test_missing_token_401(self, parity_server):
+        # 토큰 검증 실패(None) → 401, ParityStore 미호출
+        self._set_requester(parity_server, None)
+        status, _ = await parity_server.dispatch_async(
+            "replica_store",
+            {"chunk_id": self._CHUNK, "data": "QQ==", "auth_token": "bad"},
+        )
+        assert status == 401
+
+    @pytest.mark.asyncio
+    async def test_file_op_delegates_to_sync(self, parity_server):
+        # 비복제 op는 동기 dispatch에 위임된다(알 수 없는 op는 400).
+        status, _ = await parity_server.dispatch_async("frobnicate", {})
+        assert status == 400
+
+
 class TestDispatchLoopback:
     """LoopbackSource에서 dispatch가 동반 디렉토리 경로로 올바르게 동작하는지 검증.
 

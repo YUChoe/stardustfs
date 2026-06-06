@@ -93,7 +93,9 @@ MVP10에서 정리한 코어 API(목록/업로드/다운로드/삭제/디바이�
   ≥3 시 replicated, 아니면 pending), recover(스웜에서 fetch→결합→복호화), 
   ensure_replicas(건강성 회복 재복제). CLI `backup`/`restore`/`heal`.
 - NAT: UDP 홀펀칭(서버 랑데부 + `holepunch.py`, 직접 도달성 확대). 보장된 fallback은
-  서버 릴레이(단, 교차 사용자 릴레이는 허브 인가 재설계 필요로 별도 스펙 이관).
+  서버 릴레이 — 복제본 op(replica_*)는 교차 사용자 릴레이를 허용하고 홀더가 payload
+  소유자 토큰으로 요청자=소유자를 도출해 ParityStore 인가에 사용한다
+  (`.kiro/specs/cross-user-replica-relay/`). 파일 데이터 op는 같은 user_id만 릴레이.
 - E2E: 다중 홀더 실 HTTP — replicate→소스 훼손→스웜 recover 바이트 일치, 1곳만
   도달 가능 시 복구, 홀더 부족 pending, 홀더 상실 후 heal 회복.
 

@@ -485,7 +485,11 @@ class ReplicationManager:
         if not device_id:
             return False
         try:
-            await self._relay_op(device_id, "replica_store", body)
+            # 릴레이는 타 사용자 홀더일 수 있으므로 소유자 토큰을 포함한다(홀더가
+            # 요청자=소유자를 도출해 ParityStore 인가에 사용).
+            await self._relay_op(
+                device_id, "replica_store", {**body, "auth_token": token}
+            )
             return True
         except Exception as e:  # noqa: BLE001
             logger.info(
@@ -517,7 +521,9 @@ class ReplicationManager:
         if not device_id:
             return None
         try:
-            result = await self._relay_op(device_id, "replica_fetch", body)
+            result = await self._relay_op(
+                device_id, "replica_fetch", {**body, "auth_token": token}
+            )
             return base64.b64decode(result["data"])
         except Exception as e:  # noqa: BLE001
             logger.info(

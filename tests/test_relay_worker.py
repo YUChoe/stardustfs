@@ -22,9 +22,9 @@ def auth_client():
 
 @pytest.fixture
 def p2p_server():
-    """dispatch만 사용하는 P2PServer mock."""
+    """dispatch_async만 사용하는 P2PServer mock."""
     server = MagicMock()
-    server.dispatch = MagicMock(return_value=(200, {"data": "QUJD"}))
+    server.dispatch_async = AsyncMock(return_value=(200, {"data": "QUJD"}))
     return server
 
 
@@ -65,8 +65,8 @@ async def test_poll_once_dispatches_and_responds(worker, p2p_server):
 
     await worker._poll_once()
 
-    # dispatch가 폴링된 op/payload로 호출됨
-    p2p_server.dispatch.assert_called_once_with(
+    # dispatch_async가 폴링된 op/payload로 호출됨
+    p2p_server.dispatch_async.assert_called_once_with(
         "read", {"physical_path": "f.bin", "source_id": "loop-001"}
     )
     # 결과가 /relay/response/req-9로 업로드됨
@@ -86,7 +86,7 @@ async def test_poll_once_empty_204_noop(worker, p2p_server):
 
     await worker._poll_once()
 
-    p2p_server.dispatch.assert_not_called()
+    p2p_server.dispatch_async.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -94,7 +94,7 @@ async def test_poll_once_error_status_propagates_to_response(
     worker, p2p_server
 ):
     """dispatch가 오류 상태를 내면 그 상태가 응답으로 업로드된다."""
-    p2p_server.dispatch.return_value = (404, {"error": "File not found"})
+    p2p_server.dispatch_async.return_value = (404, {"error": "File not found"})
     posted = {}
 
     async def fake_get(url, params=None, headers=None):

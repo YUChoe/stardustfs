@@ -100,8 +100,9 @@ class RelayWorker:
             return
 
         logger.info("Relay 요청 수신: id=%s op=%s", request_id, op)
-        # 기존 P2P 작업 로직 재사용 (인가는 서버가 보장)
-        status, result = self._p2p_server.dispatch(op, payload)
+        # 파일 op는 같은-user(서버 보장). 복제본 op는 payload 토큰으로 요청자(소유자)를
+        # 검증해 ParityStore 인가에 사용한다(교차 사용자 릴레이).
+        status, result = await self._p2p_server.dispatch_async(op, payload)
         logger.info("Relay dispatch 완료: id=%s status=%d", request_id, status)
 
         # 결과 업로드
