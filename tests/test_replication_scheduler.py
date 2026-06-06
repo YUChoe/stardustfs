@@ -162,6 +162,46 @@ async def test_backup_cycle_skips_missing_local_file_and_caches():
 
 
 @pytest.mark.asyncio
+async def test_pending_triggers_short_retry_backoff():
+    """복제 미완료(pending)가 남으면 전체 주기 대신 짧은 백오프로 재시도한다."""
+    from stardustlib.replication_scheduler import (
+        _BACKLOG_DRAIN_DELAY,
+        _RETRY_MIN_DELAY,
+    )
+
+    class _PendingMgr(_FakeManager):
+        def replicate(self, vpath: str):
+            self.replicated.append(vpath)
+            return _FakeResult("pending")  # 목표 미달
+
+    mgr = _PendingMgr()
+    sched = ReplicationScheduler(
+        mgr, _FakeMeta(["/p"]), "devA", backup_interval=300.0
+    )
+    processed = await sched.run_backup_cycle()
+    assert processed == 1 and sched._last_pending == 1
+    # 첫 재시도: 짧은 최소 지연
+    d1 = sched._next_delay(processed)
+    assert d1 == _RETRY_MIN_DELAY
+    # 지속 pending → 지수 백오프(2배), backup_interval 상한
+    d2 = sched._next_delay(processed)
+    assert d2 == _RETRY_MIN_DELAY * 2
+
+
+@pytest.mark.asyncio
+async def test_all_replicated_uses_full_interval():
+    """모두 완료되면 정상 주기 간격으로 쉬고 백오프를 초기화한다."""
+    mgr = _FakeManager()
+    sched = ReplicationScheduler(
+        mgr, _FakeMeta(["/a"]), "devA", backup_interval=300.0
+    )
+    processed = await sched.run_backup_cycle()
+    assert sched._last_pending == 0
+    assert sched._next_delay(processed) == 300.0
+    assert sched._retry_delay is None
+
+
+@pytest.mark.asyncio
 async def test_backup_cycle_respects_max():
     mgr = _FakeManager()
     sched = ReplicationScheduler(

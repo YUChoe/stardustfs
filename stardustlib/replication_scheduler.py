@@ -16,6 +16,9 @@ logger = logging.getLogger(__name__)
 
 # 한 주기에 상한(max)만큼 처리했으면 백로그가 남은 것으로 보고 짧게 쉬고 계속 비운다.
 _BACKLOG_DRAIN_DELAY = 2.0
+# 복제 미완료(pending)가 남으면 전체 주기(backup_interval)를 기다리지 않고 짧게 재시도한다.
+# 지속 실패(예: 도달 불가·전송 한도) 시 backup_interval까지 지수 백오프로 늘려 폭주를 막는다.
+_RETRY_MIN_DELAY = 15.0
 
 
 class ReplicationScheduler:
@@ -55,6 +58,10 @@ class ReplicationScheduler:
         # 로컬에 물리 파일이 없어 백업 불가한 vpath(다른 device 소유의 NULL 레코드 등).
         # 매 주기 재시도/경고 스팸을 막기 위해 캐시해 건너뛴다.
         self._skip_backup: set[str] = set()
+        # 직전 주기에서 복제 미완료(pending)로 남은 파일 수. 짧은 재시도 판단에 쓴다.
+        self._last_pending: int = 0
+        # 현재 재시도 백오프(초). pending이 남는 동안 _RETRY_MIN_DELAY부터 2배씩 증가.
+        self._retry_delay: float | None = None
 
     async def start(self) -> None:
         """백그라운드 루프(백업 + heal)를 기동한다."""
@@ -115,14 +122,28 @@ class ReplicationScheduler:
                 raise
             except Exception as e:  # noqa: BLE001 — 루프 유지
                 logger.error("백업 주기 오류: %s", e, exc_info=True)
-            # 상한만큼 처리했으면 백로그가 남았다고 보고 짧게 쉬고 계속 비운다.
-            # 그 외(처리량 < 상한)에는 정상 주기 간격으로 쉰다.
-            delay = (
-                _BACKLOG_DRAIN_DELAY
-                if processed >= self._max
-                else self._backup_interval
-            )
+            delay = self._next_delay(processed)
             await self._sleep(delay)
+
+    def _next_delay(self, processed: int) -> float:
+        """다음 백업 주기까지 대기 시간을 정한다.
+
+        - 상한만큼 처리(백로그) → 짧게 쉬고 계속 비운다.
+        - 복제 미완료(pending)가 남음 → 전체 주기를 기다리지 않고 짧은 백오프로 재시도
+          (_RETRY_MIN_DELAY부터 2배씩, backup_interval 상한). 지속 실패 시 폭주 방지.
+        - 모두 완료 → 백오프 초기화 후 정상 주기 간격.
+        """
+        if processed >= self._max:
+            return _BACKLOG_DRAIN_DELAY
+        if self._last_pending > 0:
+            nxt = (
+                self._retry_delay * 2 if self._retry_delay
+                else _RETRY_MIN_DELAY
+            )
+            self._retry_delay = min(nxt, self._backup_interval)
+            return self._retry_delay
+        self._retry_delay = None
+        return self._backup_interval
 
     async def run_backup_cycle(self) -> int:
         """미복제/미완료(none|pending) 로컬 파일 ≤max개를 복제한다.
@@ -143,6 +164,7 @@ class ReplicationScheduler:
         # 동안 다른 파일이 진행). MetadataStore는 스레드별 연결 + WAL이라 안전하다.
         sem = asyncio.Semaphore(self._backup_concurrency)
         done = [0]
+        pending = [0]  # 복제 미완료(replicated 아님 또는 오류) → 짧은 재시도 대상
 
         async def _one(vpath: str) -> None:
             if self._stop.is_set():
@@ -153,6 +175,8 @@ class ReplicationScheduler:
                         self._manager.replicate, vpath
                     )
                     done[0] += 1
+                    if result.status != "replicated":
+                        pending[0] += 1  # 목표 미달 → 곧 재시도
                     logger.info("자동 백업: %s → %s", vpath, result.status)
                 except FileNotFoundError:
                     # 이 device에 물리 파일이 없음(다른 device 소유 NULL 레코드 등).
@@ -160,9 +184,11 @@ class ReplicationScheduler:
                     self._skip_backup.add(vpath)
                     logger.debug("로컬에 없어 백업 건너뜀: %s", vpath)
                 except Exception as e:  # noqa: BLE001 — 파일 단위 실패 격리
+                    pending[0] += 1  # 일시 오류 → 짧은 주기로 재시도
                     logger.warning("자동 백업 실패(건너뜀): %s: %s", vpath, e)
 
         await asyncio.gather(*[_one(vp) for vp in targets])
+        self._last_pending = pending[0]
         return done[0]
 
     async def _heal_loop(self) -> None:
