@@ -52,7 +52,7 @@ MVP2 멀티디바이스 동기화         (접근 계층 피벗)         GUI 파
 - 멀티디바이스: 계정/디바이스 등록, metadata_db + key_file 서버 백업/복원
 - 원격 접근 엔진: 원격 소스 프록시(remote_source), P2P 직접 연결(p2p_server),
   서버 릴레이 fallback(relay_client/relay_worker), version 롱폴링 즉시 동기화
-- NAT 트래버설: UPnP + reflexive 공인 IP 보정
+- NAT 트래버설: UDP 홀펀칭(holepunch) + reflexive 공인 IP 조회 (UPnP 폐지)
 
 상세 상태는 [HANDOVER.md](./HANDOVER.md) 참조.
 

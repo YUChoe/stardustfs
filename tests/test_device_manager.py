@@ -449,10 +449,10 @@ class TestHeartbeatPublishesAddress:
     ):
         """보정된 connection_address가 heartbeat payload로 전송된다.
 
-        UPnP 보정 후 _send_heartbeat를 호출하면 즉시 갱신되는 흐름의 핵심.
+        reflexive 공인 IP 보정 후 _send_heartbeat를 호출하면 즉시 갱신되는 흐름의 핵심.
         """
         device_manager._device_id = "dev-123"
-        # UPnP 보정이 일어난 상황을 모사: 주소를 공인 IP로 교체
+        # 주소 보정이 일어난 상황을 모사: 주소를 공인 IP로 교체
         device_manager._connection_address = "113.10.5.125:9090"
 
         captured = {}

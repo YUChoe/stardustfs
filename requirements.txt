@@ -15,9 +15,6 @@ python-dotenv==1.1.0
 # P2P 서버 (aiohttp)
 aiohttp==3.11.18
 
-# NAT 트래버설 (Pure Python UPnP — C 컴파일러 불필요)
-async-upnp-client==0.42.0
-
 # GUI 시스템 트레이 (선택 — 미설치 시 트레이 없이 창닫기=종료로 동작)
 # 둘 다 prebuilt wheel 제공(C 컴파일러 불필요)
 pystray==0.19.5

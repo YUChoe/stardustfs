@@ -515,7 +515,6 @@ async def startup_v2(config: dict, config_path: str) -> None:
             parity_store=parity_store,
         )
         await p2p_server.start()
-        await device_mgr.setup_upnp()
 
         # 릴레이 워커 시작 (직접 연결 불가 환경의 fallback 수신).
         # device_id가 확보된 경우에만 시작한다.

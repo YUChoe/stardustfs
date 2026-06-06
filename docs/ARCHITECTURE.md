@@ -76,7 +76,8 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
   동기화 전파된다 — 소유자가 값 변경 시 version+1·pending으로 업로드하고, 수신 측은
   머지에서 version과 함께 채택한다. 따라서 같은 사용자의 모든 디바이스가 동일한 백업
   상태를 본다. evicted는 디바이스-로컬 상태로 동기화하지 않는다.
-- `device_manager.py`: device 등록/heartbeat/UPnP/reflexive 공인 IP 보정.
+- `device_manager.py`: device 등록/heartbeat/reflexive 공인 IP 조회(NAT 보조).
+  NAT 뒤 직접 연결은 UDP 홀펀칭(holepunch)으로 연다(UPnP 폐지).
 - `auth_client.py` + `credential_store.py`: 토큰 인증. 토큰을 자격증명 저장소
   (`{metadata_db}.credentials.json`, 소유자 전용)에 영속화하고 만료 전 자동 갱신.
 - `daemon.py`: daemon 라이프사이클(제어 파일 + 정지 센티넬 + heartbeat).

@@ -1,7 +1,8 @@
 """디바이스 등록 및 heartbeat 관리.
 
 중앙 서버에 디바이스를 등록하고, 주기적으로 heartbeat를 전송하여
-온라인 상태를 유지한다. UPnP NAT 트래버설을 통해 외부 접근을 지원한다.
+온라인 상태를 유지한다. NAT 뒤 직접 연결은 UDP 홀펀칭(holepunch)으로 연다
+(UPnP는 폐지). reflexive 공인 IP 조회는 NAT 보조로 유지한다.
 """
 
 from __future__ import annotations
@@ -16,15 +17,6 @@ import httpx
 from stardustlib.auth_client import AuthClient
 from stardustlib.exceptions import DeviceRegistrationError
 
-try:
-    from async_upnp_client.aiohttp import AiohttpRequester
-    from async_upnp_client.client_factory import UpnpFactory
-    from async_upnp_client.profiles.igd import IgdDevice
-    from async_upnp_client.search import async_search
-    _HAS_UPNP = True
-except ImportError:
-    _HAS_UPNP = False
-
 logger = logging.getLogger(__name__)
 
 # 상수
@@ -35,7 +27,6 @@ _HEARTBEAT_DEGRADED_INTERVAL = 120  # 초
 _HEARTBEAT_FAILURE_THRESHOLD = 3
 _SOURCE_REPORT_INTERVAL = 60  # 초 — 소스 인벤토리 주기 재신고(용량 변동 반영)
 _REQUEST_TIMEOUT = 10.0  # 초
-_UPNP_LEASE_DESCRIPTION = "StardustFS P2P"
 
 
 def _get_local_ip() -> str:
@@ -125,11 +116,6 @@ class DeviceManager:
         self._connection_address: str = f"{_get_local_ip()}:{p2p_port}"
         self._offline: bool = False
         self._client = httpx.AsyncClient(timeout=_REQUEST_TIMEOUT)
-
-        # UPnP 상태
-        self._upnp_mapped: bool = False
-        self._upnp_external_port: int | None = None
-        self._igd_device = None
 
     async def register(self) -> str:
         """디바이스를 중앙 서버에 등록하고 device_id를 반환한다.
@@ -342,152 +328,7 @@ class DeviceManager:
                 setattr(self, attr, None)
                 logger.info("%s 루프 중지", name)
 
-        await self.teardown_upnp()
         await self._client.aclose()
-
-    async def setup_upnp(self) -> None:
-        """UPnP 포트 매핑을 시도한다.
-
-        P2P 서버 시작 후 호출한다. 성공 시 외부 IP:port를
-        connection_address로 설정하고, 실패 시 로컬 IP:port를 유지한다.
-        어떤 경우에도 예외를 발생시키지 않는다.
-        """
-        if not _HAS_UPNP:
-            logger.warning(
-                "async-upnp-client 라이브러리 미설치, UPnP 포트 매핑 건너뜀"
-            )
-            return
-
-        try:
-            # SSDP 검색으로 IGD 디바이스 찾기
-            discovered: list = []
-
-            async def _on_device(headers):
-                discovered.append(headers)
-
-            await asyncio.wait_for(
-                async_search(
-                    async_callback=_on_device,
-                    timeout=5,
-                    search_target="urn:schemas-upnp-org:device:InternetGatewayDevice:1",
-                ),
-                timeout=10.0,
-            )
-
-            if not discovered:
-                logger.warning("UPnP 게이트웨이를 찾을 수 없음")
-                return
-
-            # 첫 번째 IGD 디바이스의 location으로 UpnpDevice 생성
-            location = discovered[0].get("location", "")
-            if not location:
-                logger.warning("UPnP 디바이스 location 없음")
-                return
-
-            requester = AiohttpRequester()
-            factory = UpnpFactory(requester)
-            device = await factory.async_create_device(location)
-
-            # IgdDevice 래퍼 생성
-            igd_device = IgdDevice(device, None)
-
-            # 외부 IP 조회
-            external_ip = await igd_device.async_get_external_ip_address()
-
-            # 포트 매핑 추가
-            import ipaddress
-            from datetime import timedelta
-
-            local_ip = _get_local_ip()
-            await igd_device.async_add_port_mapping(
-                remote_host=ipaddress.IPv4Address("0.0.0.0"),
-                external_port=self._p2p_port,
-                protocol="TCP",
-                internal_port=self._p2p_port,
-                internal_client=ipaddress.IPv4Address(local_ip),
-                enabled=True,
-                description=_UPNP_LEASE_DESCRIPTION,
-                lease_duration=timedelta(0),
-            )
-
-            self._upnp_mapped = True
-            self._upnp_external_port = self._p2p_port
-            self._igd_device = igd_device
-            logger.info(
-                "UPnP 포트 매핑 성공: %s:%d → %s:%d",
-                external_ip,
-                self._p2p_port,
-                local_ip,
-                self._p2p_port,
-            )
-
-            # 이중 NAT 검증: UPnP가 보고한 외부 IP가 사설/CGNAT 대역이면
-            # 그 주소는 외부에서 도달 불가하다. 서버 reflexive 조회로
-            # 진짜 공인 IP를 확인하여 connection_address를 보정한다.
-            if _is_private_or_cgnat_ip(external_ip):
-                logger.warning(
-                    "UPnP 외부 IP가 사설/CGNAT 대역(%s) — 이중 NAT 추정. "
-                    "서버 reflexive 조회로 공인 IP 확인 시도",
-                    external_ip,
-                )
-                reflexive_ip = await self.query_reflexive_ip()
-                if reflexive_ip and not _is_private_or_cgnat_ip(reflexive_ip):
-                    self._connection_address = (
-                        f"{reflexive_ip}:{self._p2p_port}"
-                    )
-                    logger.info(
-                        "reflexive 공인 IP로 connection_address 보정: %s "
-                        "(주의: 이중 NAT에서는 상위 NAT 포트포워딩이 없으면 "
-                        "여전히 도달 불가할 수 있음)",
-                        self._connection_address,
-                    )
-                    # 보정된 주소를 서버에 즉시 반영한다. register()는 보정 전
-                    # 초기 주소로 등록했으므로, heartbeat 주기(최대 60초)를
-                    # 기다리지 않고 갱신해 다른 디바이스가 바로 올바른 주소를
-                    # 받도록 한다.
-                    await self._send_heartbeat()
-                else:
-                    # 공인 IP 확보 실패 — UPnP 외부 IP를 그대로 등록하되 경고
-                    self._connection_address = f"{external_ip}:{self._p2p_port}"
-                    logger.warning(
-                        "공인 IP 확인 실패 — 도달 불가 가능성이 있는 주소(%s)를 "
-                        "등록함. 수동 포트포워딩이 필요할 수 있음",
-                        self._connection_address,
-                    )
-            else:
-                self._connection_address = f"{external_ip}:{self._p2p_port}"
-        except asyncio.TimeoutError:
-            logger.warning("UPnP 검색 타임아웃 (10초)")
-        except Exception as e:
-            logger.warning("UPnP 포트 매핑 실패: %s", e)
-
-    async def teardown_upnp(self) -> None:
-        """UPnP 포트 매핑을 해제한다.
-
-        클라이언트 종료 시 호출한다. 해제 실패 시 WARNING 로그만
-        기록하고 종료 절차를 계속 진행한다.
-        """
-        if not self._upnp_mapped:
-            return
-
-        if not _HAS_UPNP:
-            return
-
-        try:
-            if hasattr(self, "_igd_device") and self._igd_device is not None:
-                import ipaddress
-                await self._igd_device.async_delete_port_mapping(
-                    remote_host=ipaddress.IPv4Address("0.0.0.0"),
-                    external_port=self._upnp_external_port,
-                    protocol="TCP",
-                )
-            self._upnp_mapped = False
-            logger.info(
-                "UPnP 포트 매핑 해제 성공: port %d",
-                self._upnp_external_port,
-            )
-        except Exception as e:
-            logger.warning("UPnP 포트 매핑 해제 실패: %s", e)
 
     def get_connection_address(self) -> str:
         """현재 P2P 접속 주소 (IP:port)를 반환한다."""
