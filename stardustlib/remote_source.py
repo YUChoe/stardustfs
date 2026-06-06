@@ -87,6 +87,13 @@ class RemoteSource(StorageSource):
         self._refresh_min_interval: float = 30.0
         # 직접 연결 실패 시 릴레이 fallback 사용 여부
         self._relay_enabled: bool = True
+        # 홀펀칭 UDP 전송 콜백: async (device_id, op, payload) -> (status, result).
+        # 데몬이 HolePunchService.send_op를 주입. 직접 TCP 실패 시 릴레이 전에 시도.
+        self._udp_send = None
+
+    def set_udp_transport(self, fn) -> None:
+        """홀펀칭 UDP 전송 콜백을 설정한다(직접 TCP→UDP→릴레이 캐스케이드의 UDP 단계)."""
+        self._udp_send = fn
 
     @property
     def device_id(self) -> str:
@@ -372,16 +379,16 @@ class RemoteSource(StorageSource):
             response = await self._client.post(url, json=request_body)
         except httpx.TimeoutException as e:
             logger.info(
-                "직접 P2P 타임아웃(%s) — 릴레이 fallback 시도: %s",
+                "직접 P2P 타임아웃(%s) — UDP/릴레이 fallback 시도: %s",
                 endpoint, self._device_id,
             )
-            return await self._relay_fallback(endpoint, payload, e)
+            return await self._fallback(endpoint, request_body, e)
         except (httpx.ConnectError, httpx.NetworkError) as e:
             logger.info(
-                "직접 P2P 연결 실패(%s) — 릴레이 fallback 시도: %s",
+                "직접 P2P 연결 실패(%s) — UDP/릴레이 fallback 시도: %s",
                 endpoint, self._device_id,
             )
-            return await self._relay_fallback(endpoint, payload, e)
+            return await self._fallback(endpoint, request_body, e)
 
         # 401 시 토큰 갱신 후 1회 재시도
         if response.status_code == 401 and retry:
@@ -416,6 +423,38 @@ class RemoteSource(StorageSource):
         "/p2p/rmdir": "rmdir",
         "/p2p/space": "space",
     }
+
+    async def _fallback(
+        self,
+        endpoint: str,
+        payload: dict[str, Any],
+        direct_error: Exception,
+    ) -> dict[str, Any]:
+        """직접 TCP 실패 시 (1) 홀펀칭 UDP → (2) 릴레이 순으로 fallback한다.
+
+        payload는 auth_token을 포함한다(홀더가 UDP/릴레이에서 토큰 검증). UDP가 200을
+        반환하면 그 result를, 비-200/예외면 릴레이로 넘어간다.
+        """
+        op = self._ENDPOINT_OP.get(endpoint)
+        # (1) 홀펀칭 UDP
+        if self._udp_send is not None and op is not None:
+            status = None
+            result: dict[str, Any] = {}
+            try:
+                status, result = await self._udp_send(
+                    self._device_id, op, payload
+                )
+            except Exception:  # noqa: BLE001 — 펀치/전송 실패 → 릴레이로
+                status = None
+            if status == 200:
+                return result
+            if status is not None:
+                # 홀더의 확정 응답(권한/없음/쿼터 등)은 릴레이해도 동일 → 오류 종결.
+                raise OSError(
+                    f"RemoteSource '{self._source_id}': UDP op {op} HTTP {status}"
+                )
+        # (2) 릴레이
+        return await self._relay_fallback(endpoint, payload, direct_error)
 
     async def _relay_fallback(
         self,

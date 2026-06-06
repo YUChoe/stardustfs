@@ -674,8 +674,33 @@ class TestDispatchAsyncReplica:
         assert status == 401
 
     @pytest.mark.asyncio
-    async def test_file_op_delegates_to_sync(self, parity_server):
-        # 비복제 op는 동기 dispatch에 위임된다(알 수 없는 op는 400).
+    async def test_file_op_same_user_delegates(self, parity_server):
+        # 파일 op는 토큰 user_id가 로컬 user(test-user-123)와 같으면 dispatch 위임.
+        self._set_requester(parity_server, "test-user-123")
+        status, result = await parity_server.dispatch_async(
+            "exists", {"physical_path": "x", "source_id": "vol1",
+                       "auth_token": "tok"}
+        )
+        assert status == 200 and result["exists"] is False
+
+    @pytest.mark.asyncio
+    async def test_file_op_other_user_forbidden(self, parity_server):
+        # 타 사용자 토큰의 파일 op는 403(임의 피어 read/write 차단).
+        self._set_requester(parity_server, "intruder")
+        status, _ = await parity_server.dispatch_async(
+            "read", {"physical_path": "x", "auth_token": "tok"}
+        )
+        assert status == 403
+
+    @pytest.mark.asyncio
+    async def test_file_op_no_token_401(self, parity_server):
+        self._set_requester(parity_server, None)
+        status, _ = await parity_server.dispatch_async("read", {})
+        assert status == 401
+
+    @pytest.mark.asyncio
+    async def test_unknown_op_after_auth_400(self, parity_server):
+        self._set_requester(parity_server, "test-user-123")
         status, _ = await parity_server.dispatch_async("frobnicate", {})
         assert status == 400
 

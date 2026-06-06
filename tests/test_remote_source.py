@@ -610,3 +610,57 @@ class TestTokenRefreshRetry:
 
         with pytest.raises(OSError, match="HTTP 401"):
             remote_source.read("dir/file.enc")
+
+
+# ------------------------------------------------------------------
+# 전송 캐스케이드: 직접 TCP → 홀펀칭 UDP → 릴레이 (_fallback)
+# ------------------------------------------------------------------
+
+
+class TestUdpFallback:
+    """직접 TCP 실패 시 홀펀칭 UDP를 릴레이보다 먼저 시도한다."""
+
+    @pytest.mark.asyncio
+    async def test_udp_success_returns_result(self, remote_source):
+        _activate(remote_source)
+
+        async def udp(device_id, op, payload):
+            assert op == "read" and payload.get("auth_token")
+            return (200, {"data": "QQ=="})
+
+        remote_source.set_udp_transport(udp)
+        out = await remote_source._fallback(
+            "/p2p/read", {"physical_path": "x", "auth_token": "t"},
+            OSError("direct failed"),
+        )
+        assert out == {"data": "QQ=="}
+
+    @pytest.mark.asyncio
+    async def test_udp_non200_raises_without_relay(self, remote_source):
+        _activate(remote_source)
+
+        async def udp(device_id, op, payload):
+            return (403, {})
+
+        remote_source.set_udp_transport(udp)
+        remote_source._relay_fallback = AsyncMock()
+        with pytest.raises(OSError):
+            await remote_source._fallback(
+                "/p2p/read", {"auth_token": "t"}, OSError("d")
+            )
+        remote_source._relay_fallback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_udp_exception_falls_to_relay(self, remote_source):
+        _activate(remote_source)
+
+        async def udp(device_id, op, payload):
+            raise OSError("punch failed")
+
+        remote_source.set_udp_transport(udp)
+        remote_source._relay_fallback = AsyncMock(return_value={"data": "relayed"})
+        out = await remote_source._fallback(
+            "/p2p/read", {"auth_token": "t"}, OSError("d")
+        )
+        assert out == {"data": "relayed"}
+        remote_source._relay_fallback.assert_called_once()

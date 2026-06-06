@@ -551,6 +551,15 @@ async def startup_v2(config: dict, config_path: str) -> None:
                     "홀펀칭 서비스 시작 (랑데부 %s:%d, reflexive=%s)",
                     rv_host, rv_port, holepunch_service.reflexive,
                 )
+                # 마운트된 원격 소스가 직접 TCP 실패 시 홀펀칭 UDP를 쓰도록 주입.
+                for _src in jbod_manager.sources:
+                    if getattr(_src, "is_remote", False) and hasattr(
+                        _src, "set_udp_transport"
+                    ):
+                        _src.set_udp_transport(
+                            lambda did, op, pl:
+                            holepunch_service.send_op(did, op, pl)
+                        )
         except Exception as e:  # noqa: BLE001 — 비치명, 릴레이로 fallback
             logger.warning("홀펀칭 서비스 시작 실패(릴레이 fallback): %s", e)
             holepunch_service = None

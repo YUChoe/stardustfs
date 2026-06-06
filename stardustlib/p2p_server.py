@@ -241,29 +241,36 @@ class P2PServer:
             return 500, {"error": "Internal error"}
 
     async def dispatch_async(self, op: str, payload: dict) -> tuple[int, dict]:
-        """릴레이 워커용 비동기 디스패치.
+        """릴레이/홀펀칭(UDP) 수신 op 디스패치.
 
-        복제본 op(replica_*)는 상호 호스팅이라 요청자가 로컬 사용자와 다를 수 있으므로,
-        payload의 auth_token을 중앙 서버에 검증(same_user=False)해 요청자 user_id를
-        도출하고 그 요청자로 ParityStore 인가를 집행한다(없거나 무효면 401). 그 외
-        파일 op는 같은-user 릴레이가 서버에서 보장되므로 동기 dispatch에 위임한다.
+        UDP·릴레이는 서버 게이트가 없거나(UDP) 같은-user 보장만 하므로, 여기서 payload의
+        auth_token을 중앙 서버에 검증한다.
+        - 복제본 op(replica_*): same_user=False로 요청자(=소유자) 도출 → ParityStore가
+          청크 단위 소유자 인가. 없음/무효면 401.
+        - 파일 op(read/write/list 등): 토큰 user_id가 로컬 user_id와 일치해야 한다
+          (same_user). 없음 401, 타 user 403. 임의 피어의 read/write를 막는다.
         """
         replica_map = {
             "replica_store": self._op_replica_store,
             "replica_fetch": self._op_replica_fetch,
             "replica_delete": self._op_replica_delete,
         }
-        handler = replica_map.get(op)
-        if handler is None:
-            return self.dispatch(op, payload)
         requester = await self._resolve_token_user(payload.get("auth_token"))
+        handler = replica_map.get(op)
+        if handler is not None:
+            if requester is None:
+                return 401, {"error": "Invalid or missing auth_token"}
+            try:
+                return handler(payload, requester)
+            except Exception as e:  # noqa: BLE001
+                logger.error("replica op=%s 실패: %s", op, e, exc_info=True)
+                return 500, {"error": "Internal error"}
+        # 파일 op: 같은 사용자 토큰 필수(서버 게이트 부재 보완)
         if requester is None:
             return 401, {"error": "Invalid or missing auth_token"}
-        try:
-            return handler(payload, requester)
-        except Exception as e:  # noqa: BLE001
-            logger.error("Relay replica op=%s 실패: %s", op, e, exc_info=True)
-            return 500, {"error": "Internal error"}
+        if requester != self._auth_client.user_id:
+            return 403, {"error": "User ID mismatch"}
+        return self.dispatch(op, payload)
 
     async def _resolve_token_user(self, token: str | None) -> str | None:
         """auth_token을 /auth/verify로 검증해 user_id를 반환한다(무효/없음/도달불가면 None).
