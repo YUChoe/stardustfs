@@ -534,10 +534,31 @@ def heal_paths(config_path: str, vpaths: list[str]) -> list[dict]:
     return asyncio.run(_run_online(config_path, aop, sync=False))
 
 
+def _delegate(config_path: str, op: str, virtual_path: str, local_path: str):
+    """데몬이 실행 중이면 전송을 데몬에 위임한다(홀펀칭 활용). 반환 dict 또는 None.
+
+    데몬 미실행/제어 채널 부재면 None을 반환해 호출자가 직접 수행하게 한다.
+    """
+    from stardustlib import daemon_control
+
+    config = ConfigLoader(config_path).load()
+    db = config.get("metadata_db")
+    if not db:
+        return None
+    return daemon_control.transfer_via_daemon(
+        db, op, virtual_path, os.path.abspath(local_path)
+    )
+
+
 def put_file(config_path: str, local: str, remote: str) -> int:
+    rv = _vpath(remote)
+    # 데몬 위임 우선(로컬 만석 시 홀펀칭 리모트 스필오버). 미실행이면 직접 수행.
+    res = _delegate(config_path, "put", rv, local)
+    if res is not None:
+        return res.get("bytes", 0)
+
     with open(local, "rb") as f:
         data = f.read()
-    rv = _vpath(remote)
 
     async def aop(s):
         s.jbod.write_file(rv, data)
@@ -549,6 +570,9 @@ def put_file(config_path: str, local: str, remote: str) -> int:
 
 def get_file(config_path: str, remote: str, local: str) -> int:
     rv = _vpath(remote)
+    res = _delegate(config_path, "get", rv, local)
+    if res is not None:
+        return res.get("bytes", 0)
 
     async def aop(s):
         return s.jbod.read_file(rv)

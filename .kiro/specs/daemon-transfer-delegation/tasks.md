@@ -18,11 +18,15 @@ inclusion: manual
 - [x] 2.2 데몬이 홀펀칭 시작 후 마운트된 RemoteSource에 holepunch.send_op 주입.
 - [x] 2.3 테스트: UDP 성공→릴레이 안 함, UDP 비-200→오류, UDP 예외→릴레이.
 
-## Phase 3: 데몬 전송 위임 채널
-- [ ] 3.1 데몬 로컬 제어 서버(127.0.0.1 + 제어 파일 토큰): POST /ctl/put, /ctl/get.
-- [ ] 3.2 put/get 구현(write_file 스필오버 udp / read_file 원격 udp + 메타 업로드).
-- [ ] 3.3 GUI/CLI: 데몬 실행 중이면 위임, 아니면 직접 수행 fallback.
-- [ ] 3.4 통합 테스트: 위임 put/get + fallback.
+## Phase 3: 데몬 전송 위임 채널 — 완료
+- [x] 3.1 daemon_control.DaemonControlServer: 127.0.0.1 임의 포트 aiohttp + 제어 파일
+      {port, token}(소유자 전용 0o600). POST /ctl/put, /ctl/get (X-Ctl-Token 인증).
+- [x] 3.2 put: 로컬 파일 읽기→jbod.write_file(스필오버 udp)→sync.upload_metadata.
+      get: jbod.read_file(원격 udp)→로컬 저장. to_thread로 이벤트 루프 비블로킹.
+- [x] 3.3 daemon_control.transfer_via_daemon + actions._delegate: 데몬 실행 중이면 위임,
+      제어 파일 없으면 None→직접 수행 fallback. put_file/get_file 적용.
+- [x] 3.4 stardustfs.py가 제어 서버 기동(_cleanup에서 정지). 테스트: put/get 왕복,
+      fallback(데몬 없음→None), 토큰 불일치 403, 없는 파일 500.
 
 ## 비범위
 - 위임 채널을 통한 대용량 진행률 스트리밍(초기엔 동기 완료 응답).

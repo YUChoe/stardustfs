@@ -627,8 +627,26 @@ async def startup_v2(config: dict, config_path: str) -> None:
             _eviction_loop(jbod_manager, repl_mgr, evict_config)
         )
 
+    # (6-d) 로컬 전송 위임 채널 — GUI/CLI가 put/get을 데몬에 위임(홀펀칭 활용).
+    control_server = None
+    try:
+        from stardustlib.daemon_control import DaemonControlServer
+
+        control_server = DaemonControlServer(
+            jbod_manager, sync_client, config["metadata_db"]
+        )
+        await control_server.start()
+    except Exception as e:  # noqa: BLE001 — 비치명(위임 없으면 GUI가 직접 수행)
+        logger.warning("데몬 제어 채널 시작 실패: %s", e)
+        control_server = None
+
     # (7) 상주 루프 (정지 신호까지 — Ctrl+C 또는 'daemon stop')
     async def _cleanup() -> None:
+        if control_server is not None:
+            try:
+                await control_server.stop()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("제어 채널 종료 중 예외: %s", e)
         if evict_task is not None:
             evict_task.cancel()
             try:

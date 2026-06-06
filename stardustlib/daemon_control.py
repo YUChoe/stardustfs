@@ -1,0 +1,155 @@
+"""데몬 로컬 제어 채널 (전송 위임).
+
+GUI/CLI가 전송(put/get)을 항상-온라인 데몬에 위임한다. 데몬은 홀펀칭 + 릴레이 정책을
+보유하므로, 로컬 만석 시 리모트 스필오버나 리모트 파일 get을 직접 UDP로 수행할 수 있다.
+
+서버: 데몬이 127.0.0.1의 임의 포트에 aiohttp 제어 서버를 띄우고 {port, token}을 소유자
+전용 제어 파일({metadata_db}.daemon.ctl.json)에 기록한다. 라우트 POST /ctl/put,
+/ctl/get은 X-Ctl-Token 헤더로 인증한다(127.0.0.1 바인딩이 1차 신뢰 경계, 토큰은 방어
+심화).
+
+클라이언트: 제어 파일을 읽어 데몬에 위임한다. 파일/연결이 없으면 None을 반환해 호출자가
+직접 수행으로 fallback하게 한다. 같은 머신이므로 데이터가 아니라 경로를 전달한다.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import secrets
+
+import httpx
+from aiohttp import web
+
+logger = logging.getLogger(__name__)
+
+_CTL_TIMEOUT = 600.0  # 초 — 대용량 전송 허용
+
+
+def _ctl_path(metadata_db: str) -> str:
+    return metadata_db + ".daemon.ctl.json"
+
+
+def read_ctl(metadata_db: str) -> dict | None:
+    """제어 파일을 읽어 {port, token}을 반환한다(없거나 손상 시 None)."""
+    try:
+        with open(_ctl_path(metadata_db), encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and "port" in data and "token" in data:
+            return data
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def transfer_via_daemon(
+    metadata_db: str, op: str, virtual_path: str, local_path: str
+) -> dict | None:
+    """데몬 제어 채널로 put/get을 위임한다. 데몬 미실행/실패 시 None(직접 수행 fallback).
+
+    op는 "put" 또는 "get". 같은 머신이므로 경로만 전달한다.
+    """
+    ctl = read_ctl(metadata_db)
+    if ctl is None:
+        return None
+    url = f"http://127.0.0.1:{ctl['port']}/ctl/{op}"
+    try:
+        resp = httpx.post(
+            url,
+            json={"virtual_path": virtual_path, "local_path": local_path},
+            headers={"X-Ctl-Token": ctl["token"]},
+            timeout=_CTL_TIMEOUT,
+        )
+    except httpx.HTTPError as e:
+        logger.info("데몬 위임 실패(직접 수행으로 fallback): %s", e)
+        return None
+    if resp.status_code == 200:
+        return resp.json()
+    # 데몬이 응답했으나 처리 실패(용량 부족 등) — 직접 수행해도 동일하므로 오류 전파.
+    raise OSError(
+        f"데몬 전송 실패 ({op}): HTTP {resp.status_code} "
+        f"{resp.json().get('error', '') if resp.headers.get('content-type','').startswith('application/json') else ''}"
+    )
+
+
+class DaemonControlServer:
+    """데몬의 로컬 전송 위임 서버(127.0.0.1)."""
+
+    def __init__(self, jbod_manager, sync_client, metadata_db: str) -> None:
+        self._jbod = jbod_manager
+        self._sync = sync_client
+        self._db = metadata_db
+        self._token = secrets.token_hex(16)
+        self._runner: web.AppRunner | None = None
+
+    async def start(self) -> None:
+        app = web.Application()
+        app.add_routes([
+            web.post("/ctl/put", self._handle_put),
+            web.post("/ctl/get", self._handle_get),
+        ])
+        self._runner = web.AppRunner(app)
+        await self._runner.setup()
+        site = web.TCPSite(self._runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
+        self._write_ctl(port)
+        logger.info("데몬 제어 채널 시작: 127.0.0.1:%d", port)
+
+    def _write_ctl(self, port: int) -> None:
+        path = _ctl_path(self._db)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"port": port, "token": self._token}, f)
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)  # 소유자 전용
+        except OSError:
+            pass
+
+    async def stop(self) -> None:
+        if self._runner is not None:
+            await self._runner.cleanup()
+            self._runner = None
+        try:
+            os.remove(_ctl_path(self._db))
+        except OSError:
+            pass
+
+    def _authorised(self, request: web.Request) -> bool:
+        return request.headers.get("X-Ctl-Token") == self._token
+
+    async def _handle_put(self, request: web.Request) -> web.Response:
+        if not self._authorised(request):
+            return web.json_response({"error": "unauthorised"}, status=403)
+        body = await request.json()
+        vpath = body.get("virtual_path", "")
+        local = body.get("local_path", "")
+        try:
+            with open(local, "rb") as f:
+                data = f.read()
+            # 로컬 우선, 만석 시 홀펀칭 UDP로 리모트 스필오버(데몬 jbod에 주입됨).
+            await asyncio.to_thread(self._jbod.write_file, vpath, data)
+            if self._sync is not None:
+                await self._sync.upload_metadata()
+        except Exception as e:  # noqa: BLE001 — 결과를 위임자에게 전달
+            logger.warning("데몬 put 실패 %s: %s", vpath, e)
+            return web.json_response({"error": str(e)}, status=500)
+        return web.json_response({"ok": True, "bytes": len(data)})
+
+    async def _handle_get(self, request: web.Request) -> web.Response:
+        if not self._authorised(request):
+            return web.json_response({"error": "unauthorised"}, status=403)
+        body = await request.json()
+        vpath = body.get("virtual_path", "")
+        local = body.get("local_path", "")
+        try:
+            data = await asyncio.to_thread(self._jbod.read_file, vpath)
+            with open(local, "wb") as f:
+                f.write(data)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("데몬 get 실패 %s: %s", vpath, e)
+            return web.json_response({"error": str(e)}, status=500)
+        return web.json_response({"ok": True, "bytes": len(data)})
