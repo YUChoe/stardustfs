@@ -768,6 +768,7 @@ class StardustApp:
             def done(ok, ov):
                 tree.delete(*tree.get_children())
                 row_meta.clear()
+                remove_btn.config(state="disabled")  # 선택 해제 → 제거 불가
                 if not ok:
                     return
                 for s in ov.get("local", []):
@@ -834,8 +835,18 @@ class StardustApp:
             self.worker.submit(lambda: actions.detach_source(cfg, sid), done)
 
         ttk.Button(bar, text=t["src_add_loop"], command=add_loop).pack(side="left")
-        ttk.Button(bar, text=t["src_remove"], command=remove).pack(side="left", padx=4)
+        remove_btn = ttk.Button(bar, text=t["src_remove"], command=remove,
+                                state="disabled")
+        remove_btn.pack(side="left", padx=4)
         ttk.Button(bar, text=t["close"], command=win.destroy).pack(side="right")
+
+        def _on_sel(_e=None):
+            # 로컬 소스를 선택했을 때만 제거(detach) 가능. 리모트는 불가.
+            sel = tree.selection()
+            local = bool(sel) and row_meta.get(sel[0], {}).get("scope") == "local"
+            remove_btn.config(state="normal" if local else "disabled")
+
+        tree.bind("<<TreeviewSelect>>", _on_sel)
         reload()
 
     # --- 디바이스 ---
