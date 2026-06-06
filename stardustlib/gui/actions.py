@@ -147,12 +147,18 @@ def browse(config_path: str, vpath: str) -> dict:
 
 
 def _replication_summary(session) -> dict:
-    """전체 파일의 백업 상태 집계: {none, pending, replicated, total}."""
+    """이 디바이스가 로컬에 저장한 파일의 백업 상태 집계: {none, pending, replicated, total}.
+
+    다른 디바이스가 소유한(원격) 파일은 그 디바이스가 백업하므로 제외한다. 그렇지 않으면
+    동기화로 받은 타 디바이스 파일을 자기 기준 '미백업(none)'으로 잘못 세게 된다
+    (replication_status는 디바이스-로컬 상태). 로컬 소스 id로 스코프한다.
+    """
     meta = session.metadata
-    counts = {
-        st: len(meta.list_virtual_paths_for_replication((st,), None))
-        for st in ("none", "pending", "replicated")
-    }
+    local_ids = [
+        s.source_id for s in session.jbod.sources
+        if not getattr(s, "is_remote", False)
+    ]
+    counts = meta.count_replication_by_sources(local_ids)
     counts["total"] = counts["none"] + counts["pending"] + counts["replicated"]
     return counts
 
@@ -256,16 +262,55 @@ async def _run_online(config_path: str, aop, sync: bool):
 
 
 def devices_summary(config_path: str) -> dict:
-    """디바이스 온라인/전체 요약 {online, total}. 미로그인/오프라인이면 {}."""
-    async def aop(s):
-        devs = s.my_devices or []
-        return {
-            "online": sum(1 for d in devs if d.get("is_online")),
-            "total": len(devs),
-        }
+    """디바이스 온라인/전체 요약 {online, total}. 미로그인/오프라인이면 {}.
+
+    경량 인증(토큰 + GET /devices)만 사용한다 — open_online(원격 마운트)을 쓰지 않아
+    주기 폴링에 가볍고, 디바이스 목록 창(devices_list)과 동일한 /devices 응답을 세므로
+    카운트가 일치한다.
+    """
+    config = ConfigLoader(config_path).load()
+    server = config.get("server")
+    server_url = server.get("url") if isinstance(server, dict) else None
+    if not server_url:
+        return {}
+
+    async def run() -> dict:
+        import httpx
+
+        from stardustlib.auth_client import AuthClient
+        from stardustlib.credential_store import CredentialStore
+        from stardustlib.exceptions import AuthenticationError
+
+        store = CredentialStore(config["metadata_db"])
+        auth = AuthClient(server_url, credential_store=store)
+        if not auth.load_from_store():
+            await auth.close()
+            return {}
+        try:
+            token = await auth.get_valid_token()
+        except AuthenticationError:
+            await auth.close()
+            return {}
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"{server_url}/devices",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            if resp.status_code >= 400:
+                return {}
+            devs = resp.json()
+            if not isinstance(devs, list):
+                return {}
+            return {
+                "online": sum(1 for d in devs if d.get("is_online")),
+                "total": len(devs),
+            }
+        finally:
+            await auth.close()
 
     try:
-        return asyncio.run(_run_online(config_path, aop, sync=False))
+        return asyncio.run(run())
     except Exception:  # noqa: BLE001 — 미로그인/오프라인
         return {}
 

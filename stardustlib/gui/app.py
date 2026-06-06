@@ -785,6 +785,7 @@ class StardustApp:
                 return
             self._after_write()  # 캐시 세션 무효화 → 새 소스 마운트·상태바 반영
             reload()             # 재빌드된 세션 기준으로 목록 갱신
+            self._restart_daemon()  # daemon이 새 소스를 mount·재신고하도록 재기동
 
         def remove():
             sel = tree.selection()
@@ -807,11 +808,15 @@ class StardustApp:
                 if report.get("detached"):
                     messagebox.showinfo(t["src_remove"], t["src_detach_done"].format(
                         moved=len(report.get("moved", []))))
+                    reload()
+                    self.refresh()
+                    # daemon이 분리된 소스를 더는 mount·재신고하지 않도록 재기동
+                    self._restart_daemon()
                 else:
                     messagebox.showwarning(t["src_remove"], t["src_detach_blocked"].format(
                         unmoved=len(report.get("unmoved", []))))
-                reload()
-                self.refresh()
+                    reload()
+                    self.refresh()
 
             self._set_status(t["src_detach_busy"])
             self.worker.submit(lambda: actions.detach_source(cfg, sid), done)
@@ -911,6 +916,13 @@ class StardustApp:
         if self.config_path:
             cfg = self.config_path
             self.worker.submit(lambda: actions.daemon_status(cfg), self._on_daemon)
+            # 디바이스 온라인 카운트를 주기적으로 갱신(유휴 중 staleness 방지).
+            # 경량 GET /devices라 폴링 부담이 작다.
+            if self._logged_in():
+                self.worker.submit(
+                    lambda: actions.devices_summary(cfg),
+                    lambda ok, s: self._show_device_summary(s) if ok else None,
+                )
         self.root.after(5000, self._refresh_daemon)
 
     def _daemon_dot(self, text: str, color: str) -> None:
@@ -932,6 +944,22 @@ class StardustApp:
         else:
             self._daemon_dot(self.t["daemon_stopped"], grey)
         self._ensure_daemon()
+
+    def _restart_daemon(self) -> None:
+        """실행 중인 daemon을 정지시켜 감독 로직이 새 config로 재기동하게 한다.
+
+        소스 추가/분리 후 호출한다 — daemon은 시작 시 config로 소스를 mount하므로,
+        재기동해야 변경된 소스 목록을 다시 읽고 서버 레지스트리에 재신고한다.
+        정지 신호만 보내고(대기 없음), 다음 폴링에서 _ensure_daemon이 재시작한다.
+        """
+        cfg = self.config_path
+        if not cfg:
+            return
+        self._daemon_restart_until = 0.0  # 쿨다운 리셋 → 즉시 재시작 허용
+        self._set_status(self.t["daemon_restart"])
+        self.worker.submit(
+            lambda: actions.daemon_signal_stop(cfg), lambda *_a: None
+        )
 
     def _ensure_daemon(self) -> None:
         """daemon이 떠 있지 않으면 재시작한다(쿨다운으로 재시작 폭주 방지).

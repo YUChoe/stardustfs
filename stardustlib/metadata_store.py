@@ -523,6 +523,31 @@ class MetadataStore:
         rows = conn.execute(sql, tuple(params)).fetchall()
         return [row["virtual_path"] for row in rows]
 
+    def count_replication_by_sources(
+        self, source_ids: list[str]
+    ) -> dict[str, int]:
+        """주어진 소스(이 디바이스의 로컬 소스)에 저장된 활성 파일의 백업 상태 집계.
+
+        반환 {none, pending, replicated}. 다른 디바이스가 소유(원격 소스)한 파일은
+        제외되므로, 각 디바이스는 자신이 책임지는(로컬 저장) 파일의 백업 상태만 센다.
+        source_ids가 비면 모두 0.
+        """
+        counts = {"none": 0, "pending": 0, "replicated": 0}
+        if not source_ids:
+            return counts
+        conn = self._get_conn()
+        placeholders = ",".join("?" for _ in source_ids)
+        rows = conn.execute(
+            "SELECT COALESCE(replication_status, 'none') AS st, COUNT(*) AS n "
+            f"FROM files WHERE deleted = 0 AND source_id IN ({placeholders}) "
+            "GROUP BY st",
+            tuple(source_ids),
+        ).fetchall()
+        for row in rows:
+            if row["st"] in counts:
+                counts[row["st"]] = row["n"]
+        return counts
+
     def get_pending_files(self) -> list[FileMetadata]:
         """sync_status가 "pending"인 모든 파일 목록을 반환한다.
 
