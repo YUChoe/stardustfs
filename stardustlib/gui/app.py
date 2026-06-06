@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -24,6 +25,10 @@ except Exception:  # noqa: BLE001
     sv_ttk = None
 
 logger = logging.getLogger(__name__)
+
+# daemon 재시작 쿨다운(초): 한 번 시작하면 heartbeat 안정화까지 추가 재시작 보류.
+# 상태 폴링 주기(5s)보다 충분히 커서 부팅 중 중복 시작을 막는다.
+_DAEMON_RESTART_COOLDOWN = 20.0
 
 
 def _human(n: int) -> str:
@@ -44,7 +49,8 @@ class StardustApp:
         self.vpath = "/"
         self.worker = Worker()
         self._rows: dict[str, dict] = {}
-        self._auto_started = False
+        # daemon은 항상 온라인으로 감독(supervise)한다. 다음 재시작 허용 시각(쿨다운).
+        self._daemon_restart_until = 0.0
         self._last_meta_mtime = 0.0
         self.lang = i18n.detect_lang()
         self.t = i18n.get_text(self.lang)
@@ -91,17 +97,13 @@ class StardustApp:
                                command=lambda: self._set_theme("dark"))
         menubar.add_cascade(label=self.t["menu_theme"], menu=theme_menu)
 
-        # 관리: 스토리지/디바이스/daemon 제어(상단 밀집 해소 위해 메뉴로 이동)
+        # 관리: 스토리지/디바이스. daemon은 수동 토글이 아니라 항상 온라인으로
+        # 감독되므로 시작/정지 메뉴를 두지 않는다(상태는 하단 점으로 표시).
         manage = tk.Menu(menubar, tearoff=0)
         manage.add_command(label=self.t["storage"], command=self._sources)
         manage.add_command(label=self.t["devices"], command=self._devices)
-        manage.add_separator()
-        manage.add_command(label=self.t["daemon_start"], command=self._daemon_start)
-        manage.add_command(label=self.t["daemon_stop"], command=self._daemon_stop)
         menubar.add_cascade(label=self.t["menu_manage"], menu=manage)
         self.manage_menu = manage
-        self._daemon_start_idx = 3  # 스토리지,디바이스,sep,시작,정지
-        self._daemon_stop_idx = 4
         self.root.config(menu=menubar)
 
     def _update_title(self) -> None:
@@ -308,7 +310,6 @@ class StardustApp:
         _btn(t["heal_now"], self._heal_selected).pack(side="left", padx=(6, 0))
 
         self._refresh_login_state()
-        self._set_daemon_buttons(None)
 
     # --- 워커 브리지 ---
 
@@ -381,25 +382,6 @@ class StardustApp:
         self._enable(self.login_btn, not logged)
         self._enable(self.logout_btn, logged)
 
-    def _set_daemon_buttons(self, running) -> None:
-        """daemon 상태에 따라 '관리' 메뉴의 시작/정지 항목 활성/비활성."""
-        menu = getattr(self, "manage_menu", None)
-        if menu is None:
-            return
-
-        def _entry(idx, on):
-            try:
-                menu.entryconfig(idx, state="normal" if on else "disabled")
-            except Exception:  # noqa: BLE001
-                pass
-
-        if running is None:
-            _entry(self._daemon_start_idx, False)
-            _entry(self._daemon_stop_idx, False)
-            return
-        _entry(self._daemon_start_idx, not running)
-        _entry(self._daemon_stop_idx, running)
-
     # --- 설정 ---
 
     def _new_config(self) -> None:
@@ -436,7 +418,7 @@ class StardustApp:
             self._update_title()
             self.vpath = "/"
             self.path_var.set("/")
-            self._auto_started = False
+            self._daemon_restart_until = 0.0  # 새 설정 → 즉시 감독 시작
             self.worker.submit(lambda: actions.invalidate(None), lambda *_a: None)
             self.refresh()
             self._refresh_daemon()
@@ -459,7 +441,7 @@ class StardustApp:
             self._update_title()
             self.vpath = "/"
             self.path_var.set("/")
-            self._auto_started = False
+            self._daemon_restart_until = 0.0  # 새 설정 → 즉시 감독 시작
             self.worker.submit(lambda: actions.invalidate(None), lambda *_a: None)
             self.refresh()
             self._refresh_daemon()
@@ -938,23 +920,33 @@ class StardustApp:
         grey, green, orange = "#9aa0a6", "#2da44e", "#d29922"
         if not ok:
             self._daemon_dot(self.t["daemon_unknown"], grey)
-            self._set_daemon_buttons(None)
             return
         if payload.get("running"):
             self._daemon_dot(
                 self.t["daemon_running"].format(pid=payload.get("pid")), green
             )
-            self._set_daemon_buttons(True)
-        elif payload.get("stale"):
+            return
+        # running이 아니면(정지 또는 stale=중단/행) 항상 온라인 유지를 위해 재시작.
+        if payload.get("stale"):
             self._daemon_dot(self.t["daemon_stale"], orange)
-            self._set_daemon_buttons(False)
         else:
             self._daemon_dot(self.t["daemon_stopped"], grey)
-            self._set_daemon_buttons(False)
-            if self.config_path and not self._auto_started:
-                self._auto_started = True
-                self._set_status(self.t["daemon_starting"])
-                self._daemon_start()
+        self._ensure_daemon()
+
+    def _ensure_daemon(self) -> None:
+        """daemon이 떠 있지 않으면 재시작한다(쿨다운으로 재시작 폭주 방지).
+
+        시작 후 heartbeat가 기록되기까지 시간이 필요하므로, 한 번 시작하면
+        쿨다운 동안에는 추가 재시작을 시도하지 않는다.
+        """
+        if not self.config_path:
+            return
+        now = time.time()
+        if now < self._daemon_restart_until:
+            return  # 직전 시작이 진행/안정화 중
+        self._daemon_restart_until = now + _DAEMON_RESTART_COOLDOWN
+        self._set_status(self.t["daemon_starting"])
+        self._daemon_start()
 
     def _daemon_start(self) -> None:
         cfg = self.config_path
@@ -967,12 +959,6 @@ class StardustApp:
             ),
             self.t["daemon_start_busy"],
         )
-
-    def _daemon_stop(self) -> None:
-        cfg = self.config_path
-        self._submit(lambda: actions.daemon_stop(cfg),
-                     lambda _r: self._set_status(self.t["daemon_stop_req"]),
-                     self.t["daemon_stop_busy"])
 
 
 def _hide_console_if_frozen() -> None:
