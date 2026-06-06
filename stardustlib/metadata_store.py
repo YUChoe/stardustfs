@@ -421,8 +421,20 @@ class MetadataStore:
                 f"허용값: {self._VALID_REPLICATION_STATUSES}"
             )
         conn = self._get_conn()
+        row = conn.execute(
+            "SELECT replication_status FROM files WHERE virtual_path = ?",
+            (virtual_path,),
+        ).fetchone()
+        if row is None:
+            return  # 레코드 없음
+        if (row["replication_status"] or "none") == status:
+            return  # 변경 없음 → no-op(version churn 방지)
+        # 값이 바뀌면 version 증가 + pending → 동기화로 다른 디바이스에 전파.
+        # replication_status는 소유자가 설정하는 전역 파일 속성으로, 모든 디바이스가
+        # 동일한 백업 상태를 보도록 한다. 수신 측은 머지에서 version과 함께 채택한다.
         conn.execute(
-            "UPDATE files SET replication_status = ? WHERE virtual_path = ?",
+            "UPDATE files SET replication_status = ?, version = version + 1, "
+            "sync_status = 'pending' WHERE virtual_path = ?",
             (status, virtual_path),
         )
         conn.commit()
@@ -462,7 +474,7 @@ class MetadataStore:
 
     @staticmethod
     def _row_to_metadata(row) -> FileMetadata:
-        """files 행을 FileMetadata로 변환한다(evicted 포함, 키 없으면 False)."""
+        """files 행을 FileMetadata로 변환한다(evicted/replication_status는 키 없으면 기본)."""
         keys = row.keys()
         return FileMetadata(
             virtual_path=row["virtual_path"],
@@ -476,6 +488,10 @@ class MetadataStore:
             sync_status=row["sync_status"],
             deleted=bool(row["deleted"]),
             evicted=bool(row["evicted"]) if "evicted" in keys else False,
+            replication_status=(
+                row["replication_status"] if "replication_status" in keys
+                else "none"
+            ),
         )
 
     def list_files_in_source(self, source_id: str) -> list[FileMetadata]:
@@ -522,31 +538,6 @@ class MetadataStore:
             params.append(owner_device_id)
         rows = conn.execute(sql, tuple(params)).fetchall()
         return [row["virtual_path"] for row in rows]
-
-    def count_replication_by_sources(
-        self, source_ids: list[str]
-    ) -> dict[str, int]:
-        """주어진 소스(이 디바이스의 로컬 소스)에 저장된 활성 파일의 백업 상태 집계.
-
-        반환 {none, pending, replicated}. 다른 디바이스가 소유(원격 소스)한 파일은
-        제외되므로, 각 디바이스는 자신이 책임지는(로컬 저장) 파일의 백업 상태만 센다.
-        source_ids가 비면 모두 0.
-        """
-        counts = {"none": 0, "pending": 0, "replicated": 0}
-        if not source_ids:
-            return counts
-        conn = self._get_conn()
-        placeholders = ",".join("?" for _ in source_ids)
-        rows = conn.execute(
-            "SELECT COALESCE(replication_status, 'none') AS st, COUNT(*) AS n "
-            f"FROM files WHERE deleted = 0 AND source_id IN ({placeholders}) "
-            "GROUP BY st",
-            tuple(source_ids),
-        ).fetchall()
-        for row in rows:
-            if row["st"] in counts:
-                counts[row["st"]] = row["n"]
-        return counts
 
     def get_pending_files(self) -> list[FileMetadata]:
         """sync_status가 "pending"인 모든 파일 목록을 반환한다.
@@ -620,7 +611,8 @@ class MetadataStore:
         cursor = conn.execute(
             "SELECT virtual_path, source_id, physical_path, file_size, "
             "created_at, modified_at, version, device_id, sync_status, deleted, "
-            "evicted FROM files WHERE virtual_path = ? AND deleted = 0",
+            "evicted, COALESCE(replication_status, 'none') AS replication_status "
+            "FROM files WHERE virtual_path = ? AND deleted = 0",
             (virtual_path,),
         )
         row = cursor.fetchone()

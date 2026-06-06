@@ -27,6 +27,28 @@ def store_with_file(store):
     return store
 
 
+class TestReplicationStatusPropagation:
+    """set_replication_status: 값 변경 시 version 증가+pending(동기화 전파), 동일하면 no-op."""
+
+    def test_status_change_bumps_version_and_marks_pending(self, store):
+        now = time.time()
+        store.insert("/r", "src-1", "r.enc", 10, now, now, device_id="devA")
+        v0 = store.lookup("/r").version
+        store.set_replication_status("/r", "replicated")
+        meta = store.lookup("/r")
+        assert meta.replication_status == "replicated"
+        assert meta.version == v0 + 1          # 전파되도록 version 증가
+        assert meta.sync_status == "pending"    # 업로드 대상
+
+    def test_same_status_is_noop(self, store):
+        now = time.time()
+        store.insert("/r2", "src-1", "r.enc", 10, now, now, device_id="devA")
+        store.set_replication_status("/r2", "replicated")
+        v1 = store.lookup("/r2").version
+        store.set_replication_status("/r2", "replicated")  # 동일 값
+        assert store.lookup("/r2").version == v1  # churn 없음(version 불변)
+
+
 class TestEviction:
     """evicted 컬럼 + mark_evicted + list_eviction_candidates."""
 

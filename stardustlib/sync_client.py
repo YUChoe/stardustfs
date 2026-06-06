@@ -586,7 +586,8 @@ class SyncClient:
             server_conn = server_store._get_conn()
             cursor = server_conn.execute(
                 "SELECT virtual_path, source_id, physical_path, file_size, "
-                "created_at, modified_at, version, device_id, sync_status, deleted "
+                "created_at, modified_at, version, device_id, sync_status, deleted, "
+                "COALESCE(replication_status, 'none') AS replication_status "
                 "FROM files"
             )
             server_records: list[FileMetadata] = []
@@ -602,6 +603,7 @@ class SyncClient:
                     device_id=row["device_id"],
                     sync_status=row["sync_status"],
                     deleted=bool(row["deleted"]),
+                    replication_status=row["replication_status"],
                 ))
 
             # 각 서버 레코드에 대해 로컬과 비교 병합
@@ -741,7 +743,8 @@ class SyncClient:
             conn.execute(
                 "UPDATE files SET source_id = ?, physical_path = ?, "
                 "file_size = ?, created_at = ?, modified_at = ?, "
-                "version = ?, device_id = ?, sync_status = 'synced', deleted = ? "
+                "version = ?, device_id = ?, sync_status = 'synced', deleted = ?, "
+                "replication_status = ? "
                 "WHERE virtual_path = ?",
                 (
                     server_rec.source_id,
@@ -752,6 +755,7 @@ class SyncClient:
                     server_rec.version,
                     server_rec.device_id,
                     deleted_val,
+                    server_rec.replication_status,
                     server_rec.virtual_path,
                 ),
             )
@@ -762,8 +766,9 @@ class SyncClient:
             conn.execute(
                 "INSERT INTO files "
                 "(virtual_path, source_id, physical_path, file_size, "
-                "created_at, modified_at, version, device_id, sync_status, deleted) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'synced', ?)",
+                "created_at, modified_at, version, device_id, sync_status, deleted, "
+                "replication_status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'synced', ?, ?)",
                 (
                     server_rec.virtual_path,
                     server_rec.source_id,
@@ -774,6 +779,7 @@ class SyncClient:
                     server_rec.version,
                     server_rec.device_id,
                     deleted_val,
+                    server_rec.replication_status,
                 ),
             )
             conn.commit()
@@ -805,7 +811,8 @@ class SyncClient:
         conn.execute(
             "UPDATE files SET source_id = ?, physical_path = ?, "
             "file_size = ?, modified_at = ?, "
-            "version = ?, device_id = ?, sync_status = 'synced', deleted = ? "
+            "version = ?, device_id = ?, sync_status = 'synced', deleted = ?, "
+            "replication_status = ? "
             "WHERE virtual_path = ?",
             (
                 server_rec.source_id,
@@ -815,6 +822,7 @@ class SyncClient:
                 server_rec.version,
                 server_rec.device_id,
                 1 if server_rec.deleted else 0,
+                server_rec.replication_status,
                 server_rec.virtual_path,
             ),
         )

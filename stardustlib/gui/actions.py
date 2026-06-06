@@ -147,18 +147,16 @@ def browse(config_path: str, vpath: str) -> dict:
 
 
 def _replication_summary(session) -> dict:
-    """이 디바이스가 로컬에 저장한 파일의 백업 상태 집계: {none, pending, replicated, total}.
+    """전체(전역) 파일의 백업 상태 집계: {none, pending, replicated, total}.
 
-    다른 디바이스가 소유한(원격) 파일은 그 디바이스가 백업하므로 제외한다. 그렇지 않으면
-    동기화로 받은 타 디바이스 파일을 자기 기준 '미백업(none)'으로 잘못 세게 된다
-    (replication_status는 디바이스-로컬 상태). 로컬 소스 id로 스코프한다.
+    replication_status는 소유자가 설정하고 동기화로 전파되는 전역 파일 속성이므로,
+    같은 사용자의 모든 디바이스가 동일한 집계를 본다(소유 무관 전체 카운트).
     """
     meta = session.metadata
-    local_ids = [
-        s.source_id for s in session.jbod.sources
-        if not getattr(s, "is_remote", False)
-    ]
-    counts = meta.count_replication_by_sources(local_ids)
+    counts = {
+        st: len(meta.list_virtual_paths_for_replication((st,), None))
+        for st in ("none", "pending", "replicated")
+    }
     counts["total"] = counts["none"] + counts["pending"] + counts["replicated"]
     return counts
 
