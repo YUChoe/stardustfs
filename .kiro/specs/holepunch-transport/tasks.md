@@ -13,9 +13,12 @@ inclusion: manual
       UPnP 언급 정리.
 
 ## Phase 2: 랑데부 활성화 + 등록
-- [ ] 2.1 daemon 시작 시 HolePunchSession.register로 reflexive UDP 학습.
-- [ ] 2.2 reflexive UDP 주소를 device 라우팅에 게시(서버 routing/devices 확장 또는 신규).
-- [ ] 2.3 서버 rendezvous 기본 활성(설정) + 같은 user connect 중개 확인(기존 테스트 활용).
+- [x] 2.1 holepunch_service.HolePunchService: 공유 UDP 소켓에서 rudp/제어 demux,
+      register로 reflexive 학습 + keepalive(60s, TTL 120s 내), 인바운드 punch 응답,
+      connect_to(peer)→punch, P2pUdpNode(서버) 통합. send_op(peer,...) 직접 UDP.
+- [x] 2.2 서버 rendezvous 기본 활성(config rendezvous_enabled=True).
+- [x] 2.3 e2e(test_holepunch_service): 로컬호스트 등록→connect→punch→rudp op 왕복,
+      peer 미가용 시 None/ OSError. (피어 주소는 랑데부 connect로 학습 — devices 게시 불요.)
 
 ## Phase 3: 신뢰성 UDP 메시지 채널 (rudp.py) — 완료
 - [x] 3.1 프레임 인코딩/디코딩(_encode/_decode, 11B 헤더) + fragment(). 항등 테스트.
