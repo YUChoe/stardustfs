@@ -49,6 +49,47 @@ class TestReplicationStatusPropagation:
         assert store.lookup("/r2").version == v1  # churn 없음(version 불변)
 
 
+class TestV6Backfill:
+    """v6 마이그레이션: replication_status 전파 백필(일회성, 값 불변, 멱등)."""
+
+    def _force_pre_v6(self, store, now):
+        conn = store._get_conn()
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_version (id, version, migrated_at) "
+            "VALUES (1, 5, ?)", (now,)
+        )
+        conn.commit()
+
+    def test_backfill_bumps_replicated_files(self, store):
+        now = time.time()
+        store.insert("/a", "src", "p", 10, now, now, device_id="d")
+        store.set_replication_status("/a", "replicated")
+        # 이미 동기화된 상태로 가정 + schema_version을 5로 되돌림
+        conn = store._get_conn()
+        conn.execute("UPDATE files SET sync_status='synced' WHERE virtual_path='/a'")
+        conn.commit()
+        self._force_pre_v6(store, now)
+        v_before = store.lookup("/a").version
+
+        store._migrate_to_v6()
+        m = store.lookup("/a")
+        assert m.version == v_before + 1     # 전파되도록 version 증가
+        assert m.sync_status == "pending"     # 재업로드 대상
+        assert m.replication_status == "replicated"  # 값 자체는 불변
+
+        # 멱등: 재실행은 no-op(schema_version=6)
+        store._migrate_to_v6()
+        assert store.lookup("/a").version == v_before + 1
+
+    def test_backfill_skips_none(self, store):
+        now = time.time()
+        store.insert("/b", "src", "p", 10, now, now, device_id="d")  # none
+        self._force_pre_v6(store, now)
+        v = store.lookup("/b").version
+        store._migrate_to_v6()
+        assert store.lookup("/b").version == v  # none은 미변경
+
+
 class TestEviction:
     """evicted 컬럼 + mark_evicted + list_eviction_candidates."""
 

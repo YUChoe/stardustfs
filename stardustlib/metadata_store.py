@@ -102,6 +102,7 @@ class MetadataStore:
         self._migrate_to_v3()
         self._migrate_to_v4()
         self._migrate_to_v5()
+        self._migrate_to_v6()
         self._initialized = True
         logger.info("Metadata Store 초기화 완료: %s", self._db_path)
 
@@ -286,6 +287,46 @@ class MetadataStore:
         except Exception as e:
             conn.rollback()
             logger.error("v5 스키마 마이그레이션 실패, 롤백 수행: %s", e)
+            raise
+
+    def _migrate_to_v6(self) -> None:
+        """v5 → v6: replication_status 전파 백필(일회성).
+
+        replication_status는 과거 비-버전 로컬 컬럼이라, 동기화 전파 도입(version 증가
+        방식) 이전에 replicated가 된 파일은 다른 디바이스로 상태가 전파되지 않았다.
+        이 마이그레이션은 status가 none이 아닌 활성 파일의 version을 한 번 올리고
+        sync_status='pending'으로 표시해, 소유자가 다음 동기화에서 status를 재업로드하게
+        한다(수신 측은 머지에서 version과 함께 채택). 한 번만 수행한다(schema_version=6).
+        replication_status 값 자체는 바꾸지 않는다.
+        """
+        conn = self._get_conn()
+        cur = conn.execute("PRAGMA table_info(files)")
+        cols = [r["name"] for r in cur.fetchall()]
+        if "replication_status" not in cols:
+            return  # v4 이전(있을 수 없음) — 안전 가드
+        row = conn.execute(
+            "SELECT version FROM schema_version WHERE id = 1"
+        ).fetchone()
+        if row is not None and row["version"] >= 6:
+            return  # 이미 백필됨
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "UPDATE files SET version = version + 1, sync_status = 'pending' "
+                "WHERE deleted = 0 AND COALESCE(replication_status, 'none') != 'none'"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_version (id, version, migrated_at) "
+                "VALUES (1, 6, ?)",
+                (time.time(),),
+            )
+            conn.commit()
+            logger.info(
+                "MetadataStore v6 마이그레이션 완료 (replication_status 전파 백필)"
+            )
+        except Exception as e:
+            conn.rollback()
+            logger.error("v6 마이그레이션 실패, 롤백 수행: %s", e)
             raise
 
     # --- 파일 메타데이터 CRUD ---
