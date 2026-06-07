@@ -14,7 +14,7 @@ import httpx
 from aiohttp import web
 
 from stardustlib.auth_client import AuthClient
-from stardustlib.jbod_manager import JBODManager
+from stardustlib.jbod_manager import InsufficientStorageError, JBODManager
 from stardustlib.parity_store import ParityStore, QuotaExceededError
 
 logger = logging.getLogger(__name__)
@@ -321,17 +321,6 @@ class P2PServer:
 
     def _op_write(self, body: dict) -> tuple[int, dict]:
         """파일 쓰기 로직."""
-        source = self._select_source_or_error(body)
-        if isinstance(source, tuple):
-            source = self._jbod_manager.sources[0] if self._jbod_manager.sources else None
-            if source is None:
-                return 404, {"error": "No source available"}
-
-        physical_path = body.get("physical_path", "")
-        err = self._validate_path_err(physical_path, self._source_data_root(source))
-        if err is not None:
-            return err
-
         data_b64 = body.get("data", "")
         try:
             data = base64.b64decode(data_b64)
@@ -340,6 +329,25 @@ class P2PServer:
 
         if len(data) > MAX_WRITE_SIZE:
             return 413, {"error": "Payload too large (max 100MB)"}
+
+        # source_id가 명시되면 그 소스를, 없으면(스필오버 등 원격 쓰기) 페이로드
+        # 크기 이상의 여유가 있는 소스를 고른다. 첫 소스를 맹목적으로 고르면 작은
+        # 소스(루프백 10MiB)에서 용량 부족(500)이 난다.
+        source_id = body.get("source_id")
+        if source_id:
+            source = self._jbod_manager._get_source_by_id(source_id)
+            if source is None:
+                return 404, {"error": "Source not found"}
+        else:
+            try:
+                source = self._jbod_manager.select_source(len(data))
+            except InsufficientStorageError as e:
+                return 507, {"error": str(e)}
+
+        physical_path = body.get("physical_path", "")
+        err = self._validate_path_err(physical_path, self._source_data_root(source))
+        if err is not None:
+            return err
 
         # 상위 디렉토리 생성은 소스 구현에 위임한다(LoopbackSource는 동반
         # 디렉토리에 기록하며 내부에서 부모를 생성).
