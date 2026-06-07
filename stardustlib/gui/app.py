@@ -81,33 +81,58 @@ class StardustApp:
     # --- 메뉴 / 트레이 ---
 
     def _build_menu(self) -> None:
-        menubar = tk.Menu(self.root)
-        file_menu = tk.Menu(menubar, tearoff=0)
-        file_menu.add_command(label=self.t["new_config"], command=self._new_config)
-        file_menu.add_command(label=self.t["choose_config"], command=self._choose_config)
-        menubar.add_cascade(label=self.t["menu_file"], menu=file_menu)
-        lang_menu = tk.Menu(menubar, tearoff=0)
-        lang_menu.add_command(label=self.t["lang_ko"],
-                              command=lambda: self._set_language("ko"))
-        lang_menu.add_command(label=self.t["lang_en"],
-                              command=lambda: self._set_language("en"))
-        menubar.add_cascade(label=self.t["menu_language"], menu=lang_menu)
+        """ttk Menubutton 기반 메뉴바를 만든다.
 
-        theme_menu = tk.Menu(menubar, tearoff=0)
-        theme_menu.add_command(label=self.t["theme_light"],
-                               command=lambda: self._set_theme("light"))
-        theme_menu.add_command(label=self.t["theme_dark"],
-                               command=lambda: self._set_theme("dark"))
-        menubar.add_cascade(label=self.t["menu_theme"], menu=theme_menu)
+        네이티브 tk 메뉴바는 sv_ttk 테마를 받지 않고 Windows에서 strip 색을 제어할
+        수 없어 다크 모드에서 밝게 보인다. ttk 바 + 다크색 드롭다운으로 대체한다.
+        언어/테마 변경 시 다시 호출되므로 기존 바를 파괴하고 새로 만든다(body 위로 고정).
+        """
+        t = self.t
+        dark = self.theme == "dark"
+        old = getattr(self, "_menubar", None)
+        if old is not None:
+            old.destroy()
+        bar = ttk.Frame(self.root)
+        if getattr(self, "body", None) is not None:
+            bar.pack(side="top", fill="x", before=self.body)
+        else:
+            bar.pack(side="top", fill="x")
+        self._menubar = bar
 
-        # 관리: 스토리지/디바이스. daemon은 수동 토글이 아니라 항상 온라인으로
-        # 감독되므로 시작/정지 메뉴를 두지 않는다(상태는 하단 점으로 표시).
-        manage = tk.Menu(menubar, tearoff=0)
-        manage.add_command(label=self.t["storage"], command=self._sources)
-        manage.add_command(label=self.t["devices"], command=self._devices)
-        menubar.add_cascade(label=self.t["menu_manage"], menu=manage)
-        self.manage_menu = manage
-        self.root.config(menu=menubar)
+        def _dropdown(items):
+            m = tk.Menu(bar, tearoff=0)
+            theme.style_menu(m, dark=dark)
+            for label, cmd in items:
+                m.add_command(label=label, command=cmd)
+            return m
+
+        file_menu = _dropdown([
+            (t["new_config"], self._new_config),
+            (t["choose_config"], self._choose_config),
+        ])
+        lang_menu = _dropdown([
+            (t["lang_ko"], lambda: self._set_language("ko")),
+            (t["lang_en"], lambda: self._set_language("en")),
+        ])
+        theme_menu = _dropdown([
+            (t["theme_light"], lambda: self._set_theme("light")),
+            (t["theme_dark"], lambda: self._set_theme("dark")),
+        ])
+        # 관리: 스토리지/디바이스. daemon은 항상 온라인으로 감독되어 시작/정지 없음.
+        self.manage_menu = _dropdown([
+            (t["storage"], self._sources),
+            (t["devices"], self._devices),
+        ])
+        for label, menu in (
+            (t["menu_file"], file_menu),
+            (t["menu_language"], lang_menu),
+            (t["menu_theme"], theme_menu),
+            (t["menu_manage"], self.manage_menu),
+        ):
+            ttk.Menubutton(
+                bar, text=label, menu=menu, direction="below",
+                style="Toolbutton",
+            ).pack(side="left", padx=(2, 0), pady=2)
 
     def _update_title(self) -> None:
         """창 제목에 앱 이름 + 설정 파일명을 표시한다."""
@@ -185,6 +210,8 @@ class StardustApp:
     def _set_theme(self, name: str) -> None:
         self.theme = name
         self._apply_theme()
+        # 메뉴바 드롭다운(tk.Menu) 색은 테마를 자동으로 따르지 않으므로 재구성한다.
+        self._build_menu()
 
     def _setup_tray(self) -> None:
         self.tray_icon = tray.build_icon(

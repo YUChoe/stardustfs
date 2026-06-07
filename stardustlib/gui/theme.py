@@ -57,6 +57,15 @@ def apply_palette(root: tk.Misc, style, *, dark: bool) -> None:
                         bordercolor=p["border_muted"])
         style.configure("Treeview.Heading", background=p["surface"],
                         foreground=p["fg_subtle"])
+        # 메뉴바(ttk Menubutton/Toolbutton): 네이티브 tk 메뉴바 대체용
+        for st in ("TMenubutton", "Toolbutton"):
+            style.configure(st, background=p["canvas"], foreground=p["fg_default"])
+            style.map(
+                st,
+                background=[("active", p["surface_hover"]),
+                            ("pressed", p["surface_hover"])],
+                foreground=[("active", p["fg_strong"])],
+            )
     # 브랜드 강조(테마 무관)
     style.map("Treeview",
               background=[("selected", p["accent"])],
@@ -75,6 +84,19 @@ def style_listbox(listbox: tk.Listbox) -> None:
         selectbackground=p["accent"], selectforeground="#ffffff",
         highlightthickness=1, highlightbackground=p["border_muted"],
         highlightcolor=p["border_default"], borderwidth=0,
+    )
+
+
+def style_menu(menu: tk.Menu, *, dark: bool) -> None:
+    """tk.Menu(드롭다운)를 Primer 다크색으로 칠한다. light면 네이티브 유지."""
+    if not dark:
+        return
+    p = PALETTE
+    menu.configure(
+        background=p["surface"], foreground=p["fg_default"],
+        activebackground=p["accent"], activeforeground="#ffffff",
+        disabledforeground=p["fg_disabled"], selectcolor=p["accent"],
+        relief="flat", borderwidth=0, activeborderwidth=0,
     )
 
 
