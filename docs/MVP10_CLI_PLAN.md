@@ -197,7 +197,7 @@ teardown을 모두 처리한다.
 명령 1회 = 단일 `asyncio.run(_run(args))`:
 1. setup(async): 로그인 → 로컬 스토리지 초기화(동기) → device 등록/조회 →
    remote 소스 마운트(동기, 내부 자가 브리지) → 1회 메타데이터 동기화(initial_sync)
-2. 파일 op: 동기 JBOD 호출. 메인 루프 블로킹을 피하려면
+2. 파일 op: 동기 스토리지 호출. 메인 루프 블로킹을 피하려면
    `await loop.run_in_executor(None, lambda: jbod.read_file(path))`
 3. teardown(async): `auth_client.close()` + 시작한 컴포넌트 stop
 - 로컬 전용 명령(`df`, 로컬 소유 파일 `ls`)은 서버 없이도 동작 가능하나, 신선한

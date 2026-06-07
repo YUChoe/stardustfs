@@ -47,7 +47,7 @@ MVP2 멀티디바이스 동기화         (접근 계층 피벗)         GUI 파
 
 접근 계층만 교체하므로 아래 엔진은 유지·재사용한다.
 
-- 암호화 저장: AES-256-GCM 파일 암호화, JBOD 스토리지 통합(Directory/Loopback)
+- 암호화 저장: AES-256-GCM 파일 암호화, 스토리지 통합(Directory/Loopback)
 - 메타데이터: SQLite(SQLCipher 암호화 가능), tombstone 삭제 동기화, CAS 낙관적 잠금
 - 멀티디바이스: 계정/디바이스 등록, metadata_db + key_file 서버 백업/복원
 - 원격 접근 엔진: 원격 소스 프록시(remote_source), P2P 직접 연결(p2p_server),
