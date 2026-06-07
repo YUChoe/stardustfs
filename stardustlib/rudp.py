@@ -28,7 +28,8 @@ _HEADER_LEN = _HEADER.size  # 11
 
 DEFAULT_MAX_PAYLOAD = 1200   # MTU 보수치(헤더 포함 < 1280 IPv6 최소 MTU)
 DEFAULT_ACK_TIMEOUT = 0.3    # 초 — 미-ack 프래그먼트 재전송 대기
-DEFAULT_MAX_RETRIES = 10     # 라운드 상한(초과 시 TimeoutError)
+DEFAULT_MAX_RETRIES = 10     # "무진행" 라운드 상한(초과 시 TimeoutError)
+DEFAULT_WINDOW = 256         # in-flight 프래그먼트 상한(대용량 전송 페이싱)
 _MAX_FRAGMENTS = 65535       # frag_count(uint16) 한계
 
 
@@ -81,11 +82,13 @@ class RudpEndpoint:
         max_payload: int = DEFAULT_MAX_PAYLOAD,
         ack_timeout: float = DEFAULT_ACK_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        window: int = DEFAULT_WINDOW,
     ) -> None:
         self._sendto = sendto
         self._max_payload = max_payload
         self._ack_timeout = ack_timeout
         self._max_retries = max_retries
+        self._window = max(1, window)
         self._next_id = 1
         # 송신 상태는 (addr, msg_id)로 키잉한다 — 한 엔드포인트가 서로 다른 피어에
         # 같은 msg_id로 동시 송신(자기 요청 + 원격 id 에코 응답)해도 충돌하지 않게.
@@ -169,26 +172,53 @@ class RudpEndpoint:
         state = _SendState(count)
         skey = (addr, msg_id)
         self._send_states[skey] = state
+        loop = asyncio.get_running_loop()
+        sent_at: dict[int, float] = {}  # idx → 마지막 전송 시각(재전송 타이밍)
+        last_acked = 0
+        stalls = 0  # 연속 무진행 라운드 수(상한 초과 시 실패)
+        logger.debug(
+            "rudp send 시작 msg_id=%s frags=%d bytes=%d window=%d",
+            msg_id, count, len(data), self._window,
+        )
         try:
-            for _attempt in range(self._max_retries):
-                for idx, payload in enumerate(frags):
-                    if idx not in state.acked:
+            while not state.all_acked():
+                now = loop.time()
+                # in-flight = 아직 ACK 안 됐고 ack_timeout 미경과로 응답 대기 중인 수
+                in_flight = sum(
+                    1 for i, t in sent_at.items()
+                    if i not in state.acked and (now - t) < self._ack_timeout
+                )
+                budget = self._window - in_flight
+                # 윈도우 예산만큼 미전송/재전송(ack_timeout 경과) 프래그먼트를 보낸다.
+                for idx in range(count):
+                    if budget <= 0:
+                        break
+                    if idx in state.acked:
+                        continue
+                    t = sent_at.get(idx)
+                    if t is None or (now - t) >= self._ack_timeout:
                         self._sendto(
-                            _encode(_TYPE_DATA, msg_id, idx, count, payload), addr
+                            _encode(_TYPE_DATA, msg_id, idx, count, frags[idx]),
+                            addr,
                         )
-                if state.all_acked():
-                    return msg_id
+                        sent_at[idx] = now
+                        budget -= 1
                 state.event.clear()
                 try:
                     await asyncio.wait_for(state.event.wait(), self._ack_timeout)
                 except asyncio.TimeoutError:
                     pass
-                if state.all_acked():
-                    return msg_id
-            raise TimeoutError(
-                f"rudp 전송 실패 msg_id={msg_id}: "
-                f"{len(state.acked)}/{count} 프래그먼트만 ACK됨"
-            )
+                if len(state.acked) > last_acked:
+                    last_acked = len(state.acked)
+                    stalls = 0  # 진행 있음 → 재시도 카운트 리셋
+                else:
+                    stalls += 1
+                    if stalls > self._max_retries:
+                        raise TimeoutError(
+                            f"rudp 전송 실패 msg_id={msg_id}: "
+                            f"{last_acked}/{count} 프래그먼트만 ACK됨"
+                        )
+            return msg_id
         finally:
             self._send_states.pop(skey, None)
 

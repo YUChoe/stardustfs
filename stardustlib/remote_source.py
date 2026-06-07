@@ -440,13 +440,16 @@ class RemoteSource(StorageSource):
         if self._udp_send is not None and op is not None:
             status = None
             result: dict[str, Any] = {}
+            logger.info("홀펀칭 UDP 전송 시도(%s) → device=%s", op, self._device_id)
             try:
                 status, result = await self._udp_send(
                     self._device_id, op, payload
                 )
-            except Exception:  # noqa: BLE001 — 펀치/전송 실패 → 릴레이로
+            except Exception as e:  # noqa: BLE001 — 펀치/전송 실패 → 릴레이로
+                logger.info("홀펀칭 UDP 실패(%s) → 릴레이 시도: %s", op, e)
                 status = None
             if status == 200:
+                logger.info("홀펀칭 UDP 전송 성공(%s) device=%s", op, self._device_id)
                 return result
             if status is not None:
                 # 홀더의 확정 응답(권한/없음/쿼터 등)은 릴레이해도 동일 → 오류 종결.

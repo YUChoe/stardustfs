@@ -130,6 +130,7 @@ class DaemonControlServer:
         try:
             with open(local, "rb") as f:
                 data = f.read()
+            logger.info("데몬 put 시작: %s (%d bytes)", vpath, len(data))
             # 로컬 우선, 만석 시 홀펀칭 UDP로 리모트 스필오버(데몬 jbod에 주입됨).
             await asyncio.to_thread(self._jbod.write_file, vpath, data)
             if self._sync is not None:
@@ -137,6 +138,7 @@ class DaemonControlServer:
         except Exception as e:  # noqa: BLE001 — 결과를 위임자에게 전달
             logger.warning("데몬 put 실패 %s: %s", vpath, e)
             return web.json_response({"error": str(e)}, status=500)
+        logger.info("데몬 put 완료: %s (%d bytes)", vpath, len(data))
         return web.json_response({"ok": True, "bytes": len(data)})
 
     async def _handle_get(self, request: web.Request) -> web.Response:
@@ -146,10 +148,12 @@ class DaemonControlServer:
         vpath = body.get("virtual_path", "")
         local = body.get("local_path", "")
         try:
+            logger.info("데몬 get 시작: %s", vpath)
             data = await asyncio.to_thread(self._jbod.read_file, vpath)
             with open(local, "wb") as f:
                 f.write(data)
         except Exception as e:  # noqa: BLE001
             logger.warning("데몬 get 실패 %s: %s", vpath, e)
             return web.json_response({"error": str(e)}, status=500)
+        logger.info("데몬 get 완료: %s (%d bytes)", vpath, len(data))
         return web.json_response({"ok": True, "bytes": len(data)})

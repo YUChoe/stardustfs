@@ -62,6 +62,17 @@ async def test_roundtrip_large_message():
 
 
 @pytest.mark.asyncio
+async def test_windowed_large_transfer_completes():
+    # 작은 윈도우 + 작은 MTU로 다수 프래그먼트를 윈도우 페이싱으로 완주.
+    r = _Router()
+    a, _aa, b, b_addr = r.pair(max_payload=16, window=8, ack_timeout=0.05)
+    payload = bytes((i * 31 + 5) & 0xFF for i in range(4000))  # 250 프래그먼트
+    await a.send(b_addr, payload)
+    _addr, _mid, got = await b.recv()
+    assert got == payload
+
+
+@pytest.mark.asyncio
 async def test_reliable_delivery_under_loss():
     r = _Router()
     a, _aa, b, b_addr = r.pair(max_payload=8, ack_timeout=0.02, max_retries=50)

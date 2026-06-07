@@ -182,7 +182,7 @@ def _build_parity_store(
     """호스트 역할 패리티 스토어를 생성한다(replication.enabled 일 때만, 기본 활성).
 
     보관 디렉토리는 {metadata_db}.parity. 최대 용량은 provided_bytes * fraction
-    (정책 호혜 비율). provided_bytes를 인자로 주면 그 값을, 없으면 config의
+    (정책 상호 보관 비율). provided_bytes를 인자로 주면 그 값을, 없으면 config의
     replication.provided_bytes를, 그것도 없으면 레거시 p2p.parity_max_bytes를,
     모두 없으면 0(호스팅 안 함)을 사용한다. replication.enabled=false면 None.
     """
@@ -387,10 +387,10 @@ async def startup_v2(config: dict, config_path: str) -> None:
     jbod_manager.device_id = device_mgr.device_id
 
     # (5-a) 리플리케이션 정책 다운로드(시작 1회) + 제공 용량 신고
-    # 기본 활성(replication.enabled 미지정 시 true), 호혜 비율 0.5.
+    # 기본 활성(replication.enabled 미지정 시 true), 상호 보관 비율 0.5.
     repl_config = config.get("replication", {})  # type: ignore[attr-defined]
     repl_enabled = repl_config.get("enabled", True)
-    # 미설정 시 로컬 총 용량을 제공(호혜 0.5 → 타인 최대 50% 사용). 0이면 호스팅 안 함.
+    # 미설정 시 로컬 총 용량을 제공(상호 보관 0.5 → 타인 최대 50% 사용). 0이면 호스팅 안 함.
     if "provided_bytes" in repl_config:
         repl_provided = int(repl_config["provided_bytes"])
     else:
@@ -404,14 +404,14 @@ async def startup_v2(config: dict, config_path: str) -> None:
         if policy:
             repl_fraction = policy["reciprocity_fraction"]
             repl_min = policy["min_replicas"]
-            logger.info("리플리케이션 정책 수신: 호혜 %.0f%%, 목표 복제본 %d",
+            logger.info("리플리케이션 정책 수신: 상호 보관 %.0f%%, 목표 복제본 %d",
                         repl_fraction * 100, repl_min)
         if device_mgr.device_id and repl_provided > 0:
             ok = await report_hosting(
                 auth_client, server_url, device_mgr.device_id, repl_provided
             )
             if ok:
-                logger.info("호스팅 용량 신고: %d bytes (호혜 %.0f%%)",
+                logger.info("호스팅 용량 신고: %d bytes (상호 보관 %.0f%%)",
                             repl_provided, repl_fraction * 100)
         elif not device_mgr.device_id:
             logger.warning("device 미등록 — 호스팅 신고를 건너뜁니다")

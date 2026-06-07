@@ -183,13 +183,17 @@ class HolePunchService:
             try:
                 peer_addr = await asyncio.wait_for(self._peer_fut, timeout)
             except asyncio.TimeoutError:
+                logger.info("랑데부 connect 타임아웃: peer=%s", peer_device_id)
                 return None
             finally:
                 self._peer_fut = None
             if peer_addr is None:
+                logger.info("랑데부 peer 미가용: peer=%s", peer_device_id)
                 return None
             if await self._punch(peer_addr):
+                logger.info("펀치 성공: peer=%s addr=%s", peer_device_id, peer_addr)
                 return peer_addr
+            logger.info("펀치 실패: peer=%s addr=%s", peer_device_id, peer_addr)
             return None
 
     async def send_op(
