@@ -58,6 +58,8 @@ class P2PServer:
         self._app = web.Application(client_max_size=200 * 1024 * 1024)
         self._app.router.add_post("/p2p/read", self.handle_read)
         self._app.router.add_post("/p2p/write", self.handle_write)
+        self._app.router.add_post("/p2p/write_chunk", self.handle_write_chunk)
+        self._app.router.add_post("/p2p/read_chunk", self.handle_read_chunk)
         self._app.router.add_post("/p2p/delete", self.handle_delete)
         self._app.router.add_post("/p2p/list", self.handle_list)
         self._app.router.add_post("/p2p/exists", self.handle_exists)
@@ -117,6 +119,22 @@ class P2PServer:
         if isinstance(body, web.Response):
             return body
         status, result = self._op_write(body)
+        return web.json_response(result, status=status)
+
+    async def handle_write_chunk(self, request: web.Request) -> web.Response:
+        """POST /p2p/write_chunk: 대용량 파일 청크 쓰기."""
+        body = await self._parse_and_verify(request)
+        if isinstance(body, web.Response):
+            return body
+        status, result = self._op_write_chunk(body)
+        return web.json_response(result, status=status)
+
+    async def handle_read_chunk(self, request: web.Request) -> web.Response:
+        """POST /p2p/read_chunk: 대용량 파일 청크 읽기."""
+        body = await self._parse_and_verify(request, allow_share_token=True)
+        if isinstance(body, web.Response):
+            return body
+        status, result = self._op_read_chunk(body)
         return web.json_response(result, status=status)
 
     async def handle_delete(self, request: web.Request) -> web.Response:
@@ -224,6 +242,8 @@ class P2PServer:
         op_map = {
             "read": self._op_read,
             "write": self._op_write,
+            "write_chunk": self._op_write_chunk,
+            "read_chunk": self._op_read_chunk,
             "delete": self._op_delete,
             "list": self._op_list,
             "exists": self._op_exists,
@@ -354,6 +374,69 @@ class P2PServer:
         source.write(physical_path, data)
         # 사용된 소스 id를 알려준다(evacuate가 메타데이터 source_id 갱신에 사용).
         return 200, {"bytes_written": len(data), "source_id": source.source_id}
+
+    def _op_write_chunk(self, body: dict) -> tuple[int, dict]:
+        """청크 쓰기 로직(대용량 리모트 파일).
+
+        offset=0이면 total_size 이상의 여유가 있는 소스를 선택(없으면 507)하고 파일을
+        새로 만든다. offset>0이면 직전 응답의 source_id로 소스를 확정해 그 위치에 이어
+        쓴다. 한 청크는 4 MiB라 rudp/100MB 한계 내.
+        """
+        data_b64 = body.get("data", "")
+        try:
+            data = base64.b64decode(data_b64)
+        except Exception:
+            return 400, {"error": "Invalid base64 data"}
+        if len(data) > MAX_WRITE_SIZE:
+            return 413, {"error": "Payload too large (max 100MB)"}
+
+        offset = int(body.get("offset", 0))
+        total_size = int(body.get("total_size", len(data)))
+        source_id = body.get("source_id")
+        if source_id:
+            source = self._jbod_manager._get_source_by_id(source_id)
+            if source is None:
+                return 404, {"error": "Source not found"}
+        elif offset == 0:
+            try:
+                source = self._jbod_manager.select_source(total_size)
+            except InsufficientStorageError as e:
+                return 507, {"error": str(e)}
+        else:
+            return 400, {"error": "offset>0 requires source_id"}
+
+        physical_path = body.get("physical_path", "")
+        err = self._validate_path_err(physical_path, self._source_data_root(source))
+        if err is not None:
+            return err
+
+        try:
+            source.write_chunk(physical_path, data, offset, total_size)
+        except OSError as e:
+            if "insufficient space" in str(e).lower():
+                return 507, {"error": str(e)}
+            raise
+        return 200, {"bytes_written": len(data), "source_id": source.source_id}
+
+    def _op_read_chunk(self, body: dict) -> tuple[int, dict]:
+        """청크 읽기 로직. offset부터 length 바이트를 b64로 반환(대용량 리모트 파일)."""
+        source = self._select_source_or_error(body)
+        if isinstance(source, tuple):
+            return source
+
+        physical_path = body.get("physical_path", "")
+        err = self._validate_path_err(physical_path, self._source_data_root(source))
+        if err is not None:
+            return err
+
+        offset = int(body.get("offset", 0))
+        length = int(body.get("length", 0))
+        try:
+            data = source.read_chunk(physical_path, offset, length)
+        except FileNotFoundError:
+            return 404, {"error": "File not found"}
+        encoded = base64.b64encode(data).decode("ascii")
+        return 200, {"data": encoded}
 
     def _op_delete(self, body: dict) -> tuple[int, dict]:
         """파일 삭제 로직."""

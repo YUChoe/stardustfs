@@ -116,6 +116,22 @@ class StorageSource(ABC):
         """
         return []
 
+    def write_chunk(
+        self, physical_path: str, data: bytes, offset: int, total_size: int
+    ) -> None:
+        """대용량 전송용 청크 기록(홀더 측).
+
+        offset=0이면 total_size로 용량을 검사하고 파일을 새로 만들어(truncate)
+        0에 기록한다. offset>0이면 같은 파일의 offset 위치에 이어 기록한다.
+        로컬 소스(Loopback/Directory)가 seek 기반으로 오버라이드한다. 기본은 미구현
+        (RemoteSource는 홀더 대상이 아님).
+        """
+        raise NotImplementedError
+
+    def read_chunk(self, physical_path: str, offset: int, length: int) -> bytes:
+        """대용량 전송용 청크 읽기(홀더 측). offset부터 length 바이트 반환."""
+        raise NotImplementedError
+
 
 class DirectorySource(StorageSource):
     """로컬 디렉토리를 스토리지 소스로 사용하는 구현체.
@@ -194,6 +210,35 @@ class DirectorySource(StorageSource):
         except OSError as e:
             self._deactivate(f"Write failed for {physical_path}: {e}")
             raise
+
+    def write_chunk(
+        self, physical_path: str, data: bytes, offset: int, total_size: int
+    ) -> None:
+        """청크 기록. offset=0은 새 파일 생성, 이후는 seek 기록(용량은 디스크 free)."""
+        self._check_active()
+        full_path = self._resolve(physical_path)
+        try:
+            if offset == 0:
+                parent = os.path.dirname(full_path)
+                if parent and not os.path.isdir(parent):
+                    os.makedirs(parent, exist_ok=True)
+                with open(full_path, "wb") as f:
+                    f.write(data)
+            else:
+                with open(full_path, "r+b") as f:
+                    f.seek(offset)
+                    f.write(data)
+        except OSError as e:
+            self._deactivate(f"write_chunk failed for {physical_path}: {e}")
+            raise
+
+    def read_chunk(self, physical_path: str, offset: int, length: int) -> bytes:
+        """offset부터 length 바이트를 읽어 반환한다."""
+        self._check_active()
+        full_path = self._resolve(physical_path)
+        with open(full_path, "rb") as f:
+            f.seek(offset)
+            return f.read(length)
 
     def delete(self, physical_path: str) -> None:
         """파일을 삭제한다."""
@@ -453,6 +498,46 @@ class LoopbackSource(StorageSource):
 
         # 증분 추적: 기존 크기를 빼고 새 크기를 더함
         self._used_bytes += len(data) - existing_size
+
+    def write_chunk(
+        self, physical_path: str, data: bytes, offset: int, total_size: int
+    ) -> None:
+        """청크 기록. offset=0은 total_size 용량 검사 후 새로 생성, 이후는 seek 기록.
+
+        used_bytes는 실제 파일 크기 증분으로 추적하므로(예약 아님), 중간 실패 후
+        delete 롤백 시 부분 파일 크기만큼 정확히 회수된다.
+        """
+        self._check_active()
+        full_path = self._resolve(physical_path)
+        if offset == 0:
+            existing = (
+                os.path.getsize(full_path) if os.path.isfile(full_path) else 0
+            )
+            needed = total_size - existing
+            if needed > 0 and needed > (self._size_bytes - self._used_bytes):
+                raise OSError(
+                    f"LoopbackSource '{self._source_id}' insufficient space: "
+                    f"need {needed}, available {self._size_bytes - self._used_bytes}"
+                )
+            parent = os.path.dirname(full_path)
+            os.makedirs(parent, exist_ok=True)
+            with open(full_path, "wb") as f:
+                f.write(data)
+            self._used_bytes += len(data) - existing
+        else:
+            before = os.path.getsize(full_path)
+            with open(full_path, "r+b") as f:
+                f.seek(offset)
+                f.write(data)
+            self._used_bytes += os.path.getsize(full_path) - before
+
+    def read_chunk(self, physical_path: str, offset: int, length: int) -> bytes:
+        """offset부터 length 바이트를 읽어 반환한다."""
+        self._check_active()
+        full_path = self._resolve(physical_path)
+        with open(full_path, "rb") as f:
+            f.seek(offset)
+            return f.read(length)
 
     def delete(self, physical_path: str) -> None:
         """파일을 삭제한다."""

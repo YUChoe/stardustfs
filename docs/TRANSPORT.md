@@ -72,6 +72,27 @@ GUI/CLI는 단발 프로세스라 홀펀칭 세션(상주 UDP 소켓·랑데부 
 (과거에는 첫 소스를 맹목적으로 골라, 작은 루프백(10MiB)에 큰 파일(12MiB)을 못 담고
 HTTP 500을 내던 버그가 있었다 — 2026-06-07 수정.) 맞는 소스가 없으면 HTTP 507.
 
+## 대용량 파일 청크 전송
+
+단일 `/p2p/write`/`/p2p/read`로는 rudp 단일 메시지 한계(frag_count u16 × 1200B ≈
+78.6MB)·홀더 `MAX_WRITE_SIZE`(100MB)·릴레이 본문 한계를 넘는 파일을 전송할 수 없다
+(713 MiB 스필오버가 "830670 프래그먼트 > 65535"로 실패하던 사례). 그래서 리모트
+파일 쓰기/읽기를 4 MiB(`REMOTE_CHUNK_SIZE`) 청크로 분할한다. 메타데이터 모델은
+그대로(리모트 파일 1개 항목)이고 청크화는 RemoteSource ↔ 홀더 전송 계층에만 있다.
+
+- 쓰기(`push_blob`/`write` → `_push_chunked`): 데이터가 4 MiB를 넘으면 청크 루프로
+  `/p2p/write_chunk`를 보낸다. 첫 청크(offset=0)에서 홀더가 `select_source(total_size)`로
+  큰 소스를 고르고(없으면 507) source_id를 응답하면, 이후 청크는 그 source_id로 같은
+  파일의 offset 위치에 이어 쓴다(`StorageSource.write_chunk`, seek 기반). 중간 청크
+  실패 시 홀더의 부분 파일을 `/p2p/delete`로 정리하고 OSError(조용한 손실 없음).
+- 읽기(`read_from_source` → `_read_chunked`): 평문 file_size가 4 MiB를 넘으면 범위
+  읽기(`/p2p/read_chunk`, offset/length)로 이어붙인다. 암호문 실제 크기는 평문과
+  다르므로 짧은 읽기(요청보다 적게 반환)를 EOF로 간주한다. 4 MiB 이하 파일은 기존
+  단일 경로(하위호환).
+- 각 청크는 기존 캐스케이드(직접 TCP → 홀펀칭 UDP → 릴레이)와 auth_token 인가를 그대로
+  탄다. 4 MiB는 rudp(≈3500 프래그먼트)·홀더 100MB 한계 내라 홀펀칭 UDP로 안정 전송.
+  스펙: `.kiro/specs/remote-chunked-transfer/`.
+
 ## UDP/릴레이 인가
 
 UDP와 릴레이 경로에는 서버 게이트키퍼가 없으므로, 파일 op 요청 본문에 소유자

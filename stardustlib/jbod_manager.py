@@ -417,7 +417,7 @@ class JBODManager:
                 )
 
         encrypted_data = remote.read_from_source(
-            metadata.physical_path, metadata.source_id
+            metadata.physical_path, metadata.source_id, metadata.file_size
         )
 
         if self.encryption_engine is not None:

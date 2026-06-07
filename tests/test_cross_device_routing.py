@@ -68,7 +68,7 @@ class _FakeRemote:
             self._active = self._refresh_to
         return self._active
 
-    def read_from_source(self, physical_path, source_id):
+    def read_from_source(self, physical_path, source_id, file_size=None):
         self.calls.append((physical_path, source_id))
         return self._data
 

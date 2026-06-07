@@ -21,6 +21,10 @@ from stardustlib.storage_source import StorageSource
 
 logger = logging.getLogger(__name__)
 
+# 리모트 전송 청크 크기(4 MiB). rudp 단일 메시지 한계(frag_count u16 × 1200B ≈
+# 78.6MB)와 홀더 MAX_WRITE_SIZE(100MB) 내. 이를 넘는 파일은 청크로 나눠 전송한다.
+REMOTE_CHUNK_SIZE = 4 * 1024 * 1024
+
 
 class _EventLoopThread:
     """백그라운드 스레드에서 asyncio 이벤트 루프를 실행한다.
@@ -220,14 +224,19 @@ class RemoteSource(StorageSource):
         return self.read_from_source(physical_path, None)
 
     def read_from_source(
-        self, physical_path: str, source_id: str | None
+        self, physical_path: str, source_id: str | None,
+        file_size: int | None = None,
     ) -> bytes:
         """원격 디바이스의 특정 소스(source_id)에서 파일을 읽는다.
 
         source_id가 None이면 원격 첫 소스를 사용한다(구버전 호환).
         디바이스 단위 라우팅(Device_Router)에서 원격 소스 ID를 지정해 호출한다.
+        file_size(평문 크기)가 REMOTE_CHUNK_SIZE를 초과하면(암호문도 초과) 범위 분할
+        읽기로 받아 한계(rudp/100MB)를 피한다. 그 이하는 단일 read(하위호환).
         """
         self._check_active()
+        if file_size is not None and file_size > REMOTE_CHUNK_SIZE:
+            return self._read_chunked(physical_path, source_id)
         payload: dict[str, Any] = {"physical_path": physical_path}
         if source_id is not None:
             payload["source_id"] = source_id
@@ -237,9 +246,40 @@ class RemoteSource(StorageSource):
         # 응답 본문에서 base64 디코딩된 data를 반환
         return base64.b64decode(result["data"])
 
+    def _read_chunked(
+        self, physical_path: str, source_id: str | None
+    ) -> bytes:
+        """REMOTE_CHUNK_SIZE 단위 범위 읽기로 전체를 이어붙인다.
+
+        암호문 실제 크기를 모르므로(평문 file_size와 다름) 짧은 읽기(요청보다 적게
+        반환)를 EOF로 간주한다. 정확히 배수면 마지막에 빈 청크 1회로 종료한다.
+        """
+        parts: list[bytes] = []
+        offset = 0
+        while True:
+            payload: dict[str, Any] = {
+                "physical_path": physical_path,
+                "offset": offset,
+                "length": REMOTE_CHUNK_SIZE,
+            }
+            if source_id is not None:
+                payload["source_id"] = source_id
+            result = self._io.run_coroutine(
+                self._p2p_request("/p2p/read_chunk", payload)
+            )
+            chunk = base64.b64decode(result["data"])
+            parts.append(chunk)
+            offset += len(chunk)
+            if len(chunk) < REMOTE_CHUNK_SIZE:
+                break
+        return b"".join(parts)
+
     def write(self, physical_path: str, data: bytes) -> None:
-        """P2P POST /p2p/write 요청으로 파일을 기록한다."""
+        """P2P POST /p2p/write 요청으로 파일을 기록한다(대용량은 청크 분할)."""
         self._check_active()
+        if len(data) > REMOTE_CHUNK_SIZE:
+            self._push_chunked(physical_path, data)
+            return
         encoded = base64.b64encode(data).decode("ascii")
         self._io.run_coroutine(
             self._p2p_request(
@@ -251,10 +291,12 @@ class RemoteSource(StorageSource):
     def push_blob(self, physical_path: str, data: bytes) -> str:
         """at-rest 암호문 블록을 원격에 기록하고 사용된 원격 source_id를 반환한다.
 
-        evacuate(스토리지 분리 시 파일을 원격으로 이동)에서 사용한다. 데이터는 이미
-        암호문이므로 재암호화하지 않는다(zero-knowledge 유지).
+        스필오버/evacuate에서 사용한다. 데이터는 이미 암호문이므로 재암호화하지 않는다
+        (zero-knowledge 유지). REMOTE_CHUNK_SIZE 초과면 청크로 나눠 push한다.
         """
         self._check_active()
+        if len(data) > REMOTE_CHUNK_SIZE:
+            return self._push_chunked(physical_path, data)
         encoded = base64.b64encode(data).decode("ascii")
         result = self._io.run_coroutine(
             self._p2p_request(
@@ -263,6 +305,43 @@ class RemoteSource(StorageSource):
             )
         )
         return result.get("source_id", "")
+
+    def _push_chunked(self, physical_path: str, data: bytes) -> str:
+        """대용량 데이터를 REMOTE_CHUNK_SIZE 청크로 순차 push하고 source_id를 반환한다.
+
+        첫 청크(offset=0)에서 홀더가 total_size로 소스를 선택하고 source_id를 응답하면,
+        이후 청크는 그 source_id로 같은 파일에 이어 쓴다. 중간 실패 시 홀더의 부분
+        파일을 삭제(베스트에포트)하고 예외를 전파한다(조용한 손실 없음).
+        """
+        total = len(data)
+        source_id = ""
+        try:
+            for offset in range(0, total, REMOTE_CHUNK_SIZE):
+                chunk = data[offset:offset + REMOTE_CHUNK_SIZE]
+                payload: dict[str, Any] = {
+                    "physical_path": physical_path,
+                    "data": base64.b64encode(chunk).decode("ascii"),
+                    "offset": offset,
+                    "total_size": total,
+                }
+                if source_id:
+                    payload["source_id"] = source_id
+                result = self._io.run_coroutine(
+                    self._p2p_request("/p2p/write_chunk", payload)
+                )
+                if not source_id:
+                    source_id = result.get("source_id", "")
+        except Exception:
+            try:
+                self._io.run_coroutine(
+                    self._p2p_request(
+                        "/p2p/delete", {"physical_path": physical_path}
+                    )
+                )
+            except Exception:  # noqa: BLE001 — 정리 실패는 무시
+                pass
+            raise
+        return source_id
 
     def delete(self, physical_path: str) -> None:
         """P2P POST /p2p/delete 요청으로 파일을 삭제한다."""
@@ -416,6 +495,8 @@ class RemoteSource(StorageSource):
     _ENDPOINT_OP = {
         "/p2p/read": "read",
         "/p2p/write": "write",
+        "/p2p/write_chunk": "write_chunk",
+        "/p2p/read_chunk": "read_chunk",
         "/p2p/delete": "delete",
         "/p2p/list": "list",
         "/p2p/exists": "exists",
