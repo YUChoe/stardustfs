@@ -67,16 +67,20 @@ class CLISession:
         )
 
     @classmethod
-    def open(cls, config_path: str) -> "CLISession":
+    def open(cls, config_path: str, *, read_only: bool = False) -> "CLISession":
         """설정을 로드하고 로컬 코어만 조립한다 (서버 접속 없음).
 
-        실패 시 _build_core가 sys.exit(1)을 호출한다.
+        read_only=True이면 루프백 FAT 이미지를 읽기 전용으로 연다(조회·용량 표시용).
+        쓰기는 데몬 단독이므로, GUI/CLI 조회 세션은 read_only로 열어 같은 FAT 이미지를
+        데몬과 동시에 rw로 여는 충돌을 피한다. 실패 시 _build_core가 sys.exit(1) 호출.
         """
         # 순환 import 방지를 위해 함수 내부에서 import (stardustfs가 cli를 호출)
         from stardustfs import _build_core
 
         config = ConfigLoader(config_path).load()
-        jbod_manager, metadata_store, _enc, _db_key = _build_core(config)
+        jbod_manager, metadata_store, _enc, _db_key = _build_core(
+            config, read_only=read_only
+        )
         return cls(jbod_manager, metadata_store)
 
     @classmethod

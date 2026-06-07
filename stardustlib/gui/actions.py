@@ -107,11 +107,69 @@ _offline_cache: dict[str, "object"] = {}
 
 
 def _offline_session(config_path: str):
+    """조회·용량 표시용 캐시 세션. 루프백 FAT 이미지를 read_only로 연다.
+
+    쓰기는 데몬 단독이므로, 조회 세션이 같은 이미지를 rw로 열어 데몬과 충돌하는 것을
+    막는다(스토리지 생성 직후 데몬 reload와의 동시 rw 충돌 방지). evacuate처럼 쓰기가
+    필요한 경우는 _rw_session을 쓴다.
+    """
     session = _offline_cache.get(config_path)
     if session is None:
-        session = CLISession.open(config_path)
+        session = CLISession.open(config_path, read_only=True)
         _offline_cache[config_path] = session
     return session
+
+
+def _rw_session(config_path: str):
+    """쓰기 가능한 1회용(비캐시) 오프라인 세션(evacuate 등). 호출자가 close 한다.
+
+    주의: 데몬이 같은 소스를 쓰고 있으면 충돌할 수 있어 호출 전 daemon 정지 권장.
+    """
+    return CLISession.open(config_path, read_only=False)
+
+
+def _fat_ready(path: str) -> bool:
+    """루프백 FAT 이미지가 준비(포맷 완료)됐는지 read_only 프로브로 확인한다.
+
+    파일이 없거나(추가 직후, 데몬 미생성) 아직 유효한 FAT가 아니면(mkfs 진행 중) False.
+    read_only 개방이라 데몬의 rw 사용과 동시에 열어도 손상되지 않는다.
+    """
+    if not os.path.isfile(path):
+        return False
+    try:
+        from pyfatfs.PyFatFS import PyFatFS
+
+        probe = PyFatFS(path, read_only=True)
+        probe.close()
+        return True
+    except Exception:  # noqa: BLE001 — 비-FAT/포맷 중
+        return False
+
+
+def storage_initializing(config_path: str) -> bool:
+    """초기화 중(아직 준비 안 된) 로컬 루프백 소스가 하나라도 있으면 True.
+
+    스토리지 추가 직후 데몬이 FAT 이미지를 생성·포맷하는 동안 True가 되며, 이때
+    업로드/다운로드를 막아 반쯤 만들어진 소스로의 전송을 방지한다.
+    """
+    for s in list_sources(config_path):
+        if s.get("type") == "loopback" and not _fat_ready(s.get("path", "")):
+            return True
+    return False
+
+
+def _evacuate_offline(config_path: str, source_id: str) -> dict:
+    """비캐시 rw 세션으로 evacuate를 수행한다(쓰기 필요).
+
+    같은 프로세스의 read_only 캐시 세션이 이미지를 잡고 있지 않도록 먼저 무효화하고,
+    rw 세션으로 이동 후 닫는다.
+    """
+    invalidate(config_path)
+    session = _rw_session(config_path)
+    try:
+        return session.jbod.evacuate_source(source_id)
+    finally:
+        session.close()
 
 
 def invalidate(config_path: str | None = None) -> None:
@@ -210,6 +268,23 @@ def add_source(
     return entry["id"]
 
 
+def create_storage_image(config_path: str, source_id: str) -> None:
+    """루프백 소스의 FAT 이미지를 생성·포맷한다(준비 완료). 이미 FAT면 마운트만.
+
+    조회 세션은 read_only라 이미지를 만들지 못하므로, 추가 시점에 1회용 rw 세션으로
+    명시적으로 포맷해 '초기화 중'을 즉시 '준비됨'으로 만든다(데몬 reload 타이밍에
+    의존하지 않음). 워커 스레드에서 호출한다(대용량 포맷이 메인 루프를 막지 않도록).
+    """
+    from stardustlib.storage_source import LoopbackSource
+
+    for s in list_sources(config_path):
+        if s.get("id") == source_id and s.get("type") == "loopback":
+            src = LoopbackSource(source_id, s["path"], int(s["size"]))
+            src.initialize()  # 없거나 비-FAT면 포맷, 유효 FAT면 마운트
+            src.close()       # rw 핸들 해제(데몬이 마운트하도록)
+            return
+
+
 def remove_source(config_path: str, source_id: str) -> None:
     """source_id 소스를 설정에서 제거한다(물리 데이터는 삭제하지 않음)."""
     sources = [s for s in list_sources(config_path) if s.get("id") != source_id]
@@ -232,6 +307,11 @@ def detach_source(config_path: str, source_id: str) -> dict:
     server_url = server.get("url") if isinstance(server, dict) else None
     use_online = bool(server_url) and is_logged_in(config_path)
 
+    # 분리 성공 시 빈 FAT 컨테이너 이미지를 삭제하기 위해 경로를 미리 확보한다.
+    entry = next(
+        (s for s in list_sources(config_path) if s.get("id") == source_id), None
+    )
+
     report: dict
     if use_online:
         async def aop(s):
@@ -242,17 +322,40 @@ def detach_source(config_path: str, source_id: str) -> dict:
         try:
             report = asyncio.run(_run_online(config_path, aop, sync=True))
         except Exception:  # noqa: BLE001 — 온라인 불가 시 로컬만
-            report = _offline_session(config_path).jbod.evacuate_source(source_id)
+            report = _evacuate_offline(config_path, source_id)
     else:
-        report = _offline_session(config_path).jbod.evacuate_source(source_id)
+        report = _evacuate_offline(config_path, source_id)
 
     detached = False
     if report.get("ok"):
         remove_source(config_path, source_id)
         invalidate(config_path)  # 소스 목록 변경 → 다음 조회 시 코어 재빌드
         detached = True
+        # 비워진 루프백 FAT 컨테이너 이미지 경로를 보고한다. 실제 삭제는 데몬이
+        # 핸들을 놓은 뒤(호출자의 daemon reload 이후) delete_storage_image로 수행한다.
+        if entry and entry.get("type") == "loopback":
+            report["image_path"] = entry.get("path")
     report["detached"] = detached
     return report
+
+
+def delete_storage_image(path: str, attempts: int = 12, delay: float = 0.3) -> bool:
+    """분리된 루프백 FAT 이미지 파일을 삭제한다(공간 회수).
+
+    데몬이 rw 핸들을 놓을 때까지 Windows에서 삭제가 막힐 수 있어, 짧게 재시도한다.
+    삭제 성공/이미 없음이면 True, 끝내 못 지우면 False.
+    """
+    import time
+
+    if not path or not os.path.isfile(path):
+        return True
+    for _ in range(attempts):
+        try:
+            os.remove(path)
+            return True
+        except OSError:
+            time.sleep(delay)
+    return not os.path.isfile(path)
 
 
 # --- 온라인(서버/원격) ---
@@ -367,6 +470,7 @@ def storage_overview(config_path: str) -> dict:
             "path": getattr(s, "path", ""),
             "total": total,
             "available": available,
+            "ready": bool(getattr(s, "is_active", False)),
         })
 
     config = ConfigLoader(config_path).load()

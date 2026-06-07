@@ -643,9 +643,22 @@ class StardustApp:
 
     # --- 전송/쓰기 ---
 
+    def _transfers_blocked(self) -> bool:
+        """스토리지 초기화 중이면 안내 후 True를 반환해 전송을 막는다.
+
+        스토리지 추가 직후 데몬이 FAT 이미지를 생성·포맷하는 동안, 반쯤 만들어진
+        소스로의 업로드/다운로드를 방지한다.
+        """
+        if self.config_path and actions.storage_initializing(self.config_path):
+            messagebox.showinfo(self.t["app_title"], self.t["transfer_init_block"])
+            return True
+        return False
+
     def _upload(self) -> None:
         if not self.config_path:
             messagebox.showwarning(self.t["app_title"], self.t["need_config"])
+            return
+        if self._transfers_blocked():
             return
         from stardustlib.gui.upload_dialog import UploadDialog
 
@@ -655,6 +668,8 @@ class StardustApp:
         row = self._selected()
         if not row or row["type"] != "file":
             messagebox.showinfo(self.t["app_title"], self.t["download_pick"])
+            return
+        if self._transfers_blocked():
             return
         remote = self._join(row["name"])
         local = filedialog.asksaveasfilename(
@@ -798,14 +813,18 @@ class StardustApp:
 
         def reload():
             def done(ok, ov):
+                if not tree.winfo_exists():
+                    return  # 다이얼로그가 닫힌 뒤 늦게 도착한 콜백 무시
                 tree.delete(*tree.get_children())
                 row_meta.clear()
                 remove_btn.config(state="disabled")  # 선택 해제 → 제거 불가
                 if not ok:
                     return
                 for s in ov.get("local", []):
+                    status = (t["src_ready"] if s.get("ready")
+                              else t["src_initializing"])
                     iid = tree.insert("", "end", values=(
-                        t["scope_local"], s.get("id"), "-",
+                        t["scope_local"], s.get("id"), status,
                         _cap(s), s.get("path", "")))
                     row_meta[iid] = {"scope": "local", "id": s.get("id")}
                 for d in ov.get("remote", []):
@@ -829,13 +848,31 @@ class StardustApp:
             if not mb:
                 return
             try:
-                actions.add_source(cfg, "loopback", path, size=mb * 1024 * 1024)
+                sid = actions.add_source(cfg, "loopback", path, size=mb * 1024 * 1024)
             except Exception as e:  # noqa: BLE001
                 messagebox.showerror(t["err"], str(e))
                 return
-            self._after_write()  # 캐시 세션 무효화 → 새 소스 마운트·상태바 반영
-            reload()             # 재빌드된 세션 기준으로 목록 갱신
-            self._reload_daemon()  # daemon이 새 소스를 remount·재신고하도록 리로드
+            reload()  # 즉시 갱신 — 새 소스가 '초기화 중'으로 표시됨
+            self._set_status(t["src_init_busy"])
+
+            # FAT 이미지 포맷은 대용량일 수 있어 워커에서 수행(메인 루프 비차단).
+            # 포맷이 끝나면 캐시 무효화→재갱신으로 '준비됨'을 반영하고, 데몬이 기존
+            # FAT를 마운트하도록 reload 신호를 보낸다(포맷 후라 동시 rw 충돌 없음).
+            def _fmt():
+                actions.create_storage_image(cfg, sid)
+                actions.invalidate(cfg)
+
+            def _fmt_done(ok, payload):
+                if not ok:
+                    self._set_status(self.t["err_status"].format(msg=payload))
+                    messagebox.showerror(self.t["err"], str(payload))
+                    return
+                self._set_status(self.t["ready"])
+                self._reload_daemon()
+                reload()
+                self.refresh()  # 메인 목록/용량도 갱신
+
+            self.worker.submit(_fmt, _fmt_done)
 
         def remove():
             sel = tree.selection()
@@ -862,6 +899,13 @@ class StardustApp:
                     self.refresh()
                     # daemon이 분리된 소스를 더는 mount·재신고하지 않도록 리로드
                     self._reload_daemon()
+                    # 데몬이 핸들을 놓은 뒤 빈 FAT 컨테이너 이미지를 삭제(공간 회수).
+                    img = report.get("image_path")
+                    if img:
+                        self.worker.submit(
+                            lambda: actions.delete_storage_image(img),
+                            lambda *_a: None,
+                        )
                 else:
                     messagebox.showwarning(t["src_remove"], t["src_detach_blocked"].format(
                         unmoved=len(report.get("unmoved", []))))

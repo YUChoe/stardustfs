@@ -313,10 +313,35 @@ def test_detach_source_removes_from_config_when_evacuated(tmp_path, monkeypatch)
     class _FakeSession:
         jbod = _FakeJbod()
 
-    monkeypatch.setattr(actions, "_offline_session", lambda c: _FakeSession())
+        def close(self):
+            pass
+
+    # detach(오프라인)는 쓰기용 _rw_session으로 evacuate한다.
+    monkeypatch.setattr(actions, "_rw_session", lambda c: _FakeSession())
     report = actions.detach_source(cfg, sid)
     assert report["detached"] is True
     assert all(s.get("id") != sid for s in actions.list_sources(cfg))
+
+
+def test_detach_deletes_empty_loopback_image(tmp_path):
+    # 빈 루프백을 분리하면 image_path를 보고하고, delete_storage_image가 파일을 지운다.
+    cfg = actions.create_config(str(tmp_path / "s3"), "", "dev", generate_key=True)
+    img = str(tmp_path / "v3.img")
+    sid = actions.add_source(cfg, "loopback", img, size=10 * 1024 * 1024)
+    actions.create_storage_image(cfg, sid)  # 실제 FAT 이미지 생성
+    assert os.path.isfile(img)
+
+    report = actions.detach_source(cfg, sid)  # 비어 있으므로 evacuate ok
+    assert report["detached"] is True
+    assert report.get("image_path") == img
+    assert all(s.get("id") != sid for s in actions.list_sources(cfg))  # config 제거
+
+    assert actions.delete_storage_image(img) is True
+    assert not os.path.isfile(img)  # 컨테이너 이미지 삭제됨
+
+
+def test_delete_storage_image_missing_ok(tmp_path):
+    assert actions.delete_storage_image(str(tmp_path / "nope.img")) is True
 
 
 def test_detach_source_kept_when_unmoved(tmp_path, monkeypatch):
@@ -331,7 +356,10 @@ def test_detach_source_kept_when_unmoved(tmp_path, monkeypatch):
     class _FakeSession:
         jbod = _FakeJbod()
 
-    monkeypatch.setattr(actions, "_offline_session", lambda c: _FakeSession())
+        def close(self):
+            pass
+
+    monkeypatch.setattr(actions, "_rw_session", lambda c: _FakeSession())
     report = actions.detach_source(cfg, sid)
     assert report["detached"] is False
     assert any(s.get("id") == sid for s in actions.list_sources(cfg))  # 유지
