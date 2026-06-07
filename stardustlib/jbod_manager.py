@@ -197,6 +197,23 @@ class JBODManager:
                 unmoved.append(meta.virtual_path)
         return {"ok": not unmoved, "moved": moved, "unmoved": unmoved}
 
+    @staticmethod
+    def _ensure_remote_active(remote) -> bool:
+        """리모트가 활성이면 True. 비활성이면 refresh(재라우팅)로 재활성화를 시도한다.
+
+        RemoteSource는 시작 시 1회 마운트되므로, 그때 오프라인이던 디바이스가 이후
+        온라인이 돼도 비활성으로 남는다. 전송 직전 refresh로 재라우팅해 살린다.
+        """
+        if getattr(remote, "is_active", False):
+            return True
+        refresh = getattr(remote, "refresh", None)
+        if refresh is None:
+            return False
+        try:
+            return bool(refresh(force=True))
+        except Exception:  # noqa: BLE001 — 재라우팅 실패 시 비활성 취급
+            return False
+
     def _evacuate_to_remote(self, meta, src) -> bool:
         """로컬 용량 부족 파일을 온라인 리모트 디바이스로 옮긴다(같은 사용자).
 
@@ -207,7 +224,7 @@ class JBODManager:
             return False
         blob = src.read(meta.physical_path)
         for device_id, remote in self._remote_devices.items():
-            if not getattr(remote, "is_active", False):
+            if not self._ensure_remote_active(remote):
                 continue
             try:
                 new_phys = self._generate_physical_path(meta.virtual_path)
@@ -243,7 +260,7 @@ class JBODManager:
         if not self._remote_devices:
             return False
         for device_id, remote in self._remote_devices.items():
-            if not getattr(remote, "is_active", False):
+            if not self._ensure_remote_active(remote):
                 continue
             try:
                 new_phys = self._generate_physical_path(virtual_path)

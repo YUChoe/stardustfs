@@ -137,6 +137,36 @@ def test_write_spills_over_to_remote_when_local_full(tmp_path):
     store.close()
 
 
+def test_write_to_remote_refreshes_inactive_remote(tmp_path):
+    # 시작 시 오프라인(비활성)이던 리모트가 전송 직전 refresh로 재활성화돼 사용된다.
+    jbod, store = _jbod(tmp_path, [])
+
+    class _ReactivatingRemote:
+        def __init__(self):
+            self.is_active = False
+            self.source_id = "dev-b-src"
+            self.stored = {}
+            self.refreshed = False
+
+        def refresh(self, *, force=False):
+            self.is_active = True
+            self.refreshed = True
+            return True
+
+        def push_blob(self, physical_path, data):
+            self.stored[physical_path] = data
+            return self.source_id
+
+    rem = _ReactivatingRemote()
+    jbod.register_remote_device("dev-b", rem)
+    jbod.write_file("/f", b"reactivated")
+    assert rem.refreshed is True              # 재라우팅 시도됨
+    meta = store.lookup("/f")
+    assert meta.device_id == "dev-b"          # 재활성 리모트로 기록
+    assert b"reactivated" in rem.stored.values()
+    store.close()
+
+
 def test_write_raises_when_local_full_and_no_reachable_remote(tmp_path):
     from stardustlib.exceptions import InsufficientStorageError
 
