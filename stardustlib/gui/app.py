@@ -591,16 +591,12 @@ class StardustApp:
     # --- 전송/쓰기 ---
 
     def _upload(self) -> None:
-        local = filedialog.askopenfilename(title=self.t["upload_pick"])
-        if not local:
+        if not self.config_path:
+            messagebox.showwarning(self.t["app_title"], self.t["need_config"])
             return
-        remote = self._join(os.path.basename(local))
-        cfg = self.config_path
-        self._submit(
-            lambda: actions.put_file(cfg, local, remote),
-            lambda _n: self._after_write(),
-            self.t["uploading"].format(name=os.path.basename(local)),
-        )
+        from stardustlib.gui.upload_dialog import UploadDialog
+
+        UploadDialog(self)
 
     def _download(self) -> None:
         row = self._selected()

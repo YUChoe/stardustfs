@@ -26,6 +26,14 @@ _REPO_ROOT = os.path.dirname(
 )
 
 
+class RemotePathExists(OSError):
+    """업로드 대상 가상 경로에 이미 파일이 있어 덮어쓰기를 거부함(GUI 업로드 전용).
+
+    코어 write_file의 덮어쓰기 의미는 CLI/데몬/동기화/복제에서 정상적으로 쓰이므로,
+    같은 경로 재업로드 차단은 GUI put_file 경로에서만 가드한다.
+    """
+
+
 # --- 초기 설정 생성 (닭-달걀 해소: 설정이 없을 때 새로 만든다) ---
 
 def create_config(
@@ -552,6 +560,10 @@ def _delegate(config_path: str, op: str, virtual_path: str, local_path: str):
 
 def put_file(config_path: str, local: str, remote: str) -> int:
     rv = _vpath(remote)
+    # 같은 가상 경로가 이미 있으면 덮어쓰지 않고 알린다(WAL이라 데몬이 커밋한 최신
+    # 메타데이터도 읽힌다). 호출자(업로드 다이얼로그)가 RemotePathExists를 처리한다.
+    if _offline_session(config_path).metadata.lookup(rv) is not None:
+        raise RemotePathExists(rv)
     # 데몬 위임 우선(로컬 만석 시 홀펀칭 리모트 스필오버). 미실행이면 직접 수행.
     res = _delegate(config_path, "put", rv, local)
     if res is not None:
