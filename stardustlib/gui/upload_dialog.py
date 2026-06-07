@@ -52,7 +52,8 @@ class UploadDialog:
         self.win = win
         win.title(t["upload_dlg_title"])
         win.geometry("520x480")
-        win.transient(self.app.root)
+        # 모달: 닫기 전까지 메인 창 입력 차단.
+        self.app.make_modal(win, self.app.root)
 
         ttk.Label(win, text=t["upload_dlg_to"].format(path=self.dest)).pack(
             anchor="w", padx=10, pady=(10, 4)

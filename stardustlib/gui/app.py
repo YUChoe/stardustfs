@@ -367,6 +367,23 @@ class StardustApp:
     def _enable(btn, on: bool) -> None:
         btn.state(["!disabled"] if on else ["disabled"])
 
+    @staticmethod
+    def make_modal(win: tk.Toplevel, parent: tk.Misc) -> None:
+        """창을 모달로 만든다 — 닫기 전까지 parent(메인 창) 입력을 차단한다.
+
+        grab_set은 창이 아직 보이지 않으면 TclError(window not viewable)를 낼 수
+        있으므로, 보일 때까지 지연 재시도한다. 창이 닫히면 grab은 자동 해제된다.
+        """
+        win.transient(parent)
+
+        def _grab() -> None:
+            try:
+                win.grab_set()
+            except tk.TclError:
+                win.after(50, _grab)
+
+        win.after(0, _grab)
+
     def _refresh_login_state(self) -> None:
         """로그인 여부에 따라 로그인/로그아웃 버튼 활성 상태를 갱신한다."""
         if not self.config_path:
@@ -712,6 +729,7 @@ class StardustApp:
         cfg = self.config_path
         win = tk.Toplevel(self.root)
         self._sources_win = win
+        self.make_modal(win, self.root)
         win.title(t["sources_title"])
         win.geometry("640x360")
         win.minsize(520, 280)
@@ -855,6 +873,7 @@ class StardustApp:
         t = self.t
         win = tk.Toplevel(self.root)
         self._devices_win = win
+        self.make_modal(win, self.root)
         win.title(t["devices_title"])
         win.geometry("440x260")
         tree = ttk.Treeview(win, columns=("id", "name", "online", "self"),
