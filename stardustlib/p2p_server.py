@@ -757,12 +757,15 @@ class P2PServer:
         return data
 
     def _source_data_root(self, source) -> str:
-        """소스의 실제 데이터 루트를 반환한다.
+        """소스의 실제 데이터 루트를 반환한다(traversal 검증 기준).
 
-        LoopbackSource는 동반 디렉토리(path + '.d')에 실제 파일을 저장하므로
-        traversal 검증의 기준 루트도 그 디렉토리여야 한다. 그 외 소스는
-        source.path를 사용한다.
+        - FAT 이미지 백엔드 LoopbackSource(`_image_backed`)는 파일이 이미지 내부에
+          있어 호스트 경로 containment가 무의미하므로 ""(빈 문자열)을 반환해 검증에서
+          containment를 건너뛰게 한다(".." 검사는 유지).
+        - 그 외(레거시 동반 디렉토리 등)는 해당 루트, 기본은 source.path.
         """
+        if getattr(source, "_image_backed", False):
+            return ""
         companion = getattr(source, "_companion_dir", None)
         if companion:
             return companion
@@ -799,6 +802,11 @@ class P2PServer:
         # ".." 세그먼트 검사
         if ".." in physical_path.replace("\\", "/").split("/"):
             return 400, {"error": "Path traversal detected"}
+
+        # FAT 이미지 백엔드("" 신호): 이미지가 경로를 샌드박스하므로 호스트 루트
+        # containment 검사를 건너뛴다(".." 검사는 위에서 수행).
+        if source_root == "":
+            return None
 
         # 정규화 후 소스 루트 내부인지 확인
         root = source_root if source_root is not None else self._source_root

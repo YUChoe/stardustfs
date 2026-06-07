@@ -132,8 +132,24 @@ class JBODManager:
         기존 참조가 즉시 새 소스를 사용한다(객체 교체 아님).
         """
         remote = [s for s in self.sources if getattr(s, "is_remote", False)]
+        old_local = [s for s in self.sources if not getattr(s, "is_remote", False)]
         self.sources = list(new_local_sources) + remote
         self._source_map = {s.source_id: s for s in self.sources}
+        # 옛 로컬 소스(FAT 이미지 핸들 등)를 깨끗이 닫는다.
+        for s in old_local:
+            try:
+                s.close()
+            except Exception:  # noqa: BLE001 — 종료 경로
+                pass
+
+    def close_local_sources(self) -> None:
+        """로컬 소스 핸들을 정리한다(종료/세션 close 시 FAT 이미지 클린 언마운트)."""
+        for s in self.sources:
+            if not getattr(s, "is_remote", False):
+                try:
+                    s.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _generate_physical_path(self, virtual_path: str) -> str:
         """가상 경로에서 물리 경로를 생성한다.

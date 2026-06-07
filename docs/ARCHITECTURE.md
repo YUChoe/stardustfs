@@ -50,15 +50,20 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
 - `metadata_store.py`: SQLite 메타데이터(SQLCipher 가능 시 암호화, 아니면 평문 폴백).
   WAL 모드. files 테이블에 device_id/version/sync_status/deleted(tombstone).
 - `storage_source.py`: `DirectorySource`/`LoopbackSource`(로컬) + `is_remote` 속성.
-  LoopbackSource는 `<path>.d/` 동반 디렉토리에 `<hex32>_<name>`으로 저장. 신규 소스
+  LoopbackSource는 `<path>`를 고정 크기 FAT 이미지(pyfatfs)로 포맷해 파일을 이미지
+  내부에 저장한다(`mount -o loop` 유사, 동반 디렉토리 폐지). size로 용량이 실제
+  한정되고, 쓰기 시 FAT 공간 부족은 OSError(insufficient)로 집행한다. 쓰기는 데몬
+  단독(작업 큐 직렬화), 조회 세션은 read_only로 열 수 있다. 비-FAT 기존 `.img`는
+  마이그레이션 없이 재포맷(데이터 폐기 — 사용자가 사전에 비운다고 가정). 신규 소스
   추가(attach)는 loopback만 허용(디렉터리 타입 폐지, 기존 설정은 하위호환 로드).
+  스펙: `.kiro/specs/loopback-fat-image/`.
 - 스토리지 detach(분리)는 "evacuate 후 분리": `jbod.evacuate_source`가 그 소스의 활성
   파일을 남은 로컬 소스로 at-rest 암호문 그대로 이동(대상 기록 성공 후 원본 삭제=무손실)
   하고, 모든 파일이 이동된 경우에만 설정에서 소스를 제거한다(원자적). 로컬 용량 부족분은
   온라인 리모트 디바이스(같은 사용자)로 분산 이동한다(`_evacuate_to_remote`: 암호문
   블록을 /p2p/write로 push → 메타 device_id/source_id 갱신 → 원본 삭제). 도달 가능한
   대상이 없으면 미이동으로 남겨 detach 보류(타 사용자 리모트는 후속).
-- JBOD 스필오버(쓰기): 신규 파일이 로컬 소스 어디에도 안 들어가면(`select_source`가
+- 스토리지 스필오버(쓰기): 신규 파일이 로컬 소스 어디에도 안 들어가면(`select_source`가
   InsufficientStorageError) `_write_to_remote`로 온라인 리모트 디바이스(같은 계정)에
   암호문을 push하고 메타를 그 디바이스 소유로 등록한다(읽기는 기존 원격 라우팅). 도달
   가능한 리모트가 없으면 무손실 에러. 로컬 소스 간 분산은 select_source가 여유 최대를

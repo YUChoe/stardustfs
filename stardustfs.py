@@ -249,6 +249,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
             sys.exit(1)
 
         async def _cleanup() -> None:
+            jbod_manager.close_local_sources()
             metadata_store.close()
 
         from stardustlib import daemon
@@ -350,6 +351,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
             if p2p_server is not None:
                 await p2p_server.stop()
             await auth_client.close()
+            jbod_manager.close_local_sources()
             metadata_store.close()
 
         from stardustlib import daemon
@@ -377,6 +379,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
 
         async def _cleanup() -> None:
             await auth_client.close()
+            jbod_manager.close_local_sources()
             metadata_store.close()
 
         from stardustlib import daemon
@@ -471,6 +474,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
             await _restore_key_from_server(auth_client, key_file_path, logger)
             # key_file 교체 후 로컬 스토리지 재초기화
             logger.info("key 복원 완료, 로컬 스토리지 재초기화...")
+            jbod_manager.close_local_sources()
             metadata_store.close()
             jbod_manager, metadata_store, encryption_engine, db_key = (
                 _build_core(config)
@@ -670,6 +674,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
         if p2p_server is not None:
             await p2p_server.stop()
         await auth_client.close()
+        jbod_manager.close_local_sources()
         metadata_store.close()
 
     async def _on_reload() -> None:
@@ -789,10 +794,11 @@ async def _eviction_loop(jbod_manager, repl_mgr, cfg: dict) -> None:
             logger.warning("축출 루프 오류: %s", e)
 
 
-def _build_local_sources(config: dict) -> list:
+def _build_local_sources(config: dict, *, read_only: bool = False) -> list:
     """config의 로컬 소스(directory/loopback)를 생성·initialize해 반환한다(remote 제외).
 
-    _build_core와 config 리로드(remount)가 공유한다.
+    _build_core와 config 리로드(remount)가 공유한다. read_only=True이면 루프백 FAT
+    이미지를 읽기 전용으로 연다(GUI/CLI 조회 세션 — 쓰기는 데몬 단독).
     """
     from stardustlib.storage_source import DirectorySource, LoopbackSource
 
@@ -802,7 +808,9 @@ def _build_local_sources(config: dict) -> list:
         if source_type == "directory":
             source = DirectorySource(cfg["id"], cfg["path"])
         elif source_type == "loopback":
-            source = LoopbackSource(cfg["id"], cfg["path"], cfg["size"])
+            source = LoopbackSource(
+                cfg["id"], cfg["path"], cfg["size"], read_only=read_only
+            )
         else:
             continue  # remote 타입은 건너뜀
         source.initialize()
@@ -810,7 +818,7 @@ def _build_local_sources(config: dict) -> list:
     return sources
 
 
-def _build_core(config: dict) -> tuple:
+def _build_core(config: dict, *, read_only: bool = False) -> tuple:
     """로컬 스토리지 핵심 컴포넌트를 조립해 반환한다 (WebDAV 비의존).
 
     기존 initializer.py의 Phase 3-6 로직을 재사용한다. WebDAV 앱 생성은 포함하지
@@ -898,7 +906,7 @@ def _build_core(config: dict) -> tuple:
     encryption_engine = EncryptionEngine(key)
 
     # 로컬 소스만 생성 (remote 제외)
-    sources = _build_local_sources(config)
+    sources = _build_local_sources(config, read_only=read_only)
 
     assert metadata_store is not None
     jbod_manager = JBODManager(sources, metadata_store, encryption_engine)

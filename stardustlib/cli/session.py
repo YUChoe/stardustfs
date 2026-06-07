@@ -227,6 +227,10 @@ class CLISession:
 
     def _close_metadata(self) -> None:
         try:
+            self.jbod.close_local_sources()
+        except Exception as e:  # noqa: BLE001 — 종료 경로, 로깅만
+            logger.debug("로컬 소스 종료 중 예외: %s", e)
+        try:
             self.metadata.close()
         except Exception as e:  # noqa: BLE001 — 종료 경로, 로깅만
             logger.debug("metadata_store 종료 중 예외: %s", e)
