@@ -1,0 +1,9 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="StardustFS mark">
+  <rect x="32" y="6" width="36.77" height="36.77" rx="6" transform="rotate(45 32 6)" stroke="#58a6ff" stroke-width="2.2" opacity="0.6"></rect>
+  <circle cx="32" cy="6" r="2.6" fill="#58a6ff"></circle>
+  <circle cx="58" cy="32" r="2.6" fill="#58a6ff"></circle>
+  <circle cx="32" cy="58" r="2.6" fill="#58a6ff"></circle>
+  <circle cx="6" cy="32" r="2.6" fill="#58a6ff"></circle>
+  <path d="M32 16 C33.2 26.4 37.6 30.8 48 32 C37.6 33.2 33.2 37.6 32 48 C30.8 37.6 26.4 33.2 16 32 C26.4 30.8 30.8 26.4 32 16 Z" fill="#79b8ff"></path>
+  <circle cx="32" cy="32" r="3.2" fill="#cfe3ff"></circle>
+</svg>

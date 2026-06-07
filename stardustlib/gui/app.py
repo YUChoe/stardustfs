@@ -16,7 +16,7 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from stardustlib.gui import actions, i18n, tray
+from stardustlib.gui import actions, i18n, theme, tray
 from stardustlib.gui.worker import Worker
 
 try:  # 현대적 플랫 테마(Windows 11 풍). 미설치 시 기본 ttk로 폴백.
@@ -54,11 +54,14 @@ class StardustApp:
         self._last_meta_mtime = 0.0
         self.lang = i18n.detect_lang()
         self.t = i18n.get_text(self.lang)
-        self.theme = "light"
+        # 디자인 시스템 기본은 Primer 다크다.
+        self.theme = "dark"
+        self._icon_photo = None  # 브랜드 마크 아이콘 참조(GC 방지)
 
         root.title(self.t["app_title"])
         root.geometry("900x620")
         root.minsize(760, 480)
+        self._icon_photo = theme.set_window_icon(root)
         self._apply_theme()
         self._build_menu()
         self.body = ttk.Frame(root)
@@ -122,6 +125,11 @@ class StardustApp:
             except Exception:  # noqa: BLE001
                 pass
         self._apply_font()
+        # 디자인 시스템(Primer) 팔레트를 sv_ttk 위에 재지정한다.
+        try:
+            theme.apply_palette(self.root, ttk.Style(), dark=self.theme == "dark")
+        except Exception:  # noqa: BLE001
+            pass
         self._apply_titlebar()
 
     def _apply_font(self) -> None:
@@ -165,8 +173,9 @@ class StardustApp:
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
                 hwnd, 20, ctypes.byref(flag), ctypes.sizeof(flag)
             )
-            # DWMWA_CAPTION_COLOR = 35 (Win11 22000+), COLORREF 0x00BBGGRR
-            color = ctypes.c_int(0x001C1C1C if dark else 0x00FAFAFA)
+            # DWMWA_CAPTION_COLOR = 35 (Win11 22000+), COLORREF 0x00BBGGRR.
+            # 다크는 Primer 캔버스(#0d1117 → BGR 0x171B0D).
+            color = ctypes.c_int(0x00171B0D if dark else 0x00FAFAFA)
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
                 hwnd, 35, ctypes.byref(color), ctypes.sizeof(color)
             )

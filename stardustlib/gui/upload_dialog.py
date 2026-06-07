@@ -15,7 +15,7 @@ import tkinter as tk
 from collections.abc import Iterable
 from tkinter import filedialog, ttk
 
-from stardustlib.gui import actions
+from stardustlib.gui import actions, theme
 
 
 def _human(n: int) -> str:
@@ -62,6 +62,7 @@ class UploadDialog:
         list_frame = ttk.Frame(win)
         list_frame.pack(fill="both", expand=False, padx=10)
         self.listbox = tk.Listbox(list_frame, height=7, selectmode="extended")
+        theme.style_listbox(self.listbox)
         sb = ttk.Scrollbar(
             list_frame, orient="vertical", command=self.listbox.yview
         )
@@ -84,6 +85,7 @@ class UploadDialog:
         log_frame = ttk.Frame(win)
         log_frame.pack(fill="both", expand=True, padx=10)
         self.log = tk.Text(log_frame, height=8, state="disabled", wrap="word")
+        theme.style_text(self.log)
         lsb = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
         self.log.configure(yscrollcommand=lsb.set)
         self.log.pack(side="left", fill="both", expand=True)
