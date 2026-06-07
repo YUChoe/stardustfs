@@ -35,15 +35,17 @@ def reason() -> str | None:
 
 
 def _make_image():
+    # 브랜드 다이아몬드 마크(theme._mark_image)를 트레이 아이콘으로 재사용한다.
+    from stardustlib.gui import theme
+
+    img = theme._mark_image(64)
+    if img is not None:
+        return img
+    # 폴백: 마크 생성 실패 시 브랜드 블루 원.
     from PIL import Image, ImageDraw
 
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    draw.ellipse((8, 8, 56, 56), fill=(74, 123, 255, 255))
-    try:
-        draw.text((25, 19), "S", fill=(255, 255, 255, 255))
-    except Exception:  # noqa: BLE001 — 폰트 없으면 원만 표시
-        pass
+    ImageDraw.Draw(img).ellipse((8, 8, 56, 56), fill=(88, 166, 255, 255))
     return img
 
 
