@@ -8,7 +8,8 @@
 StardustFS는 분산 암호화 파일시스템이다. 사용자는 여러 디바이스(PC)에서 같은 계정으로
 WebDAV를 통해 단일 파일시스템에 접근한다. 파일은 클라이언트에서 AES-256-GCM으로
 암호화되어 로컬 스토리지에 저장되고, 메타데이터는 중앙 서버를 통해 디바이스 간
-동기화된다. 디바이스 간 파일 전송은 P2P(직접 연결 또는 서버 릴레이)로 이뤄진다.
+동기화된다. 디바이스 간 파일 전송은 직접 TCP → 홀펀칭 UDP → 서버 릴레이의
+캐스케이드로 이뤄진다(상세 [TRANSPORT.md](./TRANSPORT.md)).
 
 핵심 보안 원칙: zero-knowledge. 서버는 파일 내용과 메타데이터 내용을 보지 못한다.
 서버가 다루는 것은 암호화된 불투명 blob과 정수 version뿐이다.
@@ -40,13 +41,16 @@ WebDAV를 통해 단일 파일시스템에 접근한다. 파일은 클라이언�
 - `storage_source.py`: `StorageSource` 추상 + `DirectorySource`/`LoopbackSource`.
   - LoopbackSource는 실제 파일을 `<path>.d/` 동반 디렉토리에 `<hex32>_<name>` 형식으로 저장
   - `is_remote` 속성: 로컬은 False, RemoteSource는 True
-- `remote_source.py`: 원격 디바이스 프록시. P2P 직접 연결 + 실패 시 릴레이 fallback.
+- `remote_source.py`: 원격 디바이스 프록시. 직접 TCP → 홀펀칭 UDP → 릴레이 캐스케이드.
   - `is_online=False`면 비활성 마운트, `refresh()`로 재네고시에이션(30초 throttle)
+- 홀펀칭 전송: `rudp.py`/`p2p_udp.py`/`holepunch_service.py`, GUI/CLI 위임은
+  `daemon_control.py` (상세 [TRANSPORT.md](./TRANSPORT.md))
 - `relay_client.py`: 요청자 측 릴레이(직접 연결 실패 시 서버 경유)
 - `relay_worker.py`: 대상 측 릴레이 워커(`/relay/poll` 루프 → P2PServer.dispatch)
 - `p2p_server.py`: aiohttp P2P 서버. `handle_*`는 인증 후 `_op_*` 호출, `dispatch(op, payload)`는 릴레이 워커용
 - `sync_client.py`: 메타데이터 동기화. 주기 폴링 + 버전 롱폴링(즉시 동기화) + CAS + orphan GC 트리거
-- `device_manager.py`: 디바이스 등록/heartbeat/UPnP/reflexive 공인 IP 보정
+- `device_manager.py`: 디바이스 등록/heartbeat/reflexive 공인 IP 보정(UPnP 폐지,
+  NAT 직접 연결은 홀펀칭이 담당)
 - `webdav_provider.py`: wsgidav 기반 WebDAV. 오프라인 원격 파일은 `.offline` placeholder
 
 ## 4. 완료된 작업 (시간순, 최신이 아래)
@@ -184,7 +188,8 @@ E2E 테스트는 롱폴/릴레이 미배포 서버에서는 자동 skip된다(�
 남은 항목(이관/후속):
 - 교차 사용자 릴레이 fallback: RelayHub가 same-user만 중개 → 허브 인가 모델 재설계
   (보안 민감)가 필요해 별도 스펙으로 분리. 현재 도달성은 직접+스웜(≥3)+홀펀칭.
-- 데이터 전송의 UDP 채널 전환(현 전송은 HTTP/TCP) + daemon 자동 랑데부 등록.
+- (완료) 데이터 전송의 UDP 채널 전환 + daemon 자동 랑데부 등록 — 홀펀칭 전송
+  캐스케이드(직접 TCP→홀펀칭 UDP→릴레이) e2e 검증(2026-06-07, [TRANSPORT.md](./TRANSPORT.md)).
 - 등급별 정책(MVP4), erasure coding(저장 효율).
 
 ### 알려진 한계

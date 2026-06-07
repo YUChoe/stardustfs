@@ -1,0 +1,107 @@
+# StardustFS 전송 계층 (Transport)
+
+디바이스 간 파일·복제본 전송이 NAT/방화벽 뒤에서도 동작하도록, StardustFS는
+직접 TCP → 홀펀칭 UDP → 서버 릴레이의 3단 캐스케이드를 사용한다. 이 문서는 전송
+경로, 홀펀칭 구성요소, 데몬 전송 위임, 스필오버 시 홀더 측 소스 선택을 정리한다.
+
+상위 아키텍처는 [ARCHITECTURE.md](./ARCHITECTURE.md), 제품 방향은
+[ROADMAP.md](./ROADMAP.md)를 참조한다.
+
+## 전송 캐스케이드
+
+같은 사용자의 다른 디바이스(파일 op) 또는 임의 홀더(복제본 op)로 전송할 때, 다음
+순서로 시도하고 앞 단계가 실패하면 다음으로 내려간다.
+
+1. 직접 TCP — 상대가 광고한 접속 주소(reflexive 공인 IP)로 HTTP P2P 요청. 같은
+   LAN이거나 포트가 도달 가능하면 가장 빠르다. 짧은 타임아웃
+   (`DIRECT_HOLDER_TIMEOUT`, 3s) 안에 응답이 없으면 다음 단계.
+2. 홀펀칭 UDP — 서버 랑데부로 상대 주소를 학습하고 양방향 UDP 펀치로 직접 경로를
+   연 뒤, 신뢰성 UDP(rudp) 위에서 P2P op를 전송한다. 대부분의 가정용 NAT(full/
+   restricted cone)를 라우터 설정 없이 통과한다.
+3. 서버 릴레이 — 홀펀칭마저 실패(symmetric NAT/CGNAT)할 때만, 그리고 서버 정책이
+   허가할 때만 사용하는 최후 수단. 서버는 암호문 blob만 중계하고 내용을 보지 못한다.
+
+전송 우선순위(직접 가능하면 릴레이를 쓰지 않음)는 홀펀칭 스펙의 Correctness
+Property 3으로 명문화돼 있다.
+
+## 홀펀칭 구성요소
+
+UPnP는 폐지됐고(라우터 포트포워딩 의존 제거), NAT 트래버설은 전부 UDP 홀펀칭으로
+대체됐다.
+
+- `stardustlib/rudp.py` — 순수 파이썬 신뢰성 UDP. 고정 11바이트 헤더(magic `RU`,
+  type DATA/ACK, msg_id u32, frag_idx/frag_count u16)로 메시지를 ~1200B 프래그먼트로
+  분할·재조립하고, 프래그먼트별 ACK·타임아웃 재전송·중복 억제를 처리한다. 대용량
+  전송(예: 12MiB)에서 한 메시지를 한꺼번에 보내 멈추던 문제를 막기 위해 송신
+  윈도우(`DEFAULT_WINDOW`, 256 in-flight)와 무진전 재시도 상한을 둔다. 상한 초과 시
+  조용한 손실 없이 `TimeoutError`.
+- `stardustlib/p2p_udp.py` — rudp 위의 P2P op 요청/응답. REQ/RESP 1바이트 태그 +
+  JSON, 요청 msg_id를 응답에 에코해 매칭한다. 서버 측은 `P2PServer.dispatch_async`를
+  그대로 재사용하므로 인가 규칙이 TCP 경로와 동일하다.
+- `stardustlib/holepunch_service.py` — 하나의 UDP 소켓을 공유해 (1) 랑데부 제어
+  (register/connect/punch, JSON·PUNCH/ACK)와 (2) rudp 데이터(P2P op)를 다중화한다.
+  수신 데이터그램 앞 2바이트가 rudp magic이면 rudp로, 아니면 제어 큐로 보낸다.
+  데몬이 시작 시 register로 reflexive UDP 주소를 학습하고 TTL(120s) 내 keepalive
+  (60s)로 갱신한다. 랑데부 호스트명은 IPv4로 미리 해석한다(asyncio UDP `sendto`가
+  호스트명을 해석하지 않아 패킷이 잘못 전달되던 문제 회피).
+- 서버 `rendezvous.py`(옵트인 `rendezvous_enabled`) — STUN+시그널링을 겸하는 랑데부.
+  register에 reflexive 주소를 회신하고, connect 시 양쪽에 상대 주소 + punch 신호를
+  보내 동시 오픈을 유도한다.
+
+## 데몬 전송 위임
+
+GUI/CLI는 단발 프로세스라 홀펀칭 세션(상주 UDP 소켓·랑데부 등록)을 가질 수 없다.
+따라서 전송(put/get)을 항상-온라인 데몬에 위임한다(`stardustlib/daemon_control.py`).
+
+- 데몬이 127.0.0.1의 임의 포트에 제어 서버를 띄우고 `{port, token}`을 소유자 전용
+  제어 파일(`{metadata_db}.daemon.ctl.json`, 0o600)에 기록한다.
+- GUI/CLI는 제어 파일을 읽어 `POST /ctl/put`·`/ctl/get`을 `X-Ctl-Token`으로 호출한다.
+  같은 머신이므로 데이터가 아니라 로컬 경로만 전달한다.
+- 데몬이 없거나 연결 실패면 호출자가 직접 수행으로 fallback한다(홀펀칭 없이 직접
+  TCP→릴레이만 가능).
+
+## 스필오버와 홀더 측 소스 선택
+
+로컬 소스가 모두 만석이면 신규 파일을 온라인 리모트 디바이스(같은 계정)로 스필오버
+한다(`jbod_manager._write_to_remote` → `RemoteSource.push_blob` → 위 캐스케이드).
+홀더는 `p2p_server._op_write`로 암호문을 받아 자신의 소스에 저장한다.
+
+스필오버 쓰기에는 `source_id`가 없으므로, 홀더는 페이로드 크기 이상의 여유가 있는
+소스를 `JBODManager.select_source(len(data))`로 골라 저장하고, 사용한 소스 id를
+응답한다. 소유자는 그 id를 메타데이터에 기록해 이후 get이 정확한 소스를 가리킨다.
+(과거에는 첫 소스를 맹목적으로 골라, 작은 루프백(10MiB)에 큰 파일(12MiB)을 못 담고
+HTTP 500을 내던 버그가 있었다 — 2026-06-07 수정.) 맞는 소스가 없으면 HTTP 507.
+
+## UDP/릴레이 인가
+
+UDP와 릴레이 경로에는 서버 게이트키퍼가 없으므로, 파일 op 요청 본문에 소유자
+`auth_token`을 실어 홀더가 직접 검증한다(`p2p_server.dispatch_async`).
+
+- 파일 데이터 op: 요청자가 로컬 user_id와 같아야 한다(같은 사용자 디바이스 간만).
+  불일치 시 401/403.
+- 복제본 op(replica_*): 교차 사용자 상호 호스팅이므로 `/auth/verify`(same_user=False)로
+  요청자를 도출하고, 소유자=요청자 인가는 ParityStore가 청크 단위로 집행한다.
+
+## 실패 처리와 한계
+
+- 홀펀칭 실패(symmetric NAT/CGNAT): 릴레이(허가 시)로 fallback, 비허가면 규격 에러.
+- rudp 재시도 상한 초과: 누락 프래그먼트를 명시한 `TimeoutError`/`OSError`(조용한
+  손실 없음).
+- 랑데부 미등록/미응답: 홀펀칭 불가로 간주하고 직접 TCP→릴레이만 시도. 랑데부 UDP
+  포트(기본 9091)가 서버/방화벽/보안그룹에서 열려 있어야 등록이 성립한다.
+- 전제: 홀펀칭은 상대 디바이스의 데몬이 실제 온라인이고 랑데부에 등록(reflexive
+  학습 완료)돼 있어야 직접 경로가 열린다.
+
+## E2E 검증 (2026-06-07)
+
+서로 다른 NAT 뒤의 두 호스트 간 12MiB 업로드 스필오버가 홀펀칭 UDP로 성공했다:
+`직접 P2P 타임아웃 → 홀펀칭 UDP 전송 시도(write) → 펀치 성공 → 홀더 저장 → 데몬 put
+완료`. rudp 송신 윈도우로 대용량 전송 멈춤이 사라졌고, 홀더 측 소스 선택 수정으로
+큰 파일이 여유 있는 소스에 안착한다.
+
+## 관련 스펙
+
+- `.kiro/specs/holepunch-transport/` — 홀펀칭 직접 전송(rudp·p2p_udp·랑데부·캐스케이드).
+- `.kiro/specs/daemon-transfer-delegation/` — 데몬 전송 위임 제어 채널.
+- `.kiro/specs/jbod-spillover-eviction/` — 스필오버·콜드 축출.
+- `.kiro/specs/cross-user-replica-relay/` — 교차 사용자 복제본 릴레이 인가.

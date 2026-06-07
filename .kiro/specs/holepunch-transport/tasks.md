@@ -39,8 +39,10 @@ inclusion: manual
       (remote_source 파일 op의 UDP 전환은 후속.)
 
 ## Phase 5: 검증/문서
-- [ ] 5.1 통합 e2e(펀치→직접 UDP replica 왕복 일치, 펀치 실패→릴레이 fallback).
-- [ ] 5.2 ARCHITECTURE/ROADMAP 갱신(UPnP 폐지, 홀펀칭 전송).
+- [x] 5.1 통합 e2e: 서로 다른 NAT 뒤 두 호스트 간 12MiB 스필오버가 홀펀칭 UDP로 성공
+      (직접 P2P 타임아웃→홀펀칭 UDP write→펀치 성공→홀더 저장→데몬 put 완료, 2026-06-07).
+      부수 수정: rudp 송신 윈도우(대용량 멈춤 제거), 홀더 _op_write 소스 크기 기준 선택.
+- [x] 5.2 ARCHITECTURE/ROADMAP 갱신 + docs/TRANSPORT.md 신설(UPnP 폐지, 홀펀칭 전송 캐스케이드).
 
 ## 비범위
 - QUIC/KCP 등 외부 신뢰성 전송 라이브러리(순수 파이썬 유지).

@@ -9,7 +9,8 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
 접근 계층은 FTP 유사 CLI다(MVP10 피벗). 과거의 WebDAV 실시간 마운트는 제거되었다.
 파일은 클라이언트에서 AES-256-GCM으로 암호화되어 각 디바이스의 스토리지에
 저장되고, 메타데이터는 중앙 서버를 통해 디바이스 간 동기화된다. 디바이스 간 파일
-전송은 P2P(직접 연결 또는 서버 릴레이)로 이뤄진다.
+전송은 직접 TCP → 홀펀칭 UDP → 서버 릴레이의 캐스케이드로 이뤄진다(상세
+[TRANSPORT.md](./TRANSPORT.md)).
 
 핵심 보안 원칙(zero-knowledge): 서버는 파일 내용과 메타데이터 내용을 보지 못한다.
 서버가 다루는 것은 암호화된 불투명 blob과 정수 version, 그리고 라우팅/인증에 필요한
@@ -61,16 +62,25 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
   InsufficientStorageError) `_write_to_remote`로 온라인 리모트 디바이스(같은 계정)에
   암호문을 push하고 메타를 그 디바이스 소유로 등록한다(읽기는 기존 원격 라우팅). 도달
   가능한 리모트가 없으면 무손실 에러. 로컬 소스 간 분산은 select_source가 여유 최대를
-  고른다(로컬 우선).
+  고른다(로컬 우선). 홀더(`_op_write`)는 source_id 없는 스필오버 쓰기를 받으면
+  페이로드 크기 이상의 여유가 있는 소스를 select_source로 골라 저장하고(없으면 507)
+  사용한 source_id를 응답해, 소유자가 그 id로 이후 get을 라우팅한다.
 - 콜드 축출(티어링, 기본 비활성 `eviction.enabled`): 로컬 여유가 low_watermark 미만이면
   `jbod.evict_cold`가 replicated·로컬 소유 파일을 오래된 순으로, 삭제 직전 온라인 복제본
   수를 실측(≥min_replicas)한 것만 로컬 블록 삭제 + `evicted` 표시(무손실). 메타는
   device-로컬 상태라 동기화로 전파되지 않는다. evicted 파일 읽기는 `_recover_fn`
   (ReplicationManager.recover)으로 복제 홀더에서 복구→로컬 재기록(evicted 해제) 후
   제공한다. (교차 디바이스 P2P 읽기의 축출 폴백은 후속 — 그래서 기본 비활성.)
-- `remote_source.py`: 원격 디바이스 프록시. 전용 백그라운드 이벤트 루프에서 P2P
-  직접 연결 + 실패 시 릴레이 fallback. 동기 메서드로 자가 브리지.
+- `remote_source.py`: 원격 디바이스 프록시. 전용 백그라운드 이벤트 루프에서 직접
+  TCP → 홀펀칭 UDP(주입된 udp_transport) → 릴레이 캐스케이드로 P2P op를 전송한다.
+  동기 메서드로 자가 브리지. UDP/릴레이 파일 op는 요청 본문에 소유자 auth_token을
+  실어 홀더가 같은 사용자임을 검증한다.
 - `p2p_server.py` / `relay_client.py` / `relay_worker.py`: P2P 서버와 서버 경유 릴레이.
+- 홀펀칭 전송(상세 [TRANSPORT.md](./TRANSPORT.md)): `rudp.py`(순수 파이썬 신뢰성 UDP,
+  프래그먼트·ACK·재전송·송신 윈도우), `p2p_udp.py`(rudp 위 P2P op, dispatch_async
+  재사용), `holepunch_service.py`(공유 UDP 소켓에서 랑데부 제어 + rudp 다중화,
+  register/keepalive/connect/punch). `daemon_control.py`: GUI/CLI put/get을 상주
+  데몬에 위임하는 127.0.0.1 제어 채널(데몬만 홀펀칭 세션 보유).
 - `sync_client.py`: 메타데이터 동기화(주기 폴링 + version 롱폴 + CAS + orphan GC).
   replication_status(none|pending|replicated)는 소유자가 설정하는 전역 파일 속성으로
   동기화 전파된다 — 소유자가 값 변경 시 version+1·pending으로 업로드하고, 수신 측은
@@ -129,9 +139,10 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
   → 각 청크를 홀더의 ParityStore에 push → 레지스트리 확정. 모든 청크가 목표
   복제본 수(`min_replicas`, 기본 1=원본 외 1부)를 확보하면 replicated, 아니면
   pending(경고). file_ref/chunk_id는 가상경로 SHA-256(서버에 경로 비노출).
-- 복제본 전송: 홀더로 직접 HTTP push/fetch를 짧은 타임아웃(`DIRECT_HOLDER_TIMEOUT`,
-  3s)으로 시도하고, 직접 연결 실패(NAT·이중 NAT) 시 서버 릴레이로 fallback한다
-  (RemoteSource와 동일 원리). 직접 비-200(쿼터 등)은 릴레이하지 않는다. 복제본
+- 복제본 전송: 홀더로 직접 TCP push/fetch를 짧은 타임아웃(`DIRECT_HOLDER_TIMEOUT`,
+  3s)으로 시도하고, 실패하면 홀펀칭 UDP, 그래도 실패하면 서버 릴레이로 내려가는
+  캐스케이드다(RemoteSource와 동일 원리, 상세 [TRANSPORT.md](./TRANSPORT.md)). 직접
+  비-200(쿼터 등)은 릴레이하지 않는다. 복제본
   op(replica_*)는 상호 호스팅이라 타 사용자 홀더로의 릴레이도 허용되며, 릴레이 payload에
   소유자 auth_token을 실어 홀더가 요청자=소유자를 도출(/auth/verify same_user=False)해
   ParityStore 인가에 사용한다. 파일 데이터 op는 같은 사용자 디바이스 간만 릴레이한다.
