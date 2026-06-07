@@ -24,7 +24,9 @@ from stardustlib.rudp import _MAGIC, RudpEndpoint
 
 logger = logging.getLogger(__name__)
 
-_REREGISTER_INTERVAL = 60.0   # 랑데부 TTL(120s) 내 갱신
+# ISP/CGNAT의 UDP NAT 매핑 타임아웃이 50초 미만이므로, 그 안에 최소 2회 갱신되도록
+# 20초로 둔다(매핑·랑데부 등록 동시 유지). 간격은 NAT 타임아웃보다 충분히 작아야 한다.
+_REREGISTER_INTERVAL = 20.0
 _PUNCH_ATTEMPTS = 20
 _PUNCH_INTERVAL = 0.2
 _CONNECT_TIMEOUT = 5.0
@@ -214,18 +216,28 @@ class HolePunchService:
         self, addr: tuple[str, int],
         attempts: int = _PUNCH_ATTEMPTS, interval: float = _PUNCH_INTERVAL,
     ) -> bool:
+        # per-peer 펀치 상태는 이 펀치 동안에만 유지하고 끝나면 정리한다(성공/실패
+        # 무관). 펀치는 전송마다 on-demand로 다시 열므로 오프라인 피어의 세션이
+        # 남지 않고, _punch_events가 무한히 늘지 않는다.
         ev = self._punch_events.setdefault(addr, asyncio.Event())
-        for _ in range(attempts):
-            self._sendto(addr, _PUNCH)
-            try:
-                await asyncio.wait_for(ev.wait(), interval)
-                return True
-            except asyncio.TimeoutError:
-                pass
-        return ev.is_set()
+        try:
+            for _ in range(attempts):
+                self._sendto(addr, _PUNCH)
+                try:
+                    await asyncio.wait_for(ev.wait(), interval)
+                    return True
+                except asyncio.TimeoutError:
+                    pass
+            return ev.is_set()
+        finally:
+            self._punch_events.pop(addr, None)
 
     def _signal_punch(self, addr: tuple[str, int]) -> None:
-        self._punch_events.setdefault(addr, asyncio.Event()).set()
+        # 대기 중인 펀치가 있을 때만 깨운다(새 항목을 만들지 않음 — 늦게 도착한
+        # 중복 PUNCH/ACK가 정리된 상태를 되살려 누수되는 것을 막는다).
+        ev = self._punch_events.get(addr)
+        if ev is not None:
+            ev.set()
 
     async def _control_loop(self) -> None:
         assert self._mux is not None

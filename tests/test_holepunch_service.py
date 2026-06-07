@@ -114,6 +114,50 @@ async def test_register_resolves_hostname():
 
 
 @pytest.mark.asyncio
+async def test_punch_state_cleaned_after_roundtrip():
+    """펀치 성공 후 per-peer 펀치 상태(_punch_events)가 양쪽 모두 정리된다."""
+    rv = _FakeRendezvous()
+    await rv.start()
+
+    async def dispatch(op, payload):
+        return (200, {})
+
+    a = HolePunchService("127.0.0.1", rv.port, _token, "devA", dispatch)
+    b = HolePunchService("127.0.0.1", rv.port, _token, "devB", dispatch)
+    await a.start()
+    await b.start()
+    try:
+        status, _ = await a.send_op("devB", "ping", {}, timeout=10)
+        assert status == 200
+        await asyncio.sleep(0.3)  # 응답측(B) 펀치 태스크 정리 대기
+        assert a._punch_events == {}
+        assert b._punch_events == {}
+    finally:
+        await a.stop()
+        await b.stop()
+        rv.close()
+
+
+@pytest.mark.asyncio
+async def test_offline_peer_leaves_no_session():
+    """오프라인 피어로의 connect는 None을 반환하고 펀치 세션을 남기지 않는다."""
+    rv = _FakeRendezvous()
+    await rv.start()
+
+    async def dispatch(op, payload):
+        return (200, {})
+
+    a = HolePunchService("127.0.0.1", rv.port, _token, "devA", dispatch)
+    await a.start()
+    try:
+        assert await a.connect_to("ghost", timeout=2) is None
+        assert a._punch_events == {}
+    finally:
+        await a.stop()
+        rv.close()
+
+
+@pytest.mark.asyncio
 async def test_connect_unavailable_peer_returns_none():
     rv = _FakeRendezvous()
     await rv.start()

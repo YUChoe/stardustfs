@@ -41,8 +41,10 @@ UPnP는 폐지됐고(라우터 포트포워딩 의존 제거), NAT 트래버설�
 - `stardustlib/holepunch_service.py` — 하나의 UDP 소켓을 공유해 (1) 랑데부 제어
   (register/connect/punch, JSON·PUNCH/ACK)와 (2) rudp 데이터(P2P op)를 다중화한다.
   수신 데이터그램 앞 2바이트가 rudp magic이면 rudp로, 아니면 제어 큐로 보낸다.
-  데몬이 시작 시 register로 reflexive UDP 주소를 학습하고 TTL(120s) 내 keepalive
-  (60s)로 갱신한다. 랑데부 호스트명은 IPv4로 미리 해석한다(asyncio UDP `sendto`가
+  데몬이 시작 시 register로 reflexive UDP 주소를 학습하고 keepalive(20s)로 갱신한다
+  (ISP/CGNAT의 UDP NAT 매핑 타임아웃이 50초 미만이라 그 안에 최소 2회 갱신). per-peer
+  펀치 상태는 펀치 동안에만 유지하고 끝나면 정리해 오프라인 피어 세션을 남기지 않는다.
+  랑데부 호스트명은 IPv4로 미리 해석한다(asyncio UDP `sendto`가
   호스트명을 해석하지 않아 패킷이 잘못 전달되던 문제 회피).
 - 서버 `rendezvous.py`(옵트인 `rendezvous_enabled`) — STUN+시그널링을 겸하는 랑데부.
   register에 reflexive 주소를 회신하고, connect 시 양쪽에 상대 주소 + punch 신호를
