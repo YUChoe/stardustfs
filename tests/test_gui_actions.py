@@ -58,7 +58,7 @@ def test_replica_counts_empty_when_offline(tmp_path):
 
 
 def test_storage_overview_local_only_when_offline(tmp_path):
-    # 오프라인 설정 → 로컬 소스만, remote는 빈 목록
+    # 오프라인 설정 → 강등 모드: 이 디바이스 로컬 소스만, online=False
     base = tmp_path / "setup-ov"
     cfg_path = actions.create_config(
         str(base), "", "dev-ov", generate_key=True
@@ -68,10 +68,10 @@ def test_storage_overview_local_only_when_offline(tmp_path):
     )
     actions.invalidate(cfg_path)
     ov = actions.storage_overview(cfg_path)
-    assert ov["remote"] == []
-    ids = {s["id"] for s in ov["local"]}
+    assert ov["online"] is False            # 서버 미설정 → 강등
+    ids = {s["source_id"] for s in ov["sources"]}
     assert sid in ids                       # 추가한 루프백 포함
-    assert all(s["scope"] == "local" for s in ov["local"])
+    assert all(s["self"] for s in ov["sources"])  # 강등 모드는 전부 이 기기
     actions.invalidate(cfg_path)
 
 

@@ -439,48 +439,48 @@ def devices_list(config_path: str) -> list[dict]:
     return asyncio.run(_run_online(config_path, aop, sync=False))
 
 
-def storage_overview(config_path: str) -> dict:
-    """내 모든 디바이스의 스토리지 목록을 반환한다.
-
-    {
-      "local":  [{scope, id, path, total, available}],   # 이 디바이스의 소스
-      "remote": [{scope, device_id, name(=source_id), device, type, online,
-                  total(=capacity_bytes), used(=used_bytes)}],
-    }
-
-    - local: 캐시된 오프라인 세션의 소스 객체에서 용량을 읽는다(추가 마운트 없음).
-    - remote: 서버의 디바이스 소스 레지스트리(GET /devices/sources)를 조회해 다른
-      디바이스가 신고한 소스를 행으로 만든다. open_online·P2P를 쓰지 않고 경량
-      인증 HTTP만 사용해 빠르고 비차단이다. (name, os)로 자기 device를 식별·제외.
-      미로그인/오프라인이면 [].
-    """
+def _local_live_sources(config_path: str) -> list[dict]:
+    """서버 미도달(강등) 시 이 디바이스의 로컬 소스를 라이브로 구성한다."""
     session = _offline_session(config_path)
-    local: list[dict] = []
+    out: list[dict] = []
     for s in session.jbod.sources:
         if getattr(s, "is_remote", False):
             continue
         try:
             total = s.get_total_space()
-            available = s.get_available_space()
+            used = max(0, total - s.get_available_space())
         except Exception:  # noqa: BLE001 — 용량 조회 실패 시 미상
-            total = available = None
-        local.append({
-            "scope": "local",
-            "id": s.source_id,
-            "path": getattr(s, "path", ""),
+            total = used = None
+        out.append({
+            "device_id": None,
+            "device": "",  # 이 기기(라벨은 GUI에서)
+            "source_id": s.source_id,
+            "type": "loopback",
             "total": total,
-            "available": available,
-            "ready": bool(getattr(s, "is_active", False)),
+            "used": used,
+            "state": "ready" if getattr(s, "is_active", False) else "initializing",
+            "online": True,
+            "self": True,
         })
+    return out
 
+
+def storage_overview(config_path: str) -> dict:
+    """사용자의 모든 디바이스의 모든 소스를 서버 레지스트리(단일 원천)에서 구성한다.
+
+    반환: {"sources": [...], "online": bool}. 각 소스: device_id, device, source_id,
+    type, total, used, state, online, self. 모든 온라인 디바이스가 같은 레지스트리를
+    동일하게 렌더하므로 결과가 일치한다(자기 표식 self만 다름). online=False면 서버
+    미도달로 이 디바이스 로컬 소스만 라이브로 보여주는 강등 모드다(다른 디바이스 미상).
+    """
     config = ConfigLoader(config_path).load()
     server = config.get("server")
     server_url = server.get("url") if isinstance(server, dict) else None
     device_name = server.get("device_name", "") if isinstance(server, dict) else ""
     if not server_url:
-        return {"local": local, "remote": []}
+        return {"sources": _local_live_sources(config_path), "online": False}
 
-    async def run_remote() -> list[dict]:
+    async def run_registry():
         import httpx
 
         from stardustlib.auth_client import AuthClient
@@ -492,13 +492,12 @@ def storage_overview(config_path: str) -> dict:
         auth = AuthClient(server_url, credential_store=store)
         if not auth.load_from_store():
             await auth.close()
-            return []
+            return None
         try:
             token = await auth.get_valid_token()
         except AuthenticationError:
             await auth.close()
-            return []
-        out: list[dict] = []
+            return None
         try:
             headers = {"Authorization": f"Bearer {token}"}
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -508,31 +507,33 @@ def storage_overview(config_path: str) -> dict:
                     f"{server_url}/devices/sources", headers=headers)
             devs = devs_resp.json() if devs_resp.status_code < 400 else []
             srcs = srcs_resp.json() if srcs_resp.status_code < 400 else []
-            self_id = _identify_self(devs, device_name)
-            for s in srcs:
-                did = s.get("device_id")
-                if did and did == self_id:
-                    continue  # 자기 디바이스는 로컬 섹션에서 표시
-                out.append({
-                    "scope": "remote",
-                    "device_id": did,
-                    "name": s.get("source_id"),
-                    "device": s.get("device_name") or (did[:8] if did else "?"),
-                    "type": s.get("type"),
-                    "online": bool(s.get("is_online")),
-                    "total": s.get("capacity_bytes"),
-                    "used": s.get("used_bytes"),
-                })
         finally:
             await auth.close()
-        out.sort(key=lambda r: (r["device"] or "", r["name"] or ""))
+        self_id = _identify_self(devs, device_name)
+        out: list[dict] = []
+        for s in srcs:
+            did = s.get("device_id")
+            out.append({
+                "device_id": did,
+                "device": s.get("device_name") or (did[:8] if did else "?"),
+                "source_id": s.get("source_id"),
+                "type": s.get("type"),
+                "total": s.get("capacity_bytes"),
+                "used": s.get("used_bytes"),
+                "state": s.get("state", "ready"),
+                "online": bool(s.get("is_online")),
+                "self": bool(did and did == self_id),
+            })
+        out.sort(key=lambda r: (not r["self"], r["device"] or "", r["source_id"] or ""))
         return out
 
     try:
-        remote = asyncio.run(run_remote())
-    except Exception:  # noqa: BLE001 — 미로그인/오프라인이면 로컬만
-        remote = []
-    return {"local": local, "remote": remote}
+        rows = asyncio.run(run_registry())
+    except Exception:  # noqa: BLE001 — 미로그인/오프라인이면 강등
+        rows = None
+    if rows is None:
+        return {"sources": _local_live_sources(config_path), "online": False}
+    return {"sources": rows, "online": True}
 
 
 def replica_counts(config_path: str, vpath: str, names: list[str]) -> dict:

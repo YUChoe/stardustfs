@@ -133,6 +133,7 @@ _KO: dict[str, str] = {
         "해당 디바이스에서 관리하세요."
     ),
     "col_scope": "위치",
+    "col_device": "디바이스",
     "col_src_name": "이름",
     "col_status": "상태",
     "col_capacity": "용량",
@@ -301,6 +302,7 @@ _EN: dict[str, str] = {
         "Manage it on that device."
     ),
     "col_scope": "Location",
+    "col_device": "Device",
     "col_src_name": "Name",
     "col_status": "Status",
     "col_capacity": "Capacity",

@@ -787,29 +787,34 @@ class StardustApp:
         # 버튼 바를 먼저 하단에 고정(트리 expand에 가려지지 않도록)
         bar = ttk.Frame(win, padding=8)
         bar.pack(fill="x", side="bottom")
-        cols = ("scope", "name", "status", "cap", "path")
-        heads = (t["col_scope"], t["col_src_name"], t["col_status"],
-                 t["col_capacity"], t["col_path"])
-        widths = (70, 150, 80, 130, 240)
+        cols = ("device", "source", "status", "cap")
+        heads = (t["col_device"], t["col_src_name"], t["col_status"],
+                 t["col_capacity"])
+        widths = (180, 160, 90, 150)
         tree = ttk.Treeview(win, columns=cols, show="headings")
         for c, h, w in zip(cols, heads, widths):
             tree.heading(c, text=h)
             tree.column(c, width=w)
         tree.pack(fill="both", expand=True)
-        row_meta: dict[str, dict] = {}  # iid → {scope, id|device_id}
+        row_meta: dict[str, dict] = {}  # iid → {self, id}
 
         def _cap(d: dict) -> str:
             total = d.get("total")
+            used = d.get("used")
             if total:
-                avail = d.get("available")
-                used = total - avail if avail is not None else None
                 if used is None:
                     return _human(total)
                 return f"{_human(used)} / {_human(total)}"
-            used = d.get("used")  # 리모트: 사용 바이트만 알 수 있음
             if used is not None:
                 return _human(used)
             return "-"
+
+        def _status(s: dict) -> str:
+            # 통일 어휘: 오프라인 > 초기화 중 > 준비됨 (is_online + state로 결정).
+            if not s.get("online"):
+                return t["status_offline"]
+            return (t["src_ready"] if s.get("state") == "ready"
+                    else t["src_initializing"])
 
         def reload():
             def done(ok, ov):
@@ -820,21 +825,16 @@ class StardustApp:
                 remove_btn.config(state="disabled")  # 선택 해제 → 제거 불가
                 if not ok:
                     return
-                for s in ov.get("local", []):
-                    status = (t["src_ready"] if s.get("ready")
-                              else t["src_initializing"])
+                # 단일 원천(레지스트리) — 모든 디바이스의 모든 소스를 동일하게 렌더.
+                for s in ov.get("sources", []):
+                    dev = s.get("device") or t["this_device"]
+                    if s.get("self"):
+                        dev = f"{dev} ({t['this_device']})" if s.get("device") \
+                            else t["this_device"]
                     iid = tree.insert("", "end", values=(
-                        t["scope_local"], s.get("id"), status,
-                        _cap(s), s.get("path", "")))
-                    row_meta[iid] = {"scope": "local", "id": s.get("id")}
-                for d in ov.get("remote", []):
-                    status = (t["status_online"] if d.get("online")
-                              else t["status_offline"])
-                    iid = tree.insert("", "end", values=(
-                        t["scope_remote"], d.get("name"), status,
-                        _cap(d), d.get("device", "")))
+                        dev, s.get("source_id"), _status(s), _cap(s)))
                     row_meta[iid] = {
-                        "scope": "remote", "device_id": d.get("device_id")}
+                        "self": bool(s.get("self")), "id": s.get("source_id")}
 
             self.worker.submit(lambda: actions.storage_overview(cfg), done)
 
@@ -879,7 +879,7 @@ class StardustApp:
             if not sel:
                 return
             meta = row_meta.get(sel[0], {})
-            if meta.get("scope") != "local":
+            if not meta.get("self"):
                 messagebox.showinfo(t["src_remove"], t["src_remote_no_detach"])
                 return
             sid = meta.get("id")

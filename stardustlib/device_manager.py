@@ -84,11 +84,15 @@ def build_local_source_inventory(jbod_manager) -> list[dict]:
         stype = type(source).__name__
         if stype.endswith("Source"):
             stype = stype[: -len("Source")]
+        # 소스 단위 상태: 활성(FAT 마운트/접근 가능)이면 ready, 아니면 initializing
+        # (스토리지 추가 직후 포맷 전 등). 모든 디바이스가 동일 상태를 보도록 신고한다.
+        state = "ready" if getattr(source, "is_active", False) else "initializing"
         inventory.append({
             "source_id": source.source_id,
             "type": stype.lower(),
             "capacity_bytes": total,
             "used_bytes": used,
+            "state": state,
         })
     return inventory
 
