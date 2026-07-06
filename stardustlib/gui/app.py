@@ -59,7 +59,12 @@ class StardustApp:
         self._icon_photo = None  # 브랜드 마크 아이콘 참조(GC 방지)
 
         root.title(self.t["app_title"])
-        root.geometry("900x620")
+        # 주 모니터 중앙에 배치(위치 미지정 시 터미널/커서 기준으로 화면 밖·보조
+        # 모니터에 열려 "안 보임"으로 오인되는 것을 막는다).
+        _w, _h = 900, 620
+        _sw, _sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        _x, _y = max(0, (_sw - _w) // 2), max(0, (_sh - _h) // 2)
+        root.geometry(f"{_w}x{_h}+{_x}+{_y}")
         root.minsize(760, 480)
         self._icon_photo = theme.set_window_icon(root)
         self._apply_theme()
@@ -71,12 +76,34 @@ class StardustApp:
 
         self.root.after(80, self._tick)
         self.root.after(150, self._apply_titlebar)  # 매핑 후 제목표시줄 색 재적용
+        # 터미널에서 실행 시 창이 터미널 뒤(비-포그라운드)에 열려 "안 보임"으로
+        # 오인되는 것을 막는다. 매핑 후 한 번 앞으로 끌어올린다(항상 위는 아님).
+        self.root.after(180, self._bring_to_front)
         self.root.after(200, self._refresh_daemon)
         self.root.after(3000, self._poll_meta)
         if self.config_path:
             self.refresh()
         else:
             self._set_status(self.t["select_config_hint"])
+
+    def _bring_to_front(self) -> None:
+        """시작 시 창을 화면 앞으로 올려 포커스한다(일시적 topmost 후 해제)."""
+        try:
+            self.root.deiconify()
+            self.root.update_idletasks()
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            self.root.after(300, lambda: self.root.attributes("-topmost", False))
+            self.root.focus_force()
+            # 진단: 창이 안 보인다는 신고 시 위치/화면을 로그로 확인한다.
+            logger.info(
+                "GUI 창 표시: geometry=%s screen=%dx%d state=%s",
+                self.root.winfo_geometry(),
+                self.root.winfo_screenwidth(), self.root.winfo_screenheight(),
+                self.root.state(),
+            )
+        except Exception as e:  # noqa: BLE001 — 플랫폼별 실패는 무시
+            logger.warning("창 포그라운드 실패: %s", e)
 
     # --- 메뉴 / 트레이 ---
 
