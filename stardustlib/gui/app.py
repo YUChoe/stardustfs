@@ -80,6 +80,7 @@ class StardustApp:
         # 오인되는 것을 막는다. 매핑 후 한 번 앞으로 끌어올린다(항상 위는 아님).
         self.root.after(180, self._bring_to_front)
         self.root.after(200, self._refresh_daemon)
+        self.root.after(250, self._mgmt_poll)  # 하단 스토리지·디바이스 패널 갱신 루프
         self.root.after(3000, self._poll_meta)
         if self.config_path:
             self.refresh()
@@ -145,16 +146,11 @@ class StardustApp:
             (t["theme_light"], lambda: self._set_theme("light")),
             (t["theme_dark"], lambda: self._set_theme("dark")),
         ])
-        # 관리: 스토리지/디바이스. daemon은 항상 온라인으로 감독되어 시작/정지 없음.
-        self.manage_menu = _dropdown([
-            (t["storage"], self._sources),
-            (t["devices"], self._devices),
-        ])
+        # 스토리지·디바이스 관리는 메인 창 하단 패널로 이동(관리 메뉴 제거).
         for label, menu in (
             (t["menu_file"], file_menu),
             (t["menu_language"], lang_menu),
             (t["menu_theme"], theme_menu),
-            (t["menu_manage"], self.manage_menu),
         ):
             ttk.Menubutton(
                 bar, text=label, menu=menu, direction="below",
@@ -324,9 +320,14 @@ class StardustApp:
         ttk.Button(pframe, text=t["refresh"], command=self.refresh).pack(side="left", padx=(6, 10))
         self._update_title()
 
-        # 파일 목록: 아이콘을 이름 앞에 붙여 Windows 11 탐색기 같은 경험(소유자 컬럼 제거)
+        # 파일 목록 + 하단 스토리지·디바이스 패널을 세로 분할(구분선 드래그로 조절).
+        paned = ttk.PanedWindow(self.body, orient="vertical")
+        paned.pack(fill="both", expand=True)
+
+        file_frame = ttk.Frame(paned)
         cols = ("name", "size", "backup")
-        self.tree = ttk.Treeview(self.body, columns=cols, show="headings", selectmode="extended")
+        self.tree = ttk.Treeview(file_frame, columns=cols, show="headings",
+                                 selectmode="extended")
         for c, head, w, anchor in (
             ("name", t["col_name"], 440, "w"),
             ("size", t["col_size"], 110, "e"),
@@ -336,6 +337,11 @@ class StardustApp:
             self.tree.column(c, width=w, anchor=anchor)
         self.tree.pack(fill="both", expand=True, padx=6)
         self.tree.bind("<Double-1>", self._on_double)
+        paned.add(file_frame, weight=3)
+
+        mgmt_frame = ttk.Frame(paned)
+        self._build_mgmt_panel(mgmt_frame)
+        paned.add(mgmt_frame, weight=1)
 
         # 하단 상태바(VSCode 풍): ● daemon · 스토리지 · 디바이스 · (전송 상태) · 백업
         statusbar = ttk.Frame(self.body, padding=(10, 4))
@@ -560,6 +566,7 @@ class StardustApp:
         if cfg:
             self.worker.submit(lambda: actions.invalidate(cfg), lambda *_a: None)
         self.refresh()
+        self._refresh_mgmt()  # 스토리지 사용량 변동을 하단 패널에도 반영
 
     def _backup_label(self, status: str) -> str:
         """로컬 replication_status를 표시 라벨로 변환한다."""
@@ -795,206 +802,178 @@ class StardustApp:
         self._submit(lambda: actions.copy(cfg, src, dst), lambda _r: self._after_write(),
                      self.t["copy_busy"])
 
-    # --- 스토리지 소스 ---
+    # --- 스토리지·디바이스 패널 (메인 창 하단) ---
 
-    def _sources(self) -> None:
-        if not self.config_path:
-            messagebox.showwarning(self.t["app_title"], self.t["need_config"])
+    def _build_mgmt_panel(self, parent) -> None:
+        """디바이스▸소스 2계층 트리 + 액션(스토리지 추가/분리) 패널."""
+        t = self.t
+        header = ttk.Frame(parent, padding=(8, 4))
+        header.pack(fill="x")
+        ttk.Label(header, text=t["mgmt_panel_title"]).pack(side="left")
+
+        tv = ttk.Frame(parent)
+        tv.pack(fill="both", expand=True, padx=6)
+        self.mgmt_tree = ttk.Treeview(
+            tv, columns=("status", "cap"), show="tree headings",
+            selectmode="browse",
+        )
+        self.mgmt_tree.heading("#0", text=f"{t['col_device']} / {t['col_src_name']}")
+        self.mgmt_tree.column("#0", width=320, anchor="w")
+        self.mgmt_tree.heading("status", text=t["col_status"])
+        self.mgmt_tree.column("status", width=90, anchor="w")
+        self.mgmt_tree.heading("cap", text=t["col_capacity"])
+        self.mgmt_tree.column("cap", width=160, anchor="w")
+        sb = ttk.Scrollbar(tv, orient="vertical", command=self.mgmt_tree.yview)
+        self.mgmt_tree.configure(yscrollcommand=sb.set)
+        self.mgmt_tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.mgmt_tree.bind("<<TreeviewSelect>>", self._mgmt_on_select)
+        self._mgmt_meta: dict = {}  # iid → {kind, self, id}
+
+        bar = ttk.Frame(parent, padding=(8, 6))
+        bar.pack(fill="x")
+        ttk.Button(bar, text=t["src_add_loop"],
+                   command=self._mgmt_add_storage).pack(side="left")
+        self.mgmt_detach_btn = ttk.Button(
+            bar, text=t["src_remove"], command=self._mgmt_detach, state="disabled")
+        self.mgmt_detach_btn.pack(side="left", padx=4)
+
+    def _cap_str(self, d: dict) -> str:
+        total, used = d.get("total"), d.get("used")
+        if total:
+            if used is None:
+                return _human(total)
+            return f"{_human(used)} / {_human(total)}"
+        if used is not None:
+            return _human(used)
+        return "-"
+
+    def _refresh_mgmt(self) -> None:
+        """레지스트리 단일 원천으로 디바이스·소스 트리를 갱신한다(비로그인/오프라인은 강등)."""
+        if not self.config_path or not getattr(self, "mgmt_tree", None):
             return
-        if self._focus_existing("_sources_win"):
+        cfg = self.config_path
+        self.worker.submit(
+            lambda: actions.storage_and_devices(cfg), self._populate_mgmt)
+
+    def _mgmt_poll(self) -> None:
+        self._refresh_mgmt()
+        self.root.after(15000, self._mgmt_poll)
+
+    def _populate_mgmt(self, ok, data) -> None:
+        tv = getattr(self, "mgmt_tree", None)
+        if tv is None or not tv.winfo_exists():
+            return
+        tv.delete(*tv.get_children())
+        self._mgmt_meta.clear()
+        self.mgmt_detach_btn.config(state="disabled")
+        if not ok or not isinstance(data, dict):
             return
         t = self.t
-        cfg = self.config_path
-        win = tk.Toplevel(self.root)
-        self._sources_win = win
-        self.make_modal(win, self.root)
-        win.title(t["sources_title"])
-        win.geometry("640x360")
-        win.minsize(520, 280)
-        # 버튼 바를 먼저 하단에 고정(트리 expand에 가려지지 않도록)
-        bar = ttk.Frame(win, padding=8)
-        bar.pack(fill="x", side="bottom")
-        cols = ("device", "source", "status", "cap")
-        heads = (t["col_device"], t["col_src_name"], t["col_status"],
-                 t["col_capacity"])
-        widths = (180, 160, 90, 150)
-        tree = ttk.Treeview(win, columns=cols, show="headings")
-        for c, h, w in zip(cols, heads, widths):
-            tree.heading(c, text=h)
-            tree.column(c, width=w)
-        tree.pack(fill="both", expand=True)
-        row_meta: dict[str, dict] = {}  # iid → {self, id}
-
-        def _cap(d: dict) -> str:
-            total = d.get("total")
-            used = d.get("used")
-            if total:
-                if used is None:
-                    return _human(total)
-                return f"{_human(used)} / {_human(total)}"
-            if used is not None:
-                return _human(used)
-            return "-"
-
-        def _status(s: dict) -> str:
-            # 통일 어휘: 오프라인 > 초기화 중 > 준비됨 (is_online + state로 결정).
-            if not s.get("online"):
-                return t["status_offline"]
-            return (t["src_ready"] if s.get("state") == "ready"
-                    else t["src_initializing"])
-
-        def reload():
-            def done(ok, ov):
-                if not tree.winfo_exists():
-                    return  # 다이얼로그가 닫힌 뒤 늦게 도착한 콜백 무시
-                tree.delete(*tree.get_children())
-                row_meta.clear()
-                remove_btn.config(state="disabled")  # 선택 해제 → 제거 불가
-                if not ok:
-                    return
-                # 단일 원천(레지스트리) — 모든 디바이스의 모든 소스를 동일하게 렌더.
-                for s in ov.get("sources", []):
-                    dev = s.get("device") or t["this_device"]
-                    if s.get("self"):
-                        dev = f"{dev} ({t['this_device']})" if s.get("device") \
-                            else t["this_device"]
-                    iid = tree.insert("", "end", values=(
-                        dev, s.get("source_id"), _status(s), _cap(s)))
-                    row_meta[iid] = {
-                        "self": bool(s.get("self")), "id": s.get("source_id")}
-
-            self.worker.submit(lambda: actions.storage_overview(cfg), done)
-
-        def add_loop():
-            path = filedialog.asksaveasfilename(
-                title=t["src_loop_path"], defaultextension=".img")
-            if not path:
-                return
-            mb = simpledialog.askinteger("loopback", t["src_loop_size_prompt"],
-                                         initialvalue=100, minvalue=10)
-            if not mb:
-                return
-            try:
-                sid = actions.add_source(cfg, "loopback", path, size=mb * 1024 * 1024)
-            except Exception as e:  # noqa: BLE001
-                messagebox.showerror(t["err"], str(e))
-                return
-            reload()  # 즉시 갱신 — 새 소스가 '초기화 중'으로 표시됨
-            self._set_status(t["src_init_busy"])
-
-            # FAT 이미지 포맷은 대용량일 수 있어 워커에서 수행(메인 루프 비차단).
-            # 포맷이 끝나면 캐시 무효화→재갱신으로 '준비됨'을 반영하고, 데몬이 기존
-            # FAT를 마운트하도록 reload 신호를 보낸다(포맷 후라 동시 rw 충돌 없음).
-            def _fmt():
-                actions.create_storage_image(cfg, sid)
-                actions.invalidate(cfg)
-
-            def _fmt_done(ok, payload):
-                if not ok:
-                    self._set_status(self.t["err_status"].format(msg=payload))
-                    messagebox.showerror(self.t["err"], str(payload))
-                    return
-                self._set_status(self.t["ready"])
-                self._reload_daemon()
-                reload()
-                self.refresh()  # 메인 목록/용량도 갱신
-
-            self.worker.submit(_fmt, _fmt_done)
-
-        def remove():
-            sel = tree.selection()
-            if not sel:
-                return
-            meta = row_meta.get(sel[0], {})
-            if not meta.get("self"):
-                messagebox.showinfo(t["src_remove"], t["src_remote_no_detach"])
-                return
-            sid = meta.get("id")
-            if not messagebox.askyesno(
-                t["src_remove"], t["src_detach_confirm"].format(id=sid)
-            ):
-                return
-
-            def done(ok, report):
-                if not ok:
-                    messagebox.showerror(t["err"], str(report))
-                    return
-                if report.get("detached"):
-                    messagebox.showinfo(t["src_remove"], t["src_detach_done"].format(
-                        moved=len(report.get("moved", []))))
-                    reload()
-                    self.refresh()
-                    # daemon이 분리된 소스를 더는 mount·재신고하지 않도록 리로드
-                    self._reload_daemon()
-                    # 데몬이 핸들을 놓은 뒤 빈 FAT 컨테이너 이미지를 삭제(공간 회수).
-                    img = report.get("image_path")
-                    if img:
-                        self.worker.submit(
-                            lambda: actions.delete_storage_image(img),
-                            lambda *_a: None,
-                        )
+        for d in data.get("devices", []):
+            name = d.get("name") or "?"
+            if d.get("self"):
+                name = f"{name} ({t['this_device']})"
+            dstatus = t["status_online"] if d.get("online") else t["status_offline"]
+            did = tv.insert("", "end", text=name, values=(dstatus, ""), open=True)
+            self._mgmt_meta[did] = {"kind": "device", "self": bool(d.get("self"))}
+            for s in d.get("sources", []):
+                if not s.get("online"):
+                    st = t["status_offline"]
                 else:
-                    messagebox.showwarning(t["src_remove"], t["src_detach_blocked"].format(
-                        unmoved=len(report.get("unmoved", []))))
-                    reload()
-                    self.refresh()
+                    st = (t["src_ready"] if s.get("state") == "ready"
+                          else t["src_initializing"])
+                sid = tv.insert(
+                    did, "end", text="    " + (s.get("source_id") or ""),
+                    values=(st, self._cap_str(s)))
+                self._mgmt_meta[sid] = {
+                    "kind": "source", "self": bool(d.get("self")),
+                    "id": s.get("source_id")}
 
-            self._set_status(t["src_detach_busy"])
-            self.worker.submit(lambda: actions.detach_source(cfg, sid), done)
+    def _mgmt_on_select(self, _e=None) -> None:
+        sel = self.mgmt_tree.selection()
+        meta = self._mgmt_meta.get(sel[0], {}) if sel else {}
+        can_detach = meta.get("kind") == "source" and meta.get("self")
+        self.mgmt_detach_btn.config(state="normal" if can_detach else "disabled")
 
-        ttk.Button(bar, text=t["src_add_loop"], command=add_loop).pack(side="left")
-        remove_btn = ttk.Button(bar, text=t["src_remove"], command=remove,
-                                state="disabled")
-        remove_btn.pack(side="left", padx=4)
-        ttk.Button(bar, text=t["close"], command=win.destroy).pack(side="right")
-
-        def _on_sel(_e=None):
-            # 로컬 소스를 선택했을 때만 제거(detach) 가능. 리모트는 불가.
-            sel = tree.selection()
-            local = bool(sel) and row_meta.get(sel[0], {}).get("scope") == "local"
-            remove_btn.config(state="normal" if local else "disabled")
-
-        tree.bind("<<TreeviewSelect>>", _on_sel)
-        reload()
-
-    # --- 디바이스 ---
-
-    def _focus_existing(self, attr: str) -> bool:
-        """단일 인스턴스 창: 이미 열려 있으면 앞으로 가져오고 True를 반환한다."""
-        win = getattr(self, attr, None)
-        if win is not None and win.winfo_exists():
-            win.deiconify()
-            win.lift()
-            win.focus_force()
-            return True
-        return False
-
-    def _devices(self) -> None:
-        if self._focus_existing("_devices_win"):
-            return
-        cfg = self.config_path
-        self._submit(lambda: actions.devices_list(cfg), self._show_devices,
-                     self.t["devices_busy"])
-
-    def _show_devices(self, devs: list[dict]) -> None:
+    def _mgmt_add_storage(self) -> None:
+        """이 기기에 루프백 스토리지를 추가한다(add_source→포맷→데몬 리로드)."""
         t = self.t
-        win = tk.Toplevel(self.root)
-        self._devices_win = win
-        self.make_modal(win, self.root)
-        win.title(t["devices_title"])
-        win.geometry("440x260")
-        tree = ttk.Treeview(win, columns=("id", "name", "online", "self"),
-                            show="headings")
-        for c, w in (("id", 90), ("name", 170), ("online", 80), ("self", 60)):
-            tree.heading(c, text=c)
-            tree.column(c, width=w)
-        tree.pack(fill="both", expand=True)
-        for d in devs:
-            tree.insert("", "end", values=(
-                d["id"], d["name"],
-                t["online"] if d["online"] else t["offline"],
-                t["this_device"] if d["self"] else "",
-            ))
+        cfg = self.config_path
+        if not cfg:
+            messagebox.showwarning(t["app_title"], t["need_config"])
+            return
+        path = filedialog.asksaveasfilename(
+            title=t["src_loop_path"], defaultextension=".img")
+        if not path:
+            return
+        mb = simpledialog.askinteger(
+            "loopback", t["src_loop_size_prompt"], initialvalue=100, minvalue=10)
+        if not mb:
+            return
+        try:
+            sid = actions.add_source(cfg, "loopback", path, size=mb * 1024 * 1024)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror(t["err"], str(e))
+            return
+        self._set_status(t["src_init_busy"])
+        self._refresh_mgmt()  # '초기화 중' 즉시 표시
+
+        def _fmt():
+            actions.create_storage_image(cfg, sid)
+            actions.invalidate(cfg)
+
+        def _fmt_done(ok, payload):
+            if not ok:
+                self._set_status(self.t["err_status"].format(msg=payload))
+                messagebox.showerror(self.t["err"], str(payload))
+                return
+            self._set_status(self.t["ready"])
+            self._reload_daemon()
+            self._refresh_mgmt()
+            self.refresh()
+
+        self.worker.submit(_fmt, _fmt_done)
+
+    def _mgmt_detach(self) -> None:
+        """선택한 이 기기의 소스를 evacuate 후 분리하고 빈 이미지를 삭제한다."""
+        t = self.t
+        cfg = self.config_path
+        sel = self.mgmt_tree.selection()
+        if not sel:
+            return
+        meta = self._mgmt_meta.get(sel[0], {})
+        if meta.get("kind") != "source" or not meta.get("self"):
+            messagebox.showinfo(t["src_remove"], t["src_remote_no_detach"])
+            return
+        sid = meta.get("id")
+        if not messagebox.askyesno(
+            t["src_remove"], t["src_detach_confirm"].format(id=sid)
+        ):
+            return
+
+        def done(ok, report):
+            if not ok:
+                messagebox.showerror(t["err"], str(report))
+                return
+            if report.get("detached"):
+                messagebox.showinfo(t["src_remove"], t["src_detach_done"].format(
+                    moved=len(report.get("moved", []))))
+                self._reload_daemon()
+                img = report.get("image_path")
+                if img:
+                    self.worker.submit(
+                        lambda: actions.delete_storage_image(img),
+                        lambda *_a: None)
+            else:
+                messagebox.showwarning(
+                    t["src_remove"], t["src_detach_blocked"].format(
+                        unmoved=len(report.get("unmoved", []))))
+            self._refresh_mgmt()
+            self.refresh()
+
+        self._set_status(t["src_detach_busy"])
+        self.worker.submit(lambda: actions.detach_source(cfg, sid), done)
 
     # --- 로그인 ---
 

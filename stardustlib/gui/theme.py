@@ -11,6 +11,7 @@ ttk는 테마(sv_ttk)가 일부 색을 엘리먼트 이미지로 그려 backgrou
 
 from __future__ import annotations
 
+import os
 import tkinter as tk
 
 # .design_system_v1/tokens/colors.css 미러(단일 소스)
@@ -141,8 +142,29 @@ def _mark_image(size: int = 64):
 
 
 def set_window_icon(root: tk.Misc):
-    """브랜드 마크를 창 아이콘으로 설정하고 PhotoImage 참조를 반환한다(GC 방지용으로
-    호출자가 보관). Pillow/ImageTk 미설치면 None."""
+    """브랜드 마크를 창/작업표시줄 아이콘으로 설정한다. PhotoImage 참조를 반환한다
+    (GC 방지용으로 호출자가 보관, .ico 경로면 None).
+
+    Windows: iconphoto(PNG)는 작업표시줄에 잘 반영되지 않으므로, 번들 .ico를
+    iconbitmap(default=)로 설정하고 AppUserModelID를 지정해 python.exe 기본 아이콘으로
+    묶이지 않게 한다. 그 외 플랫폼/실패 시 Pillow 마크 iconphoto로 폴백.
+    """
+    ico = os.path.join(os.path.dirname(__file__), "assets", "icon.ico")
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "StardustFS"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        if os.path.isfile(ico):
+            try:
+                root.iconbitmap(default=ico)  # 제목표시줄 + 작업표시줄
+                return None
+            except Exception:  # noqa: BLE001 — 폴백으로 진행
+                pass
     img = _mark_image(64)
     if img is None:
         return None

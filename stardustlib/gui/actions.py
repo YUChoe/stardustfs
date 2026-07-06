@@ -536,6 +536,100 @@ def storage_overview(config_path: str) -> dict:
     return {"sources": rows, "online": True}
 
 
+def storage_and_devices(config_path: str) -> dict:
+    """디바이스(전체) + 각 디바이스의 소스를 병합해 반환한다(메인 창 하단 패널용).
+
+    {"online": bool, "devices": [{id, name, online, self,
+        sources: [{source_id, type, total, used, state, online}]}]}
+    레지스트리 단일 원천이라 모든 디바이스에서 동일. online=False면 서버 미도달로
+    이 기기 로컬 라이브만 보여주는 강등 모드다.
+    """
+    config = ConfigLoader(config_path).load()
+    server = config.get("server")
+    server_url = server.get("url") if isinstance(server, dict) else None
+    device_name = server.get("device_name", "") if isinstance(server, dict) else ""
+
+    def _degraded() -> dict:
+        srcs = _local_live_sources(config_path)
+        return {"online": False, "devices": [{
+            "id": None, "name": device_name or "이 기기",
+            "online": True, "self": True,
+            "sources": [
+                {"source_id": s["source_id"], "type": s["type"],
+                 "total": s["total"], "used": s["used"],
+                 "state": s["state"], "online": True}
+                for s in srcs
+            ],
+        }]}
+
+    if not server_url:
+        return _degraded()
+
+    async def run():
+        import httpx
+
+        from stardustlib.auth_client import AuthClient
+        from stardustlib.credential_store import CredentialStore
+        from stardustlib.exceptions import AuthenticationError
+
+        store = CredentialStore(config["metadata_db"])
+        auth = AuthClient(server_url, credential_store=store)
+        if not auth.load_from_store():
+            await auth.close()
+            return None
+        try:
+            token = await auth.get_valid_token()
+        except AuthenticationError:
+            await auth.close()
+            return None
+        try:
+            headers = {"Authorization": f"Bearer {token}"}
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                dr = await client.get(f"{server_url}/devices", headers=headers)
+                sr = await client.get(
+                    f"{server_url}/devices/sources", headers=headers)
+            devs = dr.json() if dr.status_code < 400 else []
+            srcs = sr.json() if sr.status_code < 400 else []
+        finally:
+            await auth.close()
+        return devs, srcs
+
+    try:
+        data = asyncio.run(run())
+    except Exception:  # noqa: BLE001
+        data = None
+    if data is None:
+        return _degraded()
+
+    from stardustlib.cli.session import _identify_self
+
+    devs, srcs = data
+    self_id = _identify_self(devs, device_name)
+    by_dev: dict = {}
+    for s in srcs:
+        by_dev.setdefault(s.get("device_id"), []).append({
+            "source_id": s.get("source_id"),
+            "type": s.get("type"),
+            "total": s.get("capacity_bytes"),
+            "used": s.get("used_bytes"),
+            "state": s.get("state", "ready"),
+            "online": bool(s.get("is_online")),
+        })
+    devices = []
+    for d in devs:
+        did = d.get("id")
+        devices.append({
+            "id": did,
+            "name": d.get("name") or (did[:8] if did else "?"),
+            "online": bool(d.get("is_online")),
+            "self": bool(did and did == self_id),
+            "sources": sorted(
+                by_dev.get(did, []), key=lambda x: x["source_id"] or ""),
+        })
+    devices.sort(key=lambda r: (not r["self"], r["name"] or ""))
+    return {"online": True, "devices": devices}
+
+
 def replica_counts(config_path: str, vpath: str, names: list[str]) -> dict:
     """주어진 파일들의 실제 복제본 수(온라인 홀더)를 조회한다.
 
