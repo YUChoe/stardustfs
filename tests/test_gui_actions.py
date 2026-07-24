@@ -149,3 +149,16 @@ def test_daemon_status_not_running(tmp_path):
     )
     status = actions.daemon_status(str(cfg))
     assert status["running"] is False
+
+
+def test_restore_paths_requires_online(tmp_path):
+    """restore_paths는 온라인 액션 — 오프라인 설정에서는 '로그인 필요'로 실패한다."""
+    import pytest
+
+    base = tmp_path / "setup-restore"
+    cfg_path = actions.create_config(
+        str(base), "", "dev-r", generate_key=True
+    )
+    # 오프라인(server.url 없음) → 온라인 세션 불가 → RuntimeError(로그인 필요)
+    with pytest.raises(RuntimeError):
+        actions.restore_paths(cfg_path, ["/some/file.txt"])

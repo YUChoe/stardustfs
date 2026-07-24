@@ -720,6 +720,36 @@ def backup_paths(config_path: str, vpaths: list[str]) -> list[dict]:
     return asyncio.run(_run_online(config_path, aop, sync=False))
 
 
+def restore_paths(config_path: str, vpaths: list[str]) -> list[dict]:
+    """선택한 파일들을 복제본에서 복구해 로컬에 다시 기록한다(온라인 세션 1회).
+
+    소스 손상/유실 시 스웜(≥3 홀더)에서 청크를 받아 결합·복호화 후 로컬 소스에
+    복원한다. 복원은 로컬 소유권/메타데이터를 갱신하므로 완료 후 서버에 반영한다.
+    {path, status(restored|error), bytes?, error?} 목록을 반환한다.
+    """
+    norm = [_vpath(p) for p in vpaths]
+
+    async def aop(s):
+        mgr = s.make_replication_manager()
+        out: list[dict] = []
+        try:
+            for vp in norm:
+                try:
+                    nbytes = await asyncio.to_thread(mgr.recover, vp)
+                    out.append(
+                        {"path": vp, "status": "restored", "bytes": nbytes}
+                    )
+                except Exception as e:  # noqa: BLE001 — 파일 단위 격리
+                    out.append({"path": vp, "status": "error", "error": str(e)})
+        finally:
+            mgr.close()
+        # 복구로 로컬 메타데이터가 바뀌었으면 서버에 반영
+        await s.upload_if_online()
+        return out
+
+    return asyncio.run(_run_online(config_path, aop, sync=True))
+
+
 def heal_paths(config_path: str, vpaths: list[str]) -> list[dict]:
     """선택한 파일들의 복제본 부족분을 지금 보충(재복제)한다(온라인 세션 1회)."""
     norm = [_vpath(p) for p in vpaths]

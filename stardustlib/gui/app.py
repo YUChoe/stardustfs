@@ -377,6 +377,7 @@ class StardustApp:
         ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=10)
         _btn(t["backup_now"], self._backup_selected, accent=True).pack(side="left")
         _btn(t["heal_now"], self._heal_selected).pack(side="left", padx=(6, 0))
+        _btn(t["restore_now"], self._restore_selected).pack(side="left", padx=(6, 0))
 
         self._refresh_login_state()
 
@@ -773,6 +774,24 @@ class StardustApp:
         ok = sum(1 for r in results if r.get("status") == "replicated")
         pending = sum(1 for r in results if r.get("status") != "replicated")
         self._set_status(self.t["backup_done"].format(ok=ok, pending=pending))
+        self.refresh()  # 상태 컬럼·요약 갱신
+
+    def _restore_selected(self) -> None:
+        files = [r for r in self._selected_rows() if r["type"] == "file"]
+        if not files:
+            messagebox.showinfo(self.t["app_title"], self.t["backup_pick"])
+            return
+        cfg = self.config_path
+        paths = [self._join(r["name"]) for r in files]
+        self._submit(
+            lambda: actions.restore_paths(cfg, paths),
+            self._show_restore_result, self.t["restore_busy"],
+        )
+
+    def _show_restore_result(self, results: list) -> None:
+        ok = sum(1 for r in results if r.get("status") == "restored")
+        failed = sum(1 for r in results if r.get("status") != "restored")
+        self._set_status(self.t["restore_done"].format(ok=ok, failed=failed))
         self.refresh()  # 상태 컬럼·요약 갱신
 
     def _move(self) -> None:
