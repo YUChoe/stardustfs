@@ -1,125 +1,56 @@
-# StardustFS 개발 로드맵
+# StardustFS 로드맵
 
-## 제품 방향 (2026-06 개정)
+여러 디바이스의 스토리지를 하나의 가상 파일서버로 묶는다. 파일은 각 디바이스에
+AES-256-GCM으로 암호화 저장되고, 메타데이터는 중앙 서버로 동기화되며, 다운로드는
+파일을 가진 디바이스에서 직접(또는 릴레이) 가져온다.
 
-StardustFS의 핵심 취지는 "여러 디바이스의 스토리지를 원격으로 확장하여 하나의
-가상 파일서버로 묶는 것"이다. 사용자는 같은 계정의 여러 PC/Linux에 분산된
-스토리지를 어디서나 단일 네임스페이스로 업로드/다운로드한다.
+불변 원칙
+- zero-knowledge: 서버는 암호문 blob + version 정수만 본다. 콘텐츠는 소유 디바이스에서 전송.
+- 같은 유저 디바이스 간에만 평문 P2P/릴레이. 교차 계정은 암호화 복제 청크만.
+- 실패는 규격 에러로 반환한다("graceful 건너뛰기" 금지).
 
-이번 개정으로 접근 계층(access layer)을 전환한다.
+## 진행 현황
 
-- (이전) WebDAV로 실시간 마운트 → 네트워크 드라이브처럼 투명 접근, 원격 파일
-  실시간 읽기/쓰기/편집
-- (개정) FTP 유사 CLI로 명시적 업로드/다운로드. 차후 GUI 파일탐색기 제공
+| 단계 | 내용 | 상태 |
+|---|---|---|
+| MVP1 | 로컬 암호화 저장 (암호화 엔진, 스토리지 통합) | 완료 |
+| MVP2 | 멀티디바이스 동기화 (tombstone 삭제, CAS, 원격 소스, P2P, 릴레이, version 롱폴링) | 완료 |
+| MVP10 | CLI 가상 파일서버 — WebDAV 제거, `stardust put/get/ls` 업/다운로드 | 완료 |
+| 인증 | 토큰 기반 전환 (credentials.json, login/logout) | 완료 |
+| MVP3 | 암호화 리플리케이션 — 청킹, ≥3 홀더 복제, 호혜 회계, 자동 backup/heal | 완료 |
+| 전송 | NAT 캐스케이드 — 직접 TCP → 홀펀칭 UDP → 서버 릴레이 (UPnP 폐지) | 완료 |
+| 스토리지 | 루프백을 FAT 이미지(pyfatfs)로 전환, 스필오버/티어링/디태치 | 완료 |
+| GUI | 데스크톱 파일탐색기 (CLI/코어 API 재사용) | **진행 중 (mvp12)** |
+| MVP4 | 서비스 플랫폼 — 등급/과금/중계 정책 | 보류 |
 
-저장·동기화·전송 엔진은 그대로 두고, 그 위의 접근 방식만 바꾸는 변경이다.
+## 현재 단계: GUI 파일탐색기 (mvp12)
 
-### 전환 배경 (실시간 파일공유의 한계)
+MVP10에서 정리한 코어 API(목록/업로드/다운로드/삭제/디바이스·스토리지 조회) 위에
+얹는 Tkinter 데스크톱 앱. 최근 작업: 다크 모드(Primer 팔레트), 통합 스토리지 상태
+패널, 트레이/작업표시줄 아이콘, 스토리지 생성/디태치 UX, 창 가시성.
 
-- 실시간 마운트는 원격 디바이스가 항상 온라인이어야 자연스럽다. 오프라인·이중
-  NAT·릴레이 경유 시 지연/실패가 그대로 파일시스템 호출 실패로 노출된다
-  (WebDAV/POSIX 의미론은 즉시 응답을 가정).
-- 실시간 P2P 편집은 동시 편집, 부분 쓰기, 소유권 이전 등 복잡도가 크다. 원격
-  스토리지 확장이라는 본래 취지에는 명시적 업/다운로드로 충분하다.
-- 따라서 "실시간 P2P 파일 공유 + 편집"이 아니라 "가상 파일서버에 업/다운로드"로
-  단순화한다.
+## 다음 후보 (GUI 이후)
 
-### 불변 원칙 (유지)
+- 파셜/증분 메타데이터 전송: 전체 DB 대신 변경 레코드만. zero-knowledge 유지하려면
+  레코드 단위 암호화로 서버 저장 구조 재설계(방향 미결정).
+- 교차 사용자 릴레이 fallback: 릴레이 허브 인가 모델 재설계(보안 민감, 별도 스펙).
+- MVP4 서비스 플랫폼: 등급별 백업 사본 수·호혜 호스팅 비율·팀 풀 격리
+  (placement·호혜 회계에 정책값을 얹는 형태). erasure coding(저장 효율).
 
-- 저장·공유 모델은 현재와 동일: 파일은 각 디바이스의 sources에 AES-256-GCM으로
-  암호화 저장, 메타데이터는 중앙 서버를 통해 디바이스 간 동기화, 다운로드는 해당
-  파일을 보유한 device에서 가져온다(로컬이면 직접, 원격이면 P2P/릴레이).
-- zero-knowledge: 서버는 암호문 blob + version 정수만 다룬다. 콘텐츠는 소유
-  디바이스에서 직접 전송되며 서버를 평문으로 통과하지 않는다.
-- 같은 유저의 디바이스 간에만 P2P/릴레이를 허용한다.
-- "실패 시 graceful 건너뛰기" 금지. 오프라인/용량부족 등은 규격 에러로 반환한다.
+## 컴포넌트 지도 (stardustlib/)
 
-## 단계 개요
+- 저장/메타: `storage_source`, `metadata_store`, `jbod_manager`, `chunker`
+- 동기화: `sync_client` (주기 폴링 + version 롱폴링 + CAS)
+- 원격/전송: `remote_source`, `p2p_server`, `relay_client`/`relay_worker`,
+  `rudp`/`p2p_udp`/`holepunch_service`
+- 복제: `replication_manager`/`replication_scheduler`/`replication_hosting`,
+  `parity_store`
+- 디바이스/데몬: `device_manager`, `daemon`/`daemon_control`, `credential_store`
+- 접근 계층: `cli/`, `gui/`
 
-```
-[완료된 기반]                     [이번 단계]            [구현됨]          [보류]
-MVP1 로컬 암호화 저장      →  MVP10 CLI 가상 파일서버 →  MVP3 리플리케이션 →  서비스 플랫폼
-MVP2 멀티디바이스 동기화         (접근 계층 피벗)         GUI 파일탐색기      (MVP4)
-   + 원격 소스 / P2P / 릴레이
-```
+## 참고 문서
 
-## 완료된 기반 (그대로 재사용)
-
-접근 계층만 교체하므로 아래 엔진은 유지·재사용한다.
-
-- 암호화 저장: AES-256-GCM 파일 암호화, 스토리지 통합(Directory/Loopback)
-- 메타데이터: SQLite(SQLCipher 암호화 가능), tombstone 삭제 동기화, CAS 낙관적 잠금
-- 멀티디바이스: 계정/디바이스 등록, metadata_db + key_file 서버 백업/복원
-- 원격 접근 엔진: 원격 소스 프록시(remote_source), P2P 직접 연결(p2p_server),
-  서버 릴레이 fallback(relay_client/relay_worker), version 롱폴링 즉시 동기화
-- NAT 트래버설: UDP 홀펀칭(holepunch) + reflexive 공인 IP 조회 (UPnP 폐지)
-
-상세 상태는 [HANDOVER.md](./HANDOVER.md) 참조.
-
-## MVP10: CLI 가상 파일서버 (현재 단계)
-
-목표: WebDAV 실시간 마운트를 제거하고, 같은 코어 엔진 위에 FTP 유사 단발
-서브커맨드 CLI(`stardust put/get/ls/...`)를 제공한다.
-
-- 접근 모델: 명시적 업로드/다운로드 (실시간 마운트/편집 아님)
-- CLI 형태: git/aws 스타일 단발 서브커맨드 (스크립팅·자동화 용이, GUI와 코어 공유)
-- 업로드: 로컬 파일을 암호화하여 소스에 저장 + 메타데이터 등록 + 서버 동기화
-- 다운로드: 메타데이터로 소유 device 결정 → 로컬/원격(P2P·릴레이) fetch → 복호화
-- WebDAV(webdav_provider, wsgidav/cheroot 의존)는 이 단계에서 완전히 제거
-
-세부 단계·태스크는 [MVP10_CLI_PLAN.md](./MVP10_CLI_PLAN.md) 참조.
-
-## 차후: GUI 파일탐색기
-
-MVP10에서 정리한 코어 API(목록/업로드/다운로드/삭제/디바이스 조회)를 그대로
-재사용하는 데스크톱 파일탐색기. CLI와 동일한 라이브러리 경계를 호출하므로 접근
-계층만 추가하는 형태가 된다.
-
-## MVP3: 암호화 리플리케이션 (엔진 구현 완료)
-
-암호화 청크를 ≥3개 홀더에 복제하고, 중앙 서버가 위치 레지스트리·배치·건강성·호혜
-회계를 담당한다. 홀더는 자기 디바이스 + 다른 사용자 디바이스를 포함하는 상호
-(reciprocal) 피어 네트워크다 — 각 사용자는 호혜 비율(무료 0.5·provided)만큼 타인의
-암호문을 보관하고, 그 대가로 자신의 암호문이 타인 기기에 보관된다. 호스트는 키가
-없어 복호화할 수 없다. 스펙: `.kiro/specs/replication-parity/`. Phase 1~7 완료.
-
-- 청킹: `chunker.py`(암호문 4MiB 청크 split/join), 메타데이터 replication_status.
-- 서버 제어 평면: chunks/replicas/hosting 테이블 + ReplicationService(placement·
-  레지스트리·건강성·호혜 회계) + `/replication/*` 라우터. zero-knowledge(위치/크기/
-  회계만, 내용·키 미저장).
-- 호스트 역할: `parity_store.py`(타 사용자 청크 암호문 보관·쿼터·소유자 인가) +
-  P2P `/p2p/replica_{store,fetch,delete}` op(교차 사용자 토큰 검증, 소유자=요청자).
-- 오케스트레이션: `replication_manager.py` — replicate(암호화→청킹→배치→push→
-  ≥3 시 replicated, 아니면 pending), recover(스웜에서 fetch→결합→복호화), 
-  ensure_replicas(건강성 회복 재복제). CLI `backup`/`restore`/`heal`.
-- NAT: UDP 홀펀칭(서버 랑데부 + `holepunch.py`, 직접 도달성 확대). 보장된 fallback은
-  서버 릴레이 — 복제본 op(replica_*)는 교차 사용자 릴레이를 허용하고 홀더가 payload
-  소유자 토큰으로 요청자=소유자를 도출해 ParityStore 인가에 사용한다
-  (`.kiro/specs/cross-user-replica-relay/`). 파일 데이터 op는 같은 user_id만 릴레이.
-- E2E: 다중 홀더 실 HTTP — replicate→소스 훼손→스웜 recover 바이트 일치, 1곳만
-  도달 가능 시 복구, 홀더 부족 pending, 홀더 상실 후 heal 회복.
-
-승계: MVP5 데모의 share_token 인가 인프라가 복제 노드 접근 인가의 토대가 됐다.
-MVP5(평문 사용자 간 공유)는 폐기 유지 — 교차 계정 데이터는 항상 소유자 키로 암호화된
-복제본이며 평문 직접 공유는 없다.
-
-## 보류: 서비스 플랫폼 (MVP4)
-
-등급/과금/중계 플랫폼은 보류한다. 호혜 회계·릴레이 중계 토대는 MVP3에서 마련됐다.
-랜딩페이지 요금제에 노출된 등급별 정책(미구현, 향후 집행 대상):
-
-- 백업 사본 수: Free 2 / Pro 3 / Team 3+ (현 엔진 기본은 min_replicas=3).
-- 호혜 호스팅 비율: Free는 피어 데이터를 최대 50% 보관(provided·0.5), 유료는 비율 완화.
-- Team 백업은 팀 구성원 간에만 분산(피어 풀 격리).
-
-이들은 placement·호혜 회계(provided/hosted)에 등급 정책값을 얹는 형태로 확장된다.
-
-## 의존 관계
-
-```
-완료된 기반(MVP1·MVP2) → MVP10 CLI 가상 파일서버 → GUI 파일탐색기
-                                                  ↘ MVP3 리플리케이션 → (보류) 플랫폼
-```
-
-MVP10은 제품의 접근 모델을 확정하는 전환점이다. GUI와 MVP3 리플리케이션은 모두
-MVP10에서 정리한 코어 API 경계 위에 얹혀 구현됐다.
+- 작업 인수인계 상세: [HANDOVER.md](./HANDOVER.md)
+- 전송 캐스케이드 상세: [TRANSPORT.md](./TRANSPORT.md)
+- 파일 저장 위치 정책: [DISTRIBUTION_POLICY.md](./DISTRIBUTION_POLICY.md)
+- 스펙: `.kiro/specs/<기능>/{requirements,design,tasks}.md`
