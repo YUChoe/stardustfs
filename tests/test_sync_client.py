@@ -63,6 +63,9 @@ async def sync_client(auth_client, metadata_store, conflict_resolver):
         conflict_resolver=conflict_resolver,
         interval_seconds=1,
     )
+    # 이 파일의 테스트는 전체 blob(레거시/폴백) 경로를 검증한다.
+    # 레코드(증분) 경로는 test_sync_records_client.py에서 별도로 검증한다.
+    sc._record_mode = False
     yield sc
     await sc.stop()
 
@@ -425,6 +428,7 @@ class TestPeriodicSync:
             conflict_resolver=conflict_resolver,
             interval_seconds=1,
         )
+        sc._record_mode = False  # 이 테스트는 blob 경로 검증
         httpx_mock.add_response(
             url="http://test-server/sync/metadata/status",
             method="GET",
@@ -464,6 +468,7 @@ class TestPeriodicSync:
             conflict_resolver=conflict_resolver,
             interval_seconds=1,
         )
+        sc._record_mode = False  # 이 테스트는 blob 경로 검증
         httpx_mock.add_response(
             url="http://test-server/sync/metadata/status",
             method="GET",

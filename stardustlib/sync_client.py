@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -66,6 +67,11 @@ class SyncClient:
         self._wait_enabled = True
         self._consecutive_failures = 0
         self._last_synced_version = 0
+        # 파셜(레코드) 동기화 모드. 서버가 레코드 엔드포인트를 지원하지 않으면(404)
+        # False로 낮추고 기존 전체 blob 경로를 사용한다(하위 호환).
+        self._record_mode = True
+        # record_id 파생용 subkey(지연 파생)
+        self._record_subkey: bytes | None = None
         # tombstone 보관기간(초). status 응답에서 갱신됨. 기본 30일.
         self._retention_seconds: float = _DEFAULT_RETENTION_DAYS * 86400
         # last_sync_at 보존 파일 (메타데이터 DB 외부)
@@ -74,6 +80,23 @@ class SyncClient:
 
     async def initial_sync(self) -> None:
         """시작 시 서버에서 metadata_db 다운로드 및 병합."""
+        # 레코드 모드: 증분(since=0) 초기 다운로드 우선. 404면 전체 blob 경로로 폴백.
+        if self._record_mode:
+            try:
+                if await self._download_records():
+                    logger.info("Initial sync completed (records).")
+                    self._run_orphan_gc(startup=True)
+                    return
+                self._record_mode = False
+                logger.info("레코드 미지원(404) — 전체 blob 초기 동기화로 폴백")
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                logger.warning(
+                    "Initial sync failed (network): %s. Using local DB.", e
+                )
+                return
+            except Exception as e:
+                logger.warning("Initial sync (records) failed: %s.", e)
+                return
         try:
             token = await self._auth_client.get_valid_token()
             response = await self._client.get(
@@ -133,6 +156,23 @@ class SyncClient:
         이 경우 서버 변경을 다운로드·재병합한 뒤 재시도한다(최대 _MAX_CAS_RETRIES회).
         이로써 동시 업로드 시 한쪽 변경이 유실되는 레이스컨디션을 방지한다.
         """
+        # 레코드 모드: 증분 업로드 우선. 404면 전체 blob 경로로 폴백.
+        if self._record_mode:
+            try:
+                if await self._upload_records():
+                    return
+                self._record_mode = False
+                logger.info("레코드 미지원(404) — 전체 blob 업로드로 폴백")
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                self._consecutive_failures += 1
+                if self._consecutive_failures >= _MAX_UPLOAD_FAILURES:
+                    logger.error("레코드 업로드 실패 %d회: %s",
+                                 self._consecutive_failures, e)
+                return
+            except Exception as e:
+                logger.warning("레코드 업로드 오류: %s", e)
+                return
+
         db_path = self._metadata_store._db_path
 
         # pending 변경사항이 없으면 업로드 불필요 (삭제는 tombstone으로 pending에 포함됨)
@@ -868,9 +908,164 @@ class SyncClient:
         except Exception as e:
             logger.warning("Force upload error: %s", e)
 
+    # --- 파셜(레코드) 동기화 ---
+
+    def _get_record_subkey(self) -> bytes:
+        """record_id 파생용 subkey를 지연 파생하여 반환한다."""
+        if self._record_subkey is None:
+            from stardustlib.metadata_records import derive_record_subkey
+            self._record_subkey = derive_record_subkey(self._encryption_key)
+        return self._record_subkey
+
+    async def _download_records(self) -> bool:
+        """레코드 증분 다운로드 후 병합한다.
+
+        Returns:
+            레코드 미지원(404)이면 False(전체 blob 폴백 신호), 그 외 True.
+
+        네트워크 예외는 상위 호출부에서 처리하도록 전파한다.
+        """
+        token = await self._auth_client.get_valid_token()
+        resp = await self._client.get(
+            f"{self._server_url}/sync/metadata/records",
+            params={"since": self._last_synced_version},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        if resp.status_code == 404:
+            return False
+        if resp.status_code != 200:
+            logger.warning("레코드 다운로드 실패: HTTP %d", resp.status_code)
+            return True
+
+        from stardustlib.metadata_records import (
+            deserialize_metadata,
+            unpad_plaintext,
+        )
+
+        data = resp.json()
+        records = data.get("records", [])
+        for item in records:
+            encrypted = base64.b64decode(item["encrypted_record"])
+            padded = self._decrypt_blob(encrypted)
+            plaintext = unpad_plaintext(padded)
+            server_rec = deserialize_metadata(plaintext)
+            self._merge_record(server_rec)
+
+        server_version = int(
+            data.get("current_version", self._last_synced_version)
+        )
+        if server_version > self._last_synced_version:
+            self._last_synced_version = server_version
+        if records:
+            self._record_sync_success()
+            logger.info(
+                "레코드 증분 병합: %d건, version=%d",
+                len(records), server_version,
+            )
+        return True
+
+    async def _upload_records(self) -> bool:
+        """pending 레코드 증분 업로드 + 만료 tombstone purge (CAS).
+
+        base_version(last_synced_version)으로 낙관적 잠금을 적용하고, 409 충돌 시
+        증분 재다운로드·재병합 후 재시도한다.
+
+        Returns:
+            레코드 미지원(404)이면 False(전체 blob 폴백 신호), 그 외 True.
+        """
+        from stardustlib.metadata_records import (
+            pad_plaintext,
+            record_id_for,
+            serialize_metadata,
+        )
+
+        subkey = self._get_record_subkey()
+
+        for _ in range(_MAX_CAS_RETRIES):
+            pending = self._metadata_store.get_pending_files()
+            expired = self._metadata_store.list_expired_tombstones(
+                self._retention_seconds
+            )
+            purge_ids = [record_id_for(subkey, p) for p in expired]
+            if not pending and not purge_ids:
+                return True
+
+            records_payload = []
+            for fm in pending:
+                padded = pad_plaintext(serialize_metadata(fm))
+                encrypted = self._encrypt_blob(padded)
+                records_payload.append({
+                    "record_id": record_id_for(subkey, fm.virtual_path),
+                    "encrypted_record": base64.b64encode(
+                        encrypted
+                    ).decode("ascii"),
+                })
+
+            token = await self._auth_client.get_valid_token()
+            resp = await self._client.put(
+                f"{self._server_url}/sync/metadata/records",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "base_version": self._last_synced_version,
+                    "records": records_payload,
+                    "purge_ids": purge_ids,
+                },
+            )
+            if resp.status_code == 404:
+                return False
+            if resp.status_code == 409:
+                # CAS 충돌: 서버 변경 재병합 후 재시도
+                logger.info(
+                    "레코드 CAS 충돌 (base_version=%d) — 재병합 후 재시도",
+                    self._last_synced_version,
+                )
+                handled = await self._download_records()
+                if not handled:
+                    return False
+                continue
+            if resp.status_code >= 400:
+                self._consecutive_failures += 1
+                logger.warning("레코드 업로드 실패: HTTP %d", resp.status_code)
+                return True
+
+            self._consecutive_failures = 0
+            new_version = int(resp.json().get("version", self._last_synced_version))
+            self._last_synced_version = new_version
+            for fm in pending:
+                self._metadata_store.set_sync_status(fm.virtual_path, "synced")
+            if expired:
+                self._metadata_store.purge_expired_tombstones(
+                    self._retention_seconds
+                )
+            self._record_sync_success()
+            logger.info(
+                "레코드 업로드 완료: %d건 업서트, %d건 purge, version=%d",
+                len(pending), len(purge_ids), new_version,
+            )
+            return True
+
+        logger.warning(
+            "레코드 업로드: CAS 재시도 %d회 초과, 다음 주기에 재시도",
+            _MAX_CAS_RETRIES,
+        )
+        return True
+
     async def _download_and_merge(self) -> None:
         """서버 metadata version을 확인하고, 로컬보다 높으면 다운로드하여 병합한다."""
         logger.debug("_download_and_merge called (last_synced_version=%d)", self._last_synced_version)
+        # 레코드 모드: 증분 다운로드 우선. 404면 전체 blob 경로로 폴백.
+        if self._record_mode:
+            try:
+                if await self._download_records():
+                    return
+                self._record_mode = False
+                logger.info("레코드 미지원(404) — 전체 blob 동기화로 폴백")
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                logger.debug("레코드 다운로드 실패(network): %s", e)
+                return
+            except Exception as e:
+                logger.debug("레코드 다운로드 실패: %s", e)
+                return
         try:
             token = await self._auth_client.get_valid_token()
 

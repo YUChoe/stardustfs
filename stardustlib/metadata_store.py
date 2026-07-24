@@ -622,6 +622,20 @@ class MetadataStore:
         )
         conn.commit()
 
+    def list_expired_tombstones(self, retention_seconds: float) -> list[str]:
+        """보관기간이 지난 tombstone의 virtual_path 목록을 반환한다(삭제하지 않음).
+
+        레코드 모드에서 서버 purge 대상 record_id를 계산하기 위해, 로컬 삭제 전에
+        만료 tombstone 경로를 먼저 조회하는 용도.
+        """
+        cutoff = time.time() - retention_seconds
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "SELECT virtual_path FROM files WHERE deleted = 1 AND modified_at < ?",
+            (cutoff,),
+        )
+        return [row["virtual_path"] for row in cursor.fetchall()]
+
     def purge_expired_tombstones(self, retention_seconds: float) -> int:
         """보관기간이 지난 tombstone을 물리적으로 제거한다 (GC).
 
