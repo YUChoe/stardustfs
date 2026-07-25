@@ -24,7 +24,7 @@ PC-A에서 파일 A를 만들면 암호문은 PC-A의 로컬 스토리지에 저
 파일 A 실체:  [PC-A ✅]   [PC-B ❌ 목록만 보임]
 ```
 
-구현: `jbod_manager.write_file` → `select_source`(로컬 활성 소스 중 여유 최대)
+구현: `storage_pool.write_file` → `select_source`(로컬 활성 소스 중 여유 최대)
 
 ## 2단: 스필오버 — 로컬이 차면 내 다른 기기
 
@@ -41,7 +41,7 @@ PC-A에서 파일 A를 만들면 암호문은 PC-A의 로컬 스토리지에 저
 도달 불가:  저장 실패 (InsufficientStorageError)
 ```
 
-구현: `jbod_manager._write_to_remote`
+구현: `storage_pool._write_to_remote`
 
 ## 3단: 백업 사본 — 다른 기기에 암호문 조각으로
 
@@ -106,7 +106,7 @@ PC-A에서 파일 A를 만들면 암호문은 PC-A의 로컬 스토리지에 저
 읽을 때:    홀더에서 청크 복구 → 로컬 재생성 → 반환
 ```
 
-구현: `jbod_manager.evict_cold`, `jbod_manager._materialize_evicted`
+구현: `storage_pool.evict_cold`, `storage_pool._materialize_evicted`
 
 ## 읽기: 다른 기기의 파일을 열 때
 
@@ -149,7 +149,7 @@ PC-A의 옛 물리 파일은 자동 정리되지만 조건이 있다.
   메타데이터 DB나 사용자가 직접 넣은 파일은 절대 건드리지 않는다.
 - 기기 식별자를 모르는 상태에서는 정리를 아예 건너뛴다(전체 삭제 방지).
 
-구현: `jbod_manager._takeover_write`, `jbod_manager.gc_orphan_files`
+구현: `storage_pool._takeover_write`, `storage_pool.gc_orphan_files`
 
 ## 계정이 다를 때
 

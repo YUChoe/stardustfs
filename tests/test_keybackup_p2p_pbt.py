@@ -124,14 +124,14 @@ def _make_p2p_validator(root: str):
     from stardustlib.p2p_server import P2PServer
 
     server = P2PServer.__new__(P2PServer)
-    # _source_root 프로퍼티가 참조하는 jbod_manager를 흉내내는 최소 객체
+    # _source_root 프로퍼티가 참조하는 storage_pool를 흉내내는 최소 객체
     class _FakeSource:
         path = root
 
-    class _FakeJbod:
+    class _FakeStoragePool:
         sources = [_FakeSource()]
 
-    server._jbod_manager = _FakeJbod()
+    server._storage_pool = _FakeStoragePool()
     return server
 
 

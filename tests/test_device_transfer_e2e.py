@@ -31,7 +31,7 @@ load_dotenv()
 
 from stardustlib.auth_client import AuthClient
 from stardustlib.device_manager import DeviceManager
-from stardustlib.jbod_manager import JBODManager
+from stardustlib.storage_pool import StoragePool
 from stardustlib.metadata_store import MetadataStore
 from stardustlib.p2p_server import P2PServer
 from stardustlib.remote_source import RemoteSource
@@ -74,13 +74,13 @@ async def device_pair(_account):
     a_source.initialize()
     a_store = MetadataStore(os.path.join(a_dir, ".meta.db"), b"\x00" * 32)
     a_store.initialize()
-    a_jbod = JBODManager([a_source], a_store, encryption_engine=None)
+    a_storage_pool = StoragePool([a_source], a_store, encryption_engine=None)
 
     a_auth = AuthClient(SERVER_URL)
     await a_auth.login(EMAIL, PASSWORD)
 
     p2p_port = _free_port()
-    a_p2p = P2PServer(a_jbod, a_auth, p2p_port, SERVER_URL)
+    a_p2p = P2PServer(a_storage_pool, a_auth, p2p_port, SERVER_URL)
     await a_p2p.start()
 
     # 디바이스 등록 (P2P 접속 주소를 127.0.0.1:p2p_port로 설정)
@@ -93,7 +93,7 @@ async def device_pair(_account):
     await b_auth.login(EMAIL, PASSWORD)
     b_remote = RemoteSource("b-remote", device_id, b_auth, SERVER_URL)
 
-    yield a_dir, a_jbod, device_id, b_remote
+    yield a_dir, a_storage_pool, device_id, b_remote
 
     await a_devmgr.stop()
     await a_p2p.stop()
@@ -104,7 +104,7 @@ async def device_pair(_account):
 
 async def test_device_registration_and_routing(device_pair):
     """PC-A 등록 후 PC-B가 routing으로 PC-A의 P2P 주소를 찾는다."""
-    _a_dir, _a_jbod, device_id, b_remote = device_pair
+    _a_dir, _a_storage_pool, device_id, b_remote = device_pair
     assert device_id
 
     # RemoteSource.initialize가 routing으로 접속 주소를 확보
@@ -115,7 +115,7 @@ async def test_device_registration_and_routing(device_pair):
 
 async def test_cross_device_read_via_central_server(device_pair):
     """PC-A의 파일을 PC-B가 중앙 서버 routing + P2P로 읽는다 (전체 경로)."""
-    a_dir, _a_jbod, _device_id, b_remote = device_pair
+    a_dir, _a_storage_pool, _device_id, b_remote = device_pair
 
     # PC-A 디스크에 파일 기록
     payload = b"file from PC-A read by PC-B \x00\xff"
@@ -130,7 +130,7 @@ async def test_cross_device_read_via_central_server(device_pair):
 
 async def test_cross_device_list_and_exists(device_pair):
     """PC-B가 PC-A 디렉토리를 list하고 파일 존재를 확인한다."""
-    a_dir, _a_jbod, _device_id, b_remote = device_pair
+    a_dir, _a_storage_pool, _device_id, b_remote = device_pair
 
     os.makedirs(os.path.join(a_dir, "docs"), exist_ok=True)
     with open(os.path.join(a_dir, "docs", "f1.txt"), "wb") as f:

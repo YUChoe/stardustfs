@@ -27,7 +27,7 @@ from aiohttp import web
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from stardustlib.auth_client import AuthClient
-from stardustlib.jbod_manager import JBODManager
+from stardustlib.storage_pool import StoragePool
 from stardustlib.metadata_store import MetadataStore
 from stardustlib.p2p_server import P2PServer
 from stardustlib.remote_source import RemoteSource
@@ -111,7 +111,7 @@ async def p2p_env():
     meta_path = os.path.join(remote_dir, ".meta.db")
     store = MetadataStore(meta_path, b"\x00" * 32)
     store.initialize()
-    jbod = JBODManager([source], store, encryption_engine=None)
+    storage_pool = StoragePool([source], store, encryption_engine=None)
 
     p2p_port = _free_port()
     p2p_address = f"127.0.0.1:{p2p_port}"
@@ -122,7 +122,7 @@ async def p2p_env():
 
     # P2P 서버 측 AuthClient (user_id 일치 확인용)
     server_auth = _FakeAuthClient(central.url, _VALID_TOKEN, _USER_ID)
-    p2p_server = P2PServer(jbod, server_auth, p2p_port, central.url)
+    p2p_server = P2PServer(storage_pool, server_auth, p2p_port, central.url)
     await p2p_server.start()
 
     # 요청자 측 RemoteSource
@@ -223,37 +223,37 @@ async def test_invalid_token_rejected(p2p_env):
         await asyncio.to_thread(remote.write, "x.txt", b"x")
 
 
-async def test_jbod_mount_remote_source_read(p2p_env):
-    """JBODManager에 RemoteSource를 마운트하고 JBOD 경유로 원격 파일을 읽는다.
+async def test_storage_pool_mount_remote_source_read(p2p_env):
+    """StoragePool에 RemoteSource를 마운트하고 스토리지 풀 경유로 원격 파일을 읽는다.
 
     이것이 '같은 유저의 디바이스 간 전송'의 끝까지 연결된 경로다:
-    요청자 JBOD.read_file → metadata lookup → RemoteSource.read → P2P HTTP → 원격 디스크.
+    요청자 StoragePool.read_file → metadata lookup → RemoteSource.read → P2P HTTP → 원격 디스크.
     """
     import time
 
     remote, remote_dir, _auth, _central = p2p_env
 
     # 원격 디바이스에 파일을 먼저 기록 (P2P write)
-    payload = b"cross-device payload via JBOD"
+    payload = b"cross-device payload via storage pool"
     await asyncio.to_thread(remote.write, "docs/remote.bin", payload)
 
-    # 요청자 측 JBOD 구성: 별도 metadata + RemoteSource 마운트 (암호화 없음)
+    # 요청자 측 스토리지 풀 구성: 별도 metadata + RemoteSource 마운트 (암호화 없음)
     req_dir = tempfile.mkdtemp()
     req_store = MetadataStore(os.path.join(req_dir, "req.db"), b"\x00" * 32)
     req_store.initialize()
-    req_jbod = JBODManager([], req_store, encryption_engine=None)
+    req_storage_pool = StoragePool([], req_store, encryption_engine=None)
 
     # add_source로 동적 마운트 (stardustfs._mount_remote_sources가 하는 일)
-    req_jbod.add_source(remote)
-    assert req_jbod._get_source_by_id("remote-src") is remote
+    req_storage_pool.add_source(remote)
+    assert req_storage_pool._get_source_by_id("remote-src") is remote
 
     # metadata에 원격 파일 레코드 삽입 (source_id가 remote 소스를 가리킴)
     now = time.time()
     req_store.insert("/docs/remote.bin", "remote-src", "docs/remote.bin",
                      len(payload), now, now)
 
-    # JBOD 경유 읽기 → RemoteSource.read → P2P → 동일 바이트
-    data = await asyncio.to_thread(req_jbod.read_file, "/docs/remote.bin")
+    # 스토리지 풀 경유 읽기 → RemoteSource.read → P2P → 동일 바이트
+    data = await asyncio.to_thread(req_storage_pool.read_file, "/docs/remote.bin")
     assert data == payload
 
     req_store.close()

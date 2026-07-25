@@ -36,7 +36,7 @@ class _FakeRemoteSource:
         return self._active
 
 
-class _FakeJbod:
+class _FakeStoragePool:
     def __init__(self):
         self.added = []
         self.registered = {}
@@ -48,15 +48,15 @@ class _FakeJbod:
         self.registered[device_id] = remote
 
 
-def _mounted_pairs(jbod):
+def _mounted_pairs(storage_pool):
     """마운트된 (source_id, device_id) 집합."""
-    return {(s.source_id, s.device_id) for s in jbod.added}
+    return {(s.source_id, s.device_id) for s in storage_pool.added}
 
 
 def test_auto_mount_excludes_self_and_mounts_others():
     """자동 발견은 자기 자신을 빼고 다른 디바이스를 마운트한다."""
     config = {"sources": [], "p2p": {"auto_mount_devices": True}}
-    jbod = _FakeJbod()
+    storage_pool = _FakeStoragePool()
     my_devices = [
         {"id": "dev-self", "name": "PC-A"},
         {"id": "dev-b", "name": "PC-B"},
@@ -65,11 +65,11 @@ def test_auto_mount_excludes_self_and_mounts_others():
 
     with patch("stardustlib.remote_source.RemoteSource", _FakeRemoteSource):
         stardustfs._mount_remote_sources(
-            config, jbod, auth_client=None, server_url="http://x",
+            config, storage_pool, auth_client=None, server_url="http://x",
             my_devices=my_devices, self_device_id="dev-self",
         )
 
-    pairs = _mounted_pairs(jbod)
+    pairs = _mounted_pairs(storage_pool)
     assert ("remote-dev-b", "dev-b") in pairs
     assert ("remote-dev-c", "dev-c") in pairs
     # 자기 자신은 마운트 안 됨
@@ -79,16 +79,16 @@ def test_auto_mount_excludes_self_and_mounts_others():
 def test_auto_mount_disabled():
     """auto_mount_devices=false면 자동 발견하지 않는다."""
     config = {"sources": [], "p2p": {"auto_mount_devices": False}}
-    jbod = _FakeJbod()
+    storage_pool = _FakeStoragePool()
     my_devices = [{"id": "dev-self"}, {"id": "dev-b"}]
 
     with patch("stardustlib.remote_source.RemoteSource", _FakeRemoteSource):
         stardustfs._mount_remote_sources(
-            config, jbod, auth_client=None, server_url="http://x",
+            config, storage_pool, auth_client=None, server_url="http://x",
             my_devices=my_devices, self_device_id="dev-self",
         )
 
-    assert jbod.added == []
+    assert storage_pool.added == []
 
 
 def test_config_explicit_takes_priority_no_duplicate():
@@ -99,16 +99,16 @@ def test_config_explicit_takes_priority_no_duplicate():
         ],
         "p2p": {"auto_mount_devices": True},
     }
-    jbod = _FakeJbod()
+    storage_pool = _FakeStoragePool()
     my_devices = [{"id": "dev-self"}, {"id": "dev-b"}, {"id": "dev-c"}]
 
     with patch("stardustlib.remote_source.RemoteSource", _FakeRemoteSource):
         stardustfs._mount_remote_sources(
-            config, jbod, auth_client=None, server_url="http://x",
+            config, storage_pool, auth_client=None, server_url="http://x",
             my_devices=my_devices, self_device_id="dev-self",
         )
 
-    pairs = _mounted_pairs(jbod)
+    pairs = _mounted_pairs(storage_pool)
     # config 명시 소스는 그 id로 마운트
     assert ("my-laptop", "dev-b") in pairs
     # dev-b는 자동 발견에서 중복 마운트 안 됨 (remote-dev-b 없음)
@@ -120,16 +120,16 @@ def test_config_explicit_takes_priority_no_duplicate():
 def test_auto_mount_default_true_when_no_p2p_config():
     """p2p 설정이 없어도 자동 발견은 기본 활성(True)이다."""
     config = {"sources": []}  # p2p 키 없음
-    jbod = _FakeJbod()
+    storage_pool = _FakeStoragePool()
     my_devices = [{"id": "dev-self"}, {"id": "dev-b"}]
 
     with patch("stardustlib.remote_source.RemoteSource", _FakeRemoteSource):
         stardustfs._mount_remote_sources(
-            config, jbod, auth_client=None, server_url="http://x",
+            config, storage_pool, auth_client=None, server_url="http://x",
             my_devices=my_devices, self_device_id="dev-self",
         )
 
-    pairs = _mounted_pairs(jbod)
+    pairs = _mounted_pairs(storage_pool)
     assert ("remote-dev-b", "dev-b") in pairs
 
 
@@ -141,13 +141,13 @@ def test_no_my_devices_only_config_sources():
         ],
         "p2p": {"auto_mount_devices": True},
     }
-    jbod = _FakeJbod()
+    storage_pool = _FakeStoragePool()
 
     with patch("stardustlib.remote_source.RemoteSource", _FakeRemoteSource):
         stardustfs._mount_remote_sources(
-            config, jbod, auth_client=None, server_url="http://x",
+            config, storage_pool, auth_client=None, server_url="http://x",
             my_devices=None, self_device_id="dev-self",
         )
 
-    pairs = _mounted_pairs(jbod)
+    pairs = _mounted_pairs(storage_pool)
     assert pairs == {("r1", "dev-x")}

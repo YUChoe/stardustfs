@@ -41,7 +41,7 @@ HMAC(불투명), 레코드 평문은 256B 배수로 패딩해 암호문 크기�
 
 ## 컴포넌트 지도 (stardustlib/)
 
-- 저장/메타: `storage_source`, `metadata_store`, `jbod_manager`, `chunker`
+- 저장/메타: `storage_source`, `metadata_store`, `storage_pool`, `chunker`
 - 동기화: `sync_client` (주기 폴링 + version 롱폴링 + CAS)
 - 원격/전송: `remote_source`, `p2p_server`, `relay_client`/`relay_worker`,
   `rudp`/`p2p_udp`/`holepunch_service`

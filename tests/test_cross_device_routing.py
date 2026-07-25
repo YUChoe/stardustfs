@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """크로스 디바이스 파일 자동 라우팅 테스트.
 
-- JBODManager Device_Router: device_id 기반 read_file 라우팅
+- StoragePool Device_Router: device_id 기반 read_file 라우팅
 - P2PServer 다중 소스: source_id 기반 소스 선택
 - Property 1(라우팅 결정성), Property 2(소스 선택)
 - 통합: PC-A 저장 → PC-B가 원격 라우팅으로 read
@@ -25,7 +25,7 @@ from hypothesis import strategies as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from stardustlib.jbod_manager import JBODManager
+from stardustlib.storage_pool import StoragePool
 from stardustlib.metadata_store import MetadataStore
 from stardustlib.p2p_server import P2PServer
 from stardustlib.remote_source import RemoteSource
@@ -73,22 +73,22 @@ class _FakeRemote:
         return self._data
 
 
-def _make_jbod(tmp, device_id):
+def _make_storage_pool(tmp, device_id):
     src = DirectorySource("loop-local", tmp)
     src.initialize()
     store = MetadataStore(os.path.join(tmp, ".m.db"), b"\x00" * 32)
     store.initialize()
-    jbod = JBODManager([src], store, encryption_engine=None, device_id=device_id)
-    return jbod, store
+    storage_pool = StoragePool([src], store, encryption_engine=None, device_id=device_id)
+    return storage_pool, store
 
 
 def test_router_local_file_reads_locally():
     """로컬 소유 파일은 로컬에서 읽는다."""
     d = tempfile.mkdtemp()
-    jbod, store = _make_jbod(d, "dev-local")
+    storage_pool, store = _make_storage_pool(d, "dev-local")
     try:
-        jbod.write_file("/a.txt", b"local data")  # device_id=dev-local 기록
-        assert jbod.read_file("/a.txt") == b"local data"
+        storage_pool.write_file("/a.txt", b"local data")  # device_id=dev-local 기록
+        assert storage_pool.read_file("/a.txt") == b"local data"
     finally:
         store.close()
         shutil.rmtree(d, ignore_errors=True)
@@ -97,17 +97,17 @@ def test_router_local_file_reads_locally():
 def test_router_legacy_null_device_reads_locally():
     """device_id가 NULL인 레거시 레코드는 로컬에서 읽는다."""
     d = tempfile.mkdtemp()
-    # device_id 없이 JBOD 생성 → write 시 device_id=NULL
+    # device_id 없이 스토리지 풀 생성 → write 시 device_id=NULL
     src = DirectorySource("loop-local", d)
     src.initialize()
     store = MetadataStore(os.path.join(d, ".m.db"), b"\x00" * 32)
     store.initialize()
-    jbod = JBODManager([src], store, encryption_engine=None, device_id=None)
+    storage_pool = StoragePool([src], store, encryption_engine=None, device_id=None)
     try:
-        jbod.write_file("/legacy.txt", b"legacy data")
+        storage_pool.write_file("/legacy.txt", b"legacy data")
         rec = store.lookup("/legacy.txt")
         assert rec.device_id is None
-        assert jbod.read_file("/legacy.txt") == b"legacy data"
+        assert storage_pool.read_file("/legacy.txt") == b"legacy data"
     finally:
         store.close()
         shutil.rmtree(d, ignore_errors=True)
@@ -116,17 +116,17 @@ def test_router_legacy_null_device_reads_locally():
 def test_router_remote_file_routes_to_proxy():
     """원격 소유 파일은 등록된 원격 프록시로 라우팅된다."""
     d = tempfile.mkdtemp()
-    jbod, store = _make_jbod(d, "dev-local")
+    storage_pool, store = _make_storage_pool(d, "dev-local")
     try:
         remote = _FakeRemote(active=True, data=b"from-remote")
-        jbod.register_remote_device("dev-remote", remote)
+        storage_pool.register_remote_device("dev-remote", remote)
 
         # 원격 소유 레코드 직접 삽입
         now = time.time()
         store.insert("/r.txt", "loop-001", "phys/r.txt", 10, now, now,
                      device_id="dev-remote")
 
-        data = jbod.read_file("/r.txt")
+        data = storage_pool.read_file("/r.txt")
         assert data == b"from-remote"
         # 프록시에 (physical_path, source_id)로 요청됨
         assert remote.calls == [("phys/r.txt", "loop-001")]
@@ -138,14 +138,14 @@ def test_router_remote_file_routes_to_proxy():
 def test_router_remote_offline_raises():
     """원격 프록시가 비활성이면 OSError."""
     d = tempfile.mkdtemp()
-    jbod, store = _make_jbod(d, "dev-local")
+    storage_pool, store = _make_storage_pool(d, "dev-local")
     try:
-        jbod.register_remote_device("dev-remote", _FakeRemote(active=False))
+        storage_pool.register_remote_device("dev-remote", _FakeRemote(active=False))
         now = time.time()
         store.insert("/r.txt", "loop-001", "phys/r.txt", 10, now, now,
                      device_id="dev-remote")
         with pytest.raises(OSError):
-            jbod.read_file("/r.txt")
+            storage_pool.read_file("/r.txt")
     finally:
         store.close()
         shutil.rmtree(d, ignore_errors=True)
@@ -154,16 +154,16 @@ def test_router_remote_offline_raises():
 def test_router_remote_reactivates_via_refresh():
     """비활성 원격이 read 시점 refresh로 재활성화되면 읽기에 성공한다."""
     d = tempfile.mkdtemp()
-    jbod, store = _make_jbod(d, "dev-local")
+    storage_pool, store = _make_storage_pool(d, "dev-local")
     try:
         # 비활성으로 시작하지만 refresh 시 활성으로 전환되는 프록시
         remote = _FakeRemote(active=False, data=b"now-online", refresh_to=True)
-        jbod.register_remote_device("dev-remote", remote)
+        storage_pool.register_remote_device("dev-remote", remote)
         now = time.time()
         store.insert("/r.txt", "loop-001", "phys/r.txt", 10, now, now,
                      device_id="dev-remote")
 
-        data = jbod.read_file("/r.txt")
+        data = storage_pool.read_file("/r.txt")
 
         assert data == b"now-online"
         assert remote.refresh_calls == 1
@@ -176,16 +176,16 @@ def test_router_remote_reactivates_via_refresh():
 def test_router_remote_still_offline_after_refresh_raises():
     """refresh 후에도 여전히 오프라인이면 OSError."""
     d = tempfile.mkdtemp()
-    jbod, store = _make_jbod(d, "dev-local")
+    storage_pool, store = _make_storage_pool(d, "dev-local")
     try:
         # 비활성, refresh해도 비활성 유지
         remote = _FakeRemote(active=False, refresh_to=False)
-        jbod.register_remote_device("dev-remote", remote)
+        storage_pool.register_remote_device("dev-remote", remote)
         now = time.time()
         store.insert("/r.txt", "loop-001", "phys/r.txt", 10, now, now,
                      device_id="dev-remote")
         with pytest.raises(OSError):
-            jbod.read_file("/r.txt")
+            storage_pool.read_file("/r.txt")
         assert remote.refresh_calls == 1
     finally:
         store.close()
@@ -195,13 +195,13 @@ def test_router_remote_still_offline_after_refresh_raises():
 def test_router_remote_unregistered_raises():
     """원격 소유인데 프록시 미등록이면 OSError."""
     d = tempfile.mkdtemp()
-    jbod, store = _make_jbod(d, "dev-local")
+    storage_pool, store = _make_storage_pool(d, "dev-local")
     try:
         now = time.time()
         store.insert("/r.txt", "loop-001", "phys/r.txt", 10, now, now,
                      device_id="dev-unknown")
         with pytest.raises(OSError):
-            jbod.read_file("/r.txt")
+            storage_pool.read_file("/r.txt")
     finally:
         store.close()
         shutil.rmtree(d, ignore_errors=True)
@@ -210,14 +210,14 @@ def test_router_remote_unregistered_raises():
 def test_router_remote_write_takes_over_ownership():
     """원격 소유 파일을 수정하면 로컬 소유권으로 이전된다 (3a)."""
     d = tempfile.mkdtemp()
-    jbod, store = _make_jbod(d, "dev-local")
+    storage_pool, store = _make_storage_pool(d, "dev-local")
     try:
         now = time.time()
         store.insert("/r.txt", "loop-001", "phys/r.txt", 10, now, now,
                      device_id="dev-remote")
 
         # 원격 소유 파일 수정 → OSError 대신 로컬 소유권 이전
-        jbod.write_file("/r.txt", b"local edit")
+        storage_pool.write_file("/r.txt", b"local edit")
 
         rec = store.lookup("/r.txt")
         assert rec is not None
@@ -226,9 +226,9 @@ def test_router_remote_write_takes_over_ownership():
         # 로컬 소스로 물리 위치 변경
         assert rec.source_id == "loop-local"
         # 가상 경로 유지, 내용 반영
-        assert jbod.read_file("/r.txt") == b"local edit"
+        assert storage_pool.read_file("/r.txt") == b"local edit"
         # GC 필요 플래그가 섰다(파일마다가 아니라 1회)
-        assert jbod._gc_needed is True
+        assert storage_pool._gc_needed is True
     finally:
         store.close()
         shutil.rmtree(d, ignore_errors=True)
@@ -336,14 +336,14 @@ async def two_device_env():
     src2.initialize()
     a_store = MetadataStore(os.path.join(a_dir1, ".m.db"), b"\x00" * 32)
     a_store.initialize()
-    a_jbod = JBODManager([src1, src2], a_store, encryption_engine=None,
+    a_storage_pool = StoragePool([src1, src2], a_store, encryption_engine=None,
                          device_id="dev-A")
 
     p2p_port = _free_port()
     central = _MockCentral(f"127.0.0.1:{p2p_port}")
     await central.start()
     a_auth = _FakeAuth(central.url)
-    p2p = P2PServer(a_jbod, a_auth, p2p_port, central.url)
+    p2p = P2PServer(a_storage_pool, a_auth, p2p_port, central.url)
     await p2p.start()
 
     yield a_dir1, a_dir2, central, f"127.0.0.1:{p2p_port}"
@@ -399,19 +399,19 @@ async def test_cross_device_read_end_to_end(two_device_env):
     with open(os.path.join(a_dir1, "shared.bin"), "wb") as f:
         f.write(payload)
 
-    # PC-B JBOD 구성 + 원격 프록시 등록
+    # PC-B 스토리지 풀 구성 + 원격 프록시 등록
     b_dir = tempfile.mkdtemp()
     b_src = DirectorySource("loop-b", b_dir)
     b_src.initialize()
     b_store = MetadataStore(os.path.join(b_dir, ".m.db"), b"\x00" * 32)
     b_store.initialize()
-    b_jbod = JBODManager([b_src], b_store, encryption_engine=None,
+    b_storage_pool = StoragePool([b_src], b_store, encryption_engine=None,
                          device_id="dev-B")
     try:
         b_auth = _FakeAuth(central.url)
         remote = RemoteSource("remote-A", "dev-A", b_auth, central.url)
         await asyncio.to_thread(remote.initialize)
-        b_jbod.register_remote_device("dev-A", remote)
+        b_storage_pool.register_remote_device("dev-A", remote)
 
         # PC-A가 만든 파일 레코드가 metadata 동기화로 PC-B에 있음 (직접 삽입으로 시뮬레이트)
         now = time.time()
@@ -419,7 +419,7 @@ async def test_cross_device_read_end_to_end(two_device_env):
                        now, now, device_id="dev-A")
 
         # PC-B에서 그냥 read_file → 원격 라우팅으로 PC-A에서 가져옴
-        data = await asyncio.to_thread(b_jbod.read_file, "/shared.bin")
+        data = await asyncio.to_thread(b_storage_pool.read_file, "/shared.bin")
         assert data == payload
     finally:
         b_store.close()

@@ -508,7 +508,7 @@ class MetadataStore:
     def list_eviction_candidates(self) -> list[FileMetadata]:
         """축출 후보(replicated·미축출·활성)를 오래된 순(modified_at ASC)으로 반환한다.
 
-        로컬 소유 여부는 호출자(jbod)가 소스로 필터한다.
+        로컬 소유 여부는 호출자(storage_pool)가 소스로 필터한다.
         """
         conn = self._get_conn()
         cursor = conn.execute(

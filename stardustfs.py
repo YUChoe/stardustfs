@@ -239,7 +239,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
         # 오프라인 전용 모드: key_file이 로컬에 있어야 함
         logger.info("server.url 미설정, 오프라인 전용 모드로 시작")
         try:
-            jbod_manager, metadata_store, encryption_engine, db_key = (
+            storage_pool, metadata_store, encryption_engine, db_key = (
                 _build_core(config)
             )
         except SystemExit:
@@ -249,7 +249,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
             sys.exit(1)
 
         async def _cleanup() -> None:
-            jbod_manager.close_local_sources()
+            storage_pool.close_local_sources()
             metadata_store.close()
 
         from stardustlib import daemon
@@ -294,7 +294,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
 
     # (4) 로컬 스토리지 초기화
     try:
-        jbod_manager, metadata_store, encryption_engine, db_key = (
+        storage_pool, metadata_store, encryption_engine, db_key = (
             _build_core(config)
         )
     except SystemExit:
@@ -324,7 +324,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
             auth_client, server_url, metadata_store,
             conflict_resolver, interval_seconds,
             encryption_key=db_key,
-            jbod_manager=jbod_manager,
+            storage_pool=storage_pool,
         )
 
         # P2P 서버 인스턴스 (복구 시 시작됨)
@@ -336,7 +336,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
         p2p_enabled = p2p_config.get("enabled", True)
         if p2p_enabled:
             p2p_server = P2PServer(
-                jbod_manager, auth_client, p2p_port, server_url,
+                storage_pool, auth_client, p2p_port, server_url,
                 parity_store=_build_parity_store(config),
             )
 
@@ -353,7 +353,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
             if p2p_server is not None:
                 await p2p_server.stop()
             await auth_client.close()
-            jbod_manager.close_local_sources()
+            storage_pool.close_local_sources()
             metadata_store.close()
 
         from stardustlib import daemon
@@ -381,15 +381,15 @@ async def startup_v2(config: dict, config_path: str) -> None:
 
         async def _cleanup() -> None:
             await auth_client.close()
-            jbod_manager.close_local_sources()
+            storage_pool.close_local_sources()
             metadata_store.close()
 
         from stardustlib import daemon
         await daemon.serve(config["metadata_db"], _cleanup)
         return
 
-    # 등록된 device_id를 JBOD에 주입 (파일 변경 추적용)
-    jbod_manager.device_id = device_mgr.device_id
+    # 등록된 device_id를 스토리지 풀에 주입 (파일 변경 추적용)
+    storage_pool.device_id = device_mgr.device_id
 
     # (5-a) 리플리케이션 정책 다운로드(시작 1회) + 제공 용량 신고
     # 기본 활성(replication.enabled 미지정 시 true), 상호 보관 비율 0.5.
@@ -399,7 +399,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
     if "provided_bytes" in repl_config:
         repl_provided = int(repl_config["provided_bytes"])
     else:
-        repl_provided = int(jbod_manager.get_total_space())
+        repl_provided = int(storage_pool.get_total_space())
     repl_fraction = float(repl_config.get("reciprocity_fraction", _RECIPROCITY_FRACTION))
     repl_min = int(repl_config.get("min_replicas", 1))
     # 서버 프로비저닝 스위치(기본 허용). 구버전 서버/도달 불가 시 로컬 설정만 적용.
@@ -438,7 +438,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
     if device_mgr.device_id:
         from stardustlib.device_manager import build_local_source_inventory
 
-        inventory = build_local_source_inventory(jbod_manager)
+        inventory = build_local_source_inventory(storage_pool)
         if await device_mgr.report_sources(inventory):
             logger.info("로컬 소스 인벤토리 신고: %d개 소스", len(inventory))
 
@@ -455,7 +455,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
 
     # (5-b) remote 소스 마운트 (인증 완료 후) — 같은 유저의 다른 디바이스 스토리지 접근
     _mount_remote_sources(
-        config, jbod_manager, auth_client, server_url,
+        config, storage_pool, auth_client, server_url,
         my_devices=my_devices, self_device_id=device_mgr.device_id,
     )
 
@@ -471,7 +471,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
         auth_client, server_url, metadata_store,
         conflict_resolver, interval_seconds,
         encryption_key=db_key,
-        jbod_manager=jbod_manager,
+        storage_pool=storage_pool,
     )
 
     try:
@@ -488,15 +488,15 @@ async def startup_v2(config: dict, config_path: str) -> None:
             await _restore_key_from_server(auth_client, key_file_path, logger)
             # key_file 교체 후 로컬 스토리지 재초기화
             logger.info("key 복원 완료, 로컬 스토리지 재초기화...")
-            jbod_manager.close_local_sources()
+            storage_pool.close_local_sources()
             metadata_store.close()
-            jbod_manager, metadata_store, encryption_engine, db_key = (
+            storage_pool, metadata_store, encryption_engine, db_key = (
                 _build_core(config)
             )
-            # device_id, remote 소스 재주입 (jbod_manager가 교체되었으므로)
-            jbod_manager.device_id = device_mgr.device_id
+            # device_id, remote 소스 재주입 (storage_pool가 교체되었으므로)
+            storage_pool.device_id = device_mgr.device_id
             _mount_remote_sources(
-                config, jbod_manager, auth_client, server_url,
+                config, storage_pool, auth_client, server_url,
                 my_devices=my_devices, self_device_id=device_mgr.device_id,
             )
             # SyncClient 재생성
@@ -505,7 +505,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
                 auth_client, server_url, metadata_store,
                 conflict_resolver, interval_seconds,
                 encryption_key=db_key,
-                jbod_manager=jbod_manager,
+                storage_pool=storage_pool,
             )
             await sync_client.initial_sync()
             logger.info("key 복원 후 메타데이터 동기화 성공")
@@ -537,7 +537,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
         else:
             logger.info("서버 정책으로 호스팅 비활성 — 타 사용자 청크를 보관하지 않습니다")
         p2p_server = P2PServer(
-            jbod_manager, auth_client, p2p_port, server_url,
+            storage_pool, auth_client, p2p_port, server_url,
             parity_store=parity_store,
         )
         await p2p_server.start()
@@ -578,7 +578,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
                     rv_host, rv_port, holepunch_service.reflexive,
                 )
                 # 마운트된 원격 소스가 직접 TCP 실패 시 홀펀칭 UDP를 쓰도록 주입.
-                for _src in jbod_manager.sources:
+                for _src in storage_pool.sources:
                     if getattr(_src, "is_remote", False) and hasattr(
                         _src, "set_udp_transport"
                     ):
@@ -597,7 +597,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
         from stardustlib.device_manager import build_local_source_inventory
 
         await device_mgr.start_source_report(
-            lambda: build_local_source_inventory(jbod_manager),
+            lambda: build_local_source_inventory(storage_pool),
             interval=config.get("p2p", {}).get(
                 "source_report_interval_seconds", 60
             ),
@@ -612,7 +612,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
         from stardustlib.replication_scheduler import ReplicationScheduler
 
         repl_mgr = ReplicationManager(
-            auth_client, server_url, metadata_store, jbod_manager,
+            auth_client, server_url, metadata_store, storage_pool,
             min_replicas=repl_min,
         )
 
@@ -645,7 +645,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
         )
         await repl_scheduler.start()
         # 축출 파일 읽기 시 복제 홀더에서 복구해 로컬 재구체화하는 콜백 주입.
-        jbod_manager._recover_fn = repl_mgr.recover
+        storage_pool._recover_fn = repl_mgr.recover
         # 홀더 전송을 직접 TCP→직접 UDP(홀펀칭)→릴레이 순으로. 같은 IO 루프에서 await.
         if holepunch_service is not None:
             repl_mgr.set_udp_transport(
@@ -658,7 +658,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
     evict_config = config.get("eviction", {})  # type: ignore[attr-defined]
     if repl_enabled and evict_config.get("enabled", False):
         evict_task = asyncio.create_task(
-            _eviction_loop(jbod_manager, repl_mgr, evict_config)
+            _eviction_loop(storage_pool, repl_mgr, evict_config)
         )
 
     # (6-d) 로컬 전송 위임 채널 — GUI/CLI가 put/get을 데몬에 위임(홀펀칭 활용).
@@ -667,7 +667,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
         from stardustlib.daemon_control import DaemonControlServer
 
         control_server = DaemonControlServer(
-            jbod_manager, sync_client, config["metadata_db"],
+            storage_pool, sync_client, config["metadata_db"],
             repl_scheduler=repl_scheduler,
         )
         await control_server.start()
@@ -705,22 +705,22 @@ async def startup_v2(config: dict, config_path: str) -> None:
         if p2p_server is not None:
             await p2p_server.stop()
         await auth_client.close()
-        jbod_manager.close_local_sources()
+        storage_pool.close_local_sources()
         metadata_store.close()
 
     async def _on_reload() -> None:
-        """config의 로컬 소스를 다시 읽어 jbod에 remount하고 즉시 재신고한다(무중단)."""
+        """config의 로컬 소스를 다시 읽어 storage_pool에 remount하고 즉시 재신고한다(무중단)."""
         from stardustlib.config_loader import ConfigLoader
 
         fresh = ConfigLoader(config_path).load()
         new_sources = _build_local_sources(fresh)
-        jbod_manager.replace_local_sources(new_sources)
+        storage_pool.replace_local_sources(new_sources)
         logger.info("로컬 소스 remount: %d개", len(new_sources))
         if device_mgr.device_id:
             from stardustlib.device_manager import build_local_source_inventory
 
             await device_mgr.report_sources(
-                build_local_source_inventory(jbod_manager)
+                build_local_source_inventory(storage_pool)
             )
 
     from stardustlib import daemon
@@ -728,10 +728,10 @@ async def startup_v2(config: dict, config_path: str) -> None:
 
 
 def _mount_remote_sources(
-    config: dict, jbod_manager, auth_client, server_url: str,
+    config: dict, storage_pool, auth_client, server_url: str,
     my_devices: list | None = None, self_device_id: str | None = None,
 ) -> None:
-    """remote 소스를 RemoteSource로 생성해 JBOD에 마운트한다.
+    """remote 소스를 RemoteSource로 생성해 스토리지 풀에 마운트한다.
 
     두 종류를 마운트한다:
     1. 설정에 명시된 remote 타입 소스 (cfg["device_id"] 지정)
@@ -752,9 +752,9 @@ def _mount_remote_sources(
         try:
             source = RemoteSource(source_id, device_id, auth_client, server_url)
             source.initialize()
-            jbod_manager.add_source(source)
+            storage_pool.add_source(source)
             # device_id로도 등록 → read_file의 크로스 디바이스 라우팅에 사용
-            jbod_manager.register_remote_device(device_id, source)
+            storage_pool.register_remote_device(device_id, source)
             mounted_device_ids.add(device_id)
             status = "활성" if source.is_active else "비활성(오프라인)"
             logger.info(
@@ -785,7 +785,7 @@ def _mount_remote_sources(
             _mount(f"remote-{dev_id}", dev_id)
 
 
-async def _eviction_loop(jbod_manager, repl_mgr, cfg: dict) -> None:
+async def _eviction_loop(storage_pool, repl_mgr, cfg: dict) -> None:
     """로컬 여유가 low_watermark 미만이면 콜드(replicated) 파일을 축출해 회수한다.
 
     high_watermark까지 회복하도록 필요분만 축출한다. 삭제 직전 온라인 복제본 수를
@@ -807,12 +807,12 @@ async def _eviction_loop(jbod_manager, repl_mgr, cfg: dict) -> None:
     while True:
         await asyncio.sleep(interval)
         try:
-            free = jbod_manager.get_available_space()
+            free = storage_pool.get_available_space()
             if free >= low:
                 continue
             need = max(0, high - free)
             report = await asyncio.to_thread(
-                jbod_manager.evict_cold, _is_safe, need
+                storage_pool.evict_cold, _is_safe, need
             )
             if report["evicted"]:
                 logger.info(
@@ -856,7 +856,7 @@ def _build_core(config: dict, *, read_only: bool = False) -> tuple:
     않으므로 daemon(WebDAV)과 CLI가 공통으로 호출할 수 있다.
 
     Returns:
-        (jbod_manager, metadata_store, encryption_engine, db_key) 튜플.
+        (storage_pool, metadata_store, encryption_engine, db_key) 튜플.
         실패 시 sys.exit(1) 호출.
     """
     from cryptography.hazmat.primitives import hashes
@@ -865,7 +865,7 @@ def _build_core(config: dict, *, read_only: bool = False) -> tuple:
     from stardustlib.config_loader import ConfigLoader
     from stardustlib.encryption_engine import EncryptionEngine
     from stardustlib.exceptions import InvalidKeyError, KeyNotFoundError
-    from stardustlib.jbod_manager import JBODManager
+    from stardustlib.storage_pool import StoragePool
     from stardustlib.metadata_store import MetadataStore
     from stardustlib.storage_source import (
         DirectorySource,
@@ -940,10 +940,10 @@ def _build_core(config: dict, *, read_only: bool = False) -> tuple:
     sources = _build_local_sources(config, read_only=read_only)
 
     assert metadata_store is not None
-    jbod_manager = JBODManager(sources, metadata_store, encryption_engine)
+    storage_pool = StoragePool(sources, metadata_store, encryption_engine)
 
     logger.info("로컬 스토리지 초기화 완료")
-    return jbod_manager, metadata_store, encryption_engine, db_key
+    return storage_pool, metadata_store, encryption_engine, db_key
 
 
 async def _restore_key_from_server(

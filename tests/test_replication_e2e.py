@@ -24,7 +24,7 @@ import pytest_asyncio
 from aiohttp import web
 
 from stardustlib.auth_client import AuthClient
-from stardustlib.jbod_manager import JBODManager
+from stardustlib.storage_pool import StoragePool
 from stardustlib.metadata_store import MetadataStore
 from stardustlib.p2p_server import P2PServer
 from stardustlib.parity_store import ParityStore
@@ -168,11 +168,11 @@ class _Holder:
         src.initialize()
         store = MetadataStore(os.path.join(self._dir, ".m.db"), b"\x00" * 32)
         store.initialize()
-        jbod = JBODManager([src], store, encryption_engine=None)
+        storage_pool = StoragePool([src], store, encryption_engine=None)
         parity = ParityStore(os.path.join(self._dir, "parity"))
         auth = _FakeAuth(central_url, f"holder-{device_id}")
         self.parity = parity
-        self.p2p = P2PServer(jbod, auth, self.port, central_url, parity_store=parity)
+        self.p2p = P2PServer(storage_pool, auth, self.port, central_url, parity_store=parity)
 
     async def start(self) -> None:
         await self.p2p.start()
@@ -201,14 +201,14 @@ async def env():
 
     store = MetadataStore(os.path.join(owner_dir, ".m.db"), b"\x01" * 32)
     store.initialize()
-    jbod = JBODManager([src], store, encryption_engine=EncryptionEngine(key))
+    storage_pool = StoragePool([src], store, encryption_engine=EncryptionEngine(key))
     owner_auth = _FakeAuth(central.url, _OWNER)
     mgr = ReplicationManager(
-        owner_auth, central.url, store, jbod,
+        owner_auth, central.url, store, storage_pool,
         chunk_size=64, min_replicas=3,
     )
 
-    yield {"central": central, "holders": holders, "mgr": mgr, "jbod": jbod}
+    yield {"central": central, "holders": holders, "mgr": mgr, "storage_pool": storage_pool}
 
     mgr.close()
     for h in holders:
@@ -219,7 +219,7 @@ async def env():
 async def _put_file(env, vpath: str, content: bytes) -> None:
     import asyncio
 
-    await asyncio.to_thread(env["jbod"].write_file, vpath, content)
+    await asyncio.to_thread(env["storage_pool"].write_file, vpath, content)
 
 
 @pytest.mark.asyncio
@@ -241,7 +241,7 @@ async def test_replicate_then_recover_roundtrip(env):
     await _put_file(env, "/doc.bin", b"corrupted")
     n = await asyncio.to_thread(env["mgr"].recover, "/doc.bin")
     assert n == len(content)
-    assert await asyncio.to_thread(env["jbod"].read_file, "/doc.bin") == content
+    assert await asyncio.to_thread(env["storage_pool"].read_file, "/doc.bin") == content
 
 
 @pytest.mark.asyncio
@@ -259,7 +259,7 @@ async def test_swarm_recover_with_one_reachable_holder(env):
 
     n = await asyncio.to_thread(env["mgr"].recover, "/blob")
     assert n == len(content)
-    assert await asyncio.to_thread(env["jbod"].read_file, "/blob") == content
+    assert await asyncio.to_thread(env["storage_pool"].read_file, "/blob") == content
 
 
 @pytest.mark.asyncio

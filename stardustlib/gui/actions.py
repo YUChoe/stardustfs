@@ -1,6 +1,6 @@
 """GUI 백엔드 동작 (Tk 비의존).
 
-워커 스레드에서 호출된다. CLISession/JBODManager/AuthClient/daemon을 재사용하며,
+워커 스레드에서 호출된다. CLISession/StoragePool/AuthClient/daemon을 재사용하며,
 각 동작은 자체적으로 세션을 열고 닫는다(단일 워커 스레드 가정 — sqlite 연결은
 스레드별이므로 모든 코어 작업이 같은 워커 스레드에서 수행되어야 한다).
 
@@ -82,7 +82,7 @@ def create_config(
 def _rows_for(session, base: str) -> list[dict]:
     """세션으로 디렉토리 항목 행을 만든다. 각 항목: type/name/size/owner/backup."""
     rows: list[dict] = []
-    for e in session.jbod.list_directory(base):
+    for e in session.storage_pool.list_directory(base):
         owner = ""
         backup = ""
         if not e.is_directory:
@@ -167,7 +167,7 @@ def _evacuate_offline(config_path: str, source_id: str) -> dict:
     invalidate(config_path)
     session = _rw_session(config_path)
     try:
-        return session.jbod.evacuate_source(source_id)
+        return session.storage_pool.evacuate_source(source_id)
     finally:
         session.close()
 
@@ -197,8 +197,8 @@ def browse(config_path: str, vpath: str) -> dict:
     base = _vpath(vpath)
     session = _offline_session(config_path)
     rows = _rows_for(session, base)
-    total = session.jbod.get_total_space()
-    available = session.jbod.get_available_space()
+    total = session.storage_pool.get_total_space()
+    available = session.storage_pool.get_available_space()
     return {
         "rows": rows,
         "total": total,
@@ -207,7 +207,7 @@ def browse(config_path: str, vpath: str) -> dict:
         "pending": len(session.metadata.get_pending_files()),
         "backup_summary": _replication_summary(session),
         "sources": sum(
-            1 for s in session.jbod.sources if not getattr(s, "is_remote", False)
+            1 for s in session.storage_pool.sources if not getattr(s, "is_remote", False)
         ),
     }
 
@@ -315,7 +315,7 @@ def detach_source(config_path: str, source_id: str) -> dict:
     report: dict
     if use_online:
         async def aop(s):
-            r = s.jbod.evacuate_source(source_id)
+            r = s.storage_pool.evacuate_source(source_id)
             await s.upload_if_online()  # 이동된 메타데이터 전파
             return r
 
@@ -443,7 +443,7 @@ def _local_live_sources(config_path: str) -> list[dict]:
     """서버 미도달(강등) 시 이 디바이스의 로컬 소스를 라이브로 구성한다."""
     session = _offline_session(config_path)
     out: list[dict] = []
-    for s in session.jbod.sources:
+    for s in session.storage_pool.sources:
         if getattr(s, "is_remote", False):
             continue
         try:
@@ -638,7 +638,7 @@ def replica_counts(config_path: str, vpath: str, names: list[str]) -> dict:
 
     open_online(전체 코어 재빌드·원격 마운트)을 쓰지 않고, 캐시된 오프라인 세션과
     경량 토큰만으로 서버 조회한다 — 새로고침마다 스토리지 초기화가 반복되지 않는다.
-    replication_health는 jbod/metadata를 쓰지 않고 서버 API만 호출한다.
+    replication_health는 storage_pool/metadata를 쓰지 않고 서버 API만 호출한다.
     """
     if not names:
         return {}
@@ -667,7 +667,7 @@ def replica_counts(config_path: str, vpath: str, names: list[str]) -> dict:
             await auth.close()
             return {}
         mgr = ReplicationManager(
-            auth, server_url, session.metadata, session.jbod
+            auth, server_url, session.metadata, session.storage_pool
         )
         out: dict = {}
         try:
@@ -827,7 +827,7 @@ def put_file(config_path: str, local: str, remote: str) -> int:
         data = f.read()
 
     async def aop(s):
-        s.jbod.write_file(rv, data)
+        s.storage_pool.write_file(rv, data)
         await s.upload_if_online()
         return len(data)
 
@@ -841,7 +841,7 @@ def get_file(config_path: str, remote: str, local: str) -> int:
         return res.get("bytes", 0)
 
     async def aop(s):
-        return s.jbod.read_file(rv)
+        return s.storage_pool.read_file(rv)
 
     data = asyncio.run(_run_online(config_path, aop, sync=True))
     with open(local, "wb") as f:
@@ -853,7 +853,7 @@ def mkdir(config_path: str, path: str) -> None:
     rv = _vpath(path)
 
     async def aop(s):
-        s.jbod.create_directory(rv)
+        s.storage_pool.create_directory(rv)
         await s.upload_if_online()
 
     asyncio.run(_run_online(config_path, aop, sync=True))
@@ -864,9 +864,9 @@ def remove(config_path: str, path: str, recursive: bool) -> None:
 
     async def aop(s):
         if recursive:
-            s.jbod.delete_directory(rv)
+            s.storage_pool.delete_directory(rv)
         else:
-            s.jbod.delete_file(rv)
+            s.storage_pool.delete_file(rv)
         await s.upload_if_online()
 
     asyncio.run(_run_online(config_path, aop, sync=True))
@@ -885,9 +885,9 @@ def remove_many(config_path: str, items: list[tuple[str, bool]]) -> int:
         for path, recursive in norm:
             try:
                 if recursive:
-                    s.jbod.delete_directory(path)
+                    s.storage_pool.delete_directory(path)
                 else:
-                    s.jbod.delete_file(path)
+                    s.storage_pool.delete_file(path)
                 count += 1
             except FileNotFoundError:
                 pass  # 이미 삭제됨
@@ -920,10 +920,10 @@ def move(config_path: str, src: str, dst: str) -> None:
     sv, dv = _vpath(src), _vpath(dst)
 
     async def aop(s):
-        if s.jbod.file_exists(sv):
-            s.jbod.move_file(sv, dv)
+        if s.storage_pool.file_exists(sv):
+            s.storage_pool.move_file(sv, dv)
         else:
-            s.jbod.move_directory(sv, dv)
+            s.storage_pool.move_directory(sv, dv)
         await s.upload_if_online()
 
     asyncio.run(_run_online(config_path, aop, sync=True))
@@ -933,7 +933,7 @@ def copy(config_path: str, src: str, dst: str) -> None:
     sv, dv = _vpath(src), _vpath(dst)
 
     async def aop(s):
-        s.jbod.copy_file(sv, dv)
+        s.storage_pool.copy_file(sv, dv)
         await s.upload_if_online()
 
     asyncio.run(_run_online(config_path, aop, sync=True))

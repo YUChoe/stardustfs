@@ -74,11 +74,11 @@ GUI/CLI는 단발 프로세스라 홀펀칭 세션(상주 UDP 소켓·랑데부 
 ## 스필오버와 홀더 측 소스 선택
 
 로컬 소스가 모두 만석이면 신규 파일을 온라인 리모트 디바이스(같은 계정)로 스필오버
-한다(`jbod_manager._write_to_remote` → `RemoteSource.push_blob` → 위 캐스케이드).
+한다(`storage_pool._write_to_remote` → `RemoteSource.push_blob` → 위 캐스케이드).
 홀더는 `p2p_server._op_write`로 암호문을 받아 자신의 소스에 저장한다.
 
 스필오버 쓰기에는 `source_id`가 없으므로, 홀더는 페이로드 크기 이상의 여유가 있는
-소스를 `JBODManager.select_source(len(data))`로 골라 저장하고, 사용한 소스 id를
+소스를 `StoragePool.select_source(len(data))`로 골라 저장하고, 사용한 소스 id를
 응답한다. 소유자는 그 id를 메타데이터에 기록해 이후 get이 정확한 소스를 가리킨다.
 (과거에는 첫 소스를 맹목적으로 골라, 작은 루프백(10MiB)에 큰 파일(12MiB)을 못 담고
 HTTP 500을 내던 버그가 있었다 — 2026-06-07 수정.) 맞는 소스가 없으면 HTTP 507.
@@ -152,5 +152,5 @@ UDP와 릴레이 경로에는 서버 게이트키퍼가 없으므로, 파일 op 
 
 - `.kiro/specs/holepunch-transport/` — 홀펀칭 직접 전송(rudp·p2p_udp·랑데부·캐스케이드).
 - `.kiro/specs/daemon-transfer-delegation/` — 데몬 전송 위임 제어 채널.
-- `.kiro/specs/jbod-spillover-eviction/` — 스필오버·콜드 축출.
+- `.kiro/specs/storage_pool-spillover-eviction/` — 스필오버·콜드 축출.
 - `.kiro/specs/cross-user-replica-relay/` — 교차 사용자 복제본 릴레이 인가.

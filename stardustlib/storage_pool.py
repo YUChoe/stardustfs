@@ -1,4 +1,4 @@
-"""JBOD 스토리지 통합 관리자.
+"""스토리지 풀 관리자.
 
 복수의 Storage Source를 단일 논리 볼륨으로 통합하고,
 파일 배치 전략을 관리한다.
@@ -22,8 +22,8 @@ logger = logging.getLogger(__name__)
 _MANAGED_FILE_RE = re.compile(r"^[0-9a-f]{32}_")
 
 
-class JBODManager:
-    """JBOD 스토리지 통합 관리자.
+class StoragePool:
+    """스토리지 풀 관리자.
 
     모든 활성 Storage Source의 파일을 단일 네임스페이스로 통합하고,
     파일 배치 전략(Most-Available-Space)을 적용한다.
@@ -36,7 +36,7 @@ class JBODManager:
         encryption_engine: EncryptionEngine | None = None,
         device_id: str | None = None,
     ) -> None:
-        """JBODManager 초기화.
+        """StoragePool 초기화.
 
         Args:
             sources: Storage Source 목록.
@@ -128,7 +128,7 @@ class JBODManager:
         """로컬 소스를 새 목록으로 in-place 교체한다(config 리로드용).
 
         원격 소스(is_remote=True)와 _remote_devices, _recover_fn은 보존하고 로컬
-        소스만 교체한다. 같은 JBODManager 객체를 갱신하므로 p2p_server/sync_client 등
+        소스만 교체한다. 같은 StoragePool 객체를 갱신하므로 p2p_server/sync_client 등
         기존 참조가 즉시 새 소스를 사용한다(객체 교체 아님).
         """
         remote = [s for s in self.sources if getattr(s, "is_remote", False)]
@@ -522,7 +522,7 @@ class JBODManager:
                 raise
         else:
             # 새 파일 생성. 로컬 소스가 모두 만석이면 온라인 리모트(같은 계정)로
-            # 스필오버한다(JBOD를 로컬+리모트로 확장). 리모트도 불가하면 무손실 에러.
+            # 스필오버한다(스토리지 풀을 로컬+리모트로 확장). 리모트도 불가하면 무손실 에러.
             try:
                 source = self.select_source(len(encrypted))
             except InsufficientStorageError:

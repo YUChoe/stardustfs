@@ -43,7 +43,7 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
 
 ## 클라이언트 핵심 컴포넌트 (stardustlib/)
 
-- `jbod_manager.py`: JBOD 스토리지 통합. 파일 읽기/쓰기 라우팅의 중심.
+- `storage_pool.py`: 스토리지 풀 통합. 파일 읽기/쓰기 라우팅의 중심.
   `read_file`은 metadata의 device_id로 로컬/원격을 분기한다(원격은 P2P/릴레이 fetch
   후 로컬 복호화). `write_file`은 로컬 소유는 덮어쓰기, 원격 소유는 소유권 이전
   (takeover) + orphan GC.
@@ -57,7 +57,7 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
   마이그레이션 없이 재포맷(데이터 폐기 — 사용자가 사전에 비운다고 가정). 신규 소스
   추가(attach)는 loopback만 허용(디렉터리 타입 폐지, 기존 설정은 하위호환 로드).
   스펙: `.kiro/specs/loopback-fat-image/`.
-- 스토리지 detach(분리)는 "evacuate 후 분리": `jbod.evacuate_source`가 그 소스의 활성
+- 스토리지 detach(분리)는 "evacuate 후 분리": `storage_pool.evacuate_source`가 그 소스의 활성
   파일을 남은 로컬 소스로 at-rest 암호문 그대로 이동(대상 기록 성공 후 원본 삭제=무손실)
   하고, 모든 파일이 이동된 경우에만 설정에서 소스를 제거한다(원자적). 로컬 용량 부족분은
   온라인 리모트 디바이스(같은 사용자)로 분산 이동한다(`_evacuate_to_remote`: 암호문
@@ -71,7 +71,7 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
   페이로드 크기 이상의 여유가 있는 소스를 select_source로 골라 저장하고(없으면 507)
   사용한 source_id를 응답해, 소유자가 그 id로 이후 get을 라우팅한다.
 - 콜드 축출(티어링, 기본 비활성 `eviction.enabled`): 로컬 여유가 low_watermark 미만이면
-  `jbod.evict_cold`가 replicated·로컬 소유 파일을 오래된 순으로, 삭제 직전 온라인 복제본
+  `storage_pool.evict_cold`가 replicated·로컬 소유 파일을 오래된 순으로, 삭제 직전 온라인 복제본
   수를 실측(≥min_replicas)한 것만 로컬 블록 삭제 + `evicted` 표시(무손실). 메타는
   device-로컬 상태라 동기화로 전파되지 않는다. evicted 파일 읽기는 `_recover_fn`
   (ReplicationManager.recover)으로 복제 홀더에서 복구→로컬 재기록(evicted 해제) 후

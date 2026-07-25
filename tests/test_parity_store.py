@@ -87,9 +87,9 @@ def _server_with_parity(tmp_path):
 
     auth = MagicMock(spec=AuthClient)
     auth.user_id = "host-self"
-    jbod = MagicMock()
+    storage_pool = MagicMock()
     ps = ParityStore(str(tmp_path / "parity"), max_bytes=20)
-    return P2PServer(jbod, auth, 9999, "http://localhost:8000", parity_store=ps)
+    return P2PServer(storage_pool, auth, 9999, "http://localhost:8000", parity_store=ps)
 
 
 def _b64(data: bytes) -> str:

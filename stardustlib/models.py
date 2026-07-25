@@ -123,7 +123,7 @@ class EntryInfo:
 
 @dataclass
 class FileInfo:
-    """파일 상세 정보. JBOD Manager에서 반환하는 파일 정보."""
+    """파일 상세 정보. StoragePool에서 반환하는 파일 정보."""
 
     virtual_path: str
     source_id: str

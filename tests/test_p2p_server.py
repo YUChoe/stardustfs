@@ -11,7 +11,7 @@ import pytest_asyncio
 from aiohttp import web
 
 from stardustlib.auth_client import AuthClient
-from stardustlib.jbod_manager import JBODManager
+from stardustlib.storage_pool import StoragePool
 from stardustlib.p2p_server import P2PServer
 from stardustlib.storage_source import DirectorySource, LoopbackSource
 
@@ -47,19 +47,19 @@ def mock_auth_client():
 
 
 @pytest.fixture
-def jbod_manager(directory_source, mock_metadata_store):
-    """JBODManager를 생성한다."""
-    return JBODManager(
+def storage_pool(directory_source, mock_metadata_store):
+    """StoragePool를 생성한다."""
+    return StoragePool(
         sources=[directory_source],
         metadata_store=mock_metadata_store,
     )
 
 
 @pytest.fixture
-def p2p_server(jbod_manager, mock_auth_client):
+def p2p_server(storage_pool, mock_auth_client):
     """P2PServer 인스턴스를 생성한다."""
     return P2PServer(
-        jbod_manager=jbod_manager,
+        storage_pool=storage_pool,
         auth_client=mock_auth_client,
         port=9999,
         server_url="http://localhost:8000",
@@ -616,12 +616,12 @@ class TestDispatchAsyncReplica:
     _CHUNK = "a" * 64  # 유효한 SHA-256 형식 chunk_id
 
     @pytest.fixture
-    def parity_server(self, jbod_manager, mock_auth_client, tmp_path):
+    def parity_server(self, storage_pool, mock_auth_client, tmp_path):
         from stardustlib.parity_store import ParityStore
 
         store = ParityStore(str(tmp_path / "parity"))
         return P2PServer(
-            jbod_manager=jbod_manager,
+            storage_pool=storage_pool,
             auth_client=mock_auth_client,
             port=9999,
             server_url="http://localhost:8000",
@@ -719,10 +719,10 @@ class TestDispatchLoopback:
         source = LoopbackSource("loop-001", img, 10 * 1024 * 1024)
         source.initialize()
         store = MagicMock()
-        jbod = JBODManager(sources=[source], metadata_store=store)
+        storage_pool = StoragePool(sources=[source], metadata_store=store)
         auth = MagicMock(spec=AuthClient)
         auth.user_id = "u1"
-        return P2PServer(jbod, auth, 9999, "http://localhost:8000"), source
+        return P2PServer(storage_pool, auth, 9999, "http://localhost:8000"), source
 
     def test_dispatch_read_loopback(self, loopback_p2p):
         """동반 디렉토리에 기록한 파일을 dispatch read로 읽는다."""

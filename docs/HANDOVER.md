@@ -31,7 +31,7 @@ WebDAV를 통해 단일 파일시스템에 접근한다. 파일은 클라이언�
 
 ## 3. 핵심 컴포넌트 (클라이언트 stardustlib/)
 
-- `jbod_manager.py`: JBOD 스토리지 통합. 파일 읽기/쓰기 라우팅의 중심.
+- `storage_pool.py`: 스토리지 풀 통합. 파일 읽기/쓰기 라우팅의 중심.
   - `read_file`: device_id로 로컬/원격 분기(`_read_local`/`_read_remote`)
   - `write_file`: 로컬 소유는 덮어쓰기, 원격 소유는 `_takeover_write`(소유권 이전)
   - `gc_orphan_files`/`gc_orphan_files_if_needed`: orphan 물리 파일 정리

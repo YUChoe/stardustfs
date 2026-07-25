@@ -50,8 +50,8 @@ def _short(device_id: str | None) -> str:
 
 def cmd_df(session, args) -> int:
     """총/사용/가용 용량을 출력한다 (로컬 소스 합산)."""
-    total = session.jbod.get_total_space()
-    available = session.jbod.get_available_space()
+    total = session.storage_pool.get_total_space()
+    available = session.storage_pool.get_available_space()
     used = total - available
 
     if args.json:
@@ -70,7 +70,7 @@ def cmd_ls(session, args) -> int:
     self device는 'this'로 표시한다.
     """
     base = _vpath(args.path)
-    entries = session.jbod.list_directory(base)
+    entries = session.storage_pool.list_directory(base)
     self_id = session.self_device_id
 
     def owner_of(name: str) -> str | None:
@@ -109,7 +109,7 @@ def cmd_ls(session, args) -> int:
 def cmd_status(session, args) -> int:
     """동기화 상태를 출력한다 (보류 변경 수 등, 로컬 기준)."""
     pending = session.metadata.get_pending_files()
-    total = len(session.jbod.list_directory("/"))
+    total = len(session.storage_pool.list_directory("/"))
 
     if args.json:
         print_json(
@@ -266,7 +266,7 @@ async def cmd_put(session, args) -> int:
         return 3
 
     try:
-        session.jbod.write_file(remote, data)
+        session.storage_pool.write_file(remote, data)
     except InsufficientStorageError as e:
         _err(f"오류: 저장 공간 부족: {e}")
         return 5
@@ -285,7 +285,7 @@ async def cmd_get(session, args) -> int:
     remote = _vpath(args.remote)
     local = args.local or os.path.basename(remote.rstrip("/"))
     try:
-        data = session.jbod.read_file(remote)
+        data = session.storage_pool.read_file(remote)
     except FileNotFoundError:
         _err(f"오류: 파일을 찾을 수 없습니다: {remote}")
         return 3
@@ -309,9 +309,9 @@ async def cmd_rm(session, args) -> int:
     path = _vpath(args.path)
     try:
         if args.recursive:
-            session.jbod.delete_directory(path)
+            session.storage_pool.delete_directory(path)
         else:
-            session.jbod.delete_file(path)
+            session.storage_pool.delete_file(path)
     except FileNotFoundError:
         _err(f"오류: 없는 경로: {path}")
         return 3
@@ -327,7 +327,7 @@ async def cmd_rm(session, args) -> int:
 async def cmd_mkdir(session, args) -> int:
     """디렉토리를 생성한다 (전파)."""
     path = _vpath(args.path)
-    session.jbod.create_directory(path)
+    session.storage_pool.create_directory(path)
     await session.upload_if_online()
     echo(f"디렉토리 생성: {path}{_note_propagation(session)}")
     return 0
@@ -337,10 +337,10 @@ async def cmd_mv(session, args) -> int:
     """파일/디렉토리를 이동(이름변경)한다 (전파)."""
     src, dst = _vpath(args.src), _vpath(args.dst)
     try:
-        if session.jbod.file_exists(src):
-            session.jbod.move_file(src, dst)
+        if session.storage_pool.file_exists(src):
+            session.storage_pool.move_file(src, dst)
         else:
-            session.jbod.move_directory(src, dst)
+            session.storage_pool.move_directory(src, dst)
     except FileNotFoundError:
         _err(f"오류: 없는 경로: {src}")
         return 3
@@ -357,7 +357,7 @@ async def cmd_cp(session, args) -> int:
     """파일을 복사한다 (전파)."""
     src, dst = _vpath(args.src), _vpath(args.dst)
     try:
-        session.jbod.copy_file(src, dst)
+        session.storage_pool.copy_file(src, dst)
     except FileNotFoundError:
         _err(f"오류: 없는 파일: {src}")
         return 3

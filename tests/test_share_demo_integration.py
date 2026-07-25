@@ -30,7 +30,7 @@ from aiohttp import web
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from stardustlib.auth_client import AuthClient
-from stardustlib.jbod_manager import JBODManager
+from stardustlib.storage_pool import StoragePool
 from stardustlib.metadata_store import MetadataStore
 from stardustlib.p2p_server import P2PServer
 from stardustlib.storage_source import DirectorySource
@@ -124,14 +124,14 @@ async def share_env():
     source.initialize()
     store = MetadataStore(os.path.join(owner_dir, ".meta.db"), b"\x00" * 32)
     store.initialize()
-    jbod = JBODManager([source], store, encryption_engine=None)
+    storage_pool = StoragePool([source], store, encryption_engine=None)
 
     central = _MockShareServer()
     await central.start()
 
     p2p_port = _free_port()
     server_auth = _FakeAuthClient(central.url, "tokenA", _OWNER_USER_ID)
-    p2p = P2PServer(jbod, server_auth, p2p_port, central.url)
+    p2p = P2PServer(storage_pool, server_auth, p2p_port, central.url)
     await p2p.start()
 
     p2p_address = f"127.0.0.1:{p2p_port}"

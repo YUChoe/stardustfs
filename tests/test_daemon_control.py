@@ -10,7 +10,7 @@ from stardustlib import daemon_control
 from stardustlib.daemon_control import DaemonControlServer, transfer_via_daemon
 
 
-class _FakeJbod:
+class _FakeStoragePool:
     def __init__(self) -> None:
         self.store: dict[str, bytes] = {}
 
@@ -34,8 +34,8 @@ class _FakeSync:
 @pytest.mark.asyncio
 async def test_put_then_get_via_daemon(tmp_path):
     db = str(tmp_path / "m.db")
-    jbod, sync = _FakeJbod(), _FakeSync()
-    server = DaemonControlServer(jbod, sync, db)
+    storage_pool, sync = _FakeStoragePool(), _FakeSync()
+    server = DaemonControlServer(storage_pool, sync, db)
     await server.start()
     try:
         src = tmp_path / "up.bin"
@@ -45,7 +45,7 @@ async def test_put_then_get_via_daemon(tmp_path):
             transfer_via_daemon, db, "put", "/f", str(src)
         )
         assert res["ok"] is True and res["bytes"] == len(src.read_bytes())
-        assert jbod.store["/f"] == src.read_bytes()
+        assert storage_pool.store["/f"] == src.read_bytes()
         assert sync.uploaded == 1  # 메타데이터 전파
 
         dst = tmp_path / "down.bin"
@@ -71,7 +71,7 @@ async def test_delegate_returns_none_when_no_daemon(tmp_path):
 @pytest.mark.asyncio
 async def test_bad_token_rejected(tmp_path):
     db = str(tmp_path / "m.db")
-    server = DaemonControlServer(_FakeJbod(), _FakeSync(), db)
+    server = DaemonControlServer(_FakeStoragePool(), _FakeSync(), db)
     await server.start()
     try:
         ctl = daemon_control.read_ctl(db)
@@ -91,7 +91,7 @@ async def test_bad_token_rejected(tmp_path):
 @pytest.mark.asyncio
 async def test_get_missing_file_500(tmp_path):
     db = str(tmp_path / "m.db")
-    server = DaemonControlServer(_FakeJbod(), _FakeSync(), db)
+    server = DaemonControlServer(_FakeStoragePool(), _FakeSync(), db)
     await server.start()
     try:
         with pytest.raises(OSError):
@@ -118,7 +118,7 @@ async def test_put_announces_for_immediate_backup(tmp_path):
     db = str(tmp_path / "m.db")
     sched = _FakeScheduler()
     server = DaemonControlServer(
-        _FakeJbod(), _FakeSync(), db, repl_scheduler=sched
+        _FakeStoragePool(), _FakeSync(), db, repl_scheduler=sched
     )
     await server.start()
     try:
@@ -134,8 +134,8 @@ async def test_put_announces_for_immediate_backup(tmp_path):
 async def test_put_without_scheduler_still_succeeds(tmp_path):
     """리플리케이션 비활성(스케줄러 없음)이어도 put은 정상 동작한다."""
     db = str(tmp_path / "m.db")
-    jbod = _FakeJbod()
-    server = DaemonControlServer(jbod, _FakeSync(), db)  # repl_scheduler=None
+    storage_pool = _FakeStoragePool()
+    server = DaemonControlServer(storage_pool, _FakeSync(), db)  # repl_scheduler=None
     await server.start()
     try:
         src = tmp_path / "up.bin"
@@ -144,7 +144,7 @@ async def test_put_without_scheduler_still_succeeds(tmp_path):
             transfer_via_daemon, db, "put", "/f", str(src)
         )
         assert res["ok"] is True
-        assert jbod.store["/f"] == b"data"
+        assert storage_pool.store["/f"] == b"data"
     finally:
         await server.stop()
 
@@ -155,7 +155,7 @@ async def test_manual_announce_endpoint(tmp_path):
     db = str(tmp_path / "m.db")
     sched = _FakeScheduler()
     server = DaemonControlServer(
-        _FakeJbod(), _FakeSync(), db, repl_scheduler=sched
+        _FakeStoragePool(), _FakeSync(), db, repl_scheduler=sched
     )
     await server.start()
     try:
@@ -172,7 +172,7 @@ async def test_manual_announce_endpoint(tmp_path):
 async def test_manual_announce_without_replication_503(tmp_path):
     """리플리케이션 비활성이면 수동 요청은 규격 오류(503)를 낸다(조용한 무시 금지)."""
     db = str(tmp_path / "m.db")
-    server = DaemonControlServer(_FakeJbod(), _FakeSync(), db)
+    server = DaemonControlServer(_FakeStoragePool(), _FakeSync(), db)
     await server.start()
     try:
         with pytest.raises(OSError):

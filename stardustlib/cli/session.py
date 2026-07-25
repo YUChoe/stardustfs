@@ -7,7 +7,7 @@
   안에서 setup→op→teardown 을 처리한다 (auth_client의 httpx 루프 바인딩 때문).
 
 read_file/write_file의 원격 경로는 remote_source의 전용 이벤트 루프로 자가
-브리지되므로, 명령 본체(동기 JBOD 호출)는 이벤트 루프를 소유하지 않는다.
+브리지되므로, 명령 본체(동기 스토리지 풀 호출)는 이벤트 루프를 소유하지 않는다.
 """
 
 from __future__ import annotations
@@ -41,8 +41,8 @@ class CLISession:
     online 속성이 True면 서버 연동(device 목록 등)이 가능하다.
     """
 
-    def __init__(self, jbod_manager, metadata_store) -> None:
-        self.jbod = jbod_manager
+    def __init__(self, storage_pool, metadata_store) -> None:
+        self.storage_pool = storage_pool
         self.metadata = metadata_store
         # 온라인 setup에서만 채워진다.
         self.online: bool = False
@@ -63,7 +63,7 @@ class CLISession:
         from stardustlib.replication_manager import ReplicationManager
 
         return ReplicationManager(
-            self.auth, self.server_url, self.metadata, self.jbod
+            self.auth, self.server_url, self.metadata, self.storage_pool
         )
 
     @classmethod
@@ -78,10 +78,10 @@ class CLISession:
         from stardustfs import _build_core
 
         config = ConfigLoader(config_path).load()
-        jbod_manager, metadata_store, _enc, _db_key = _build_core(
+        storage_pool, metadata_store, _enc, _db_key = _build_core(
             config, read_only=read_only
         )
-        return cls(jbod_manager, metadata_store)
+        return cls(storage_pool, metadata_store)
 
     @classmethod
     async def open_online(
@@ -108,8 +108,8 @@ class CLISession:
 
         if not server_url:
             logger.info("server.url 미설정, 오프라인 세션으로 시작")
-            jbod, metadata, _enc, _db = _build_core(config)
-            return cls(jbod, metadata)
+            storage_pool, metadata, _enc, _db = _build_core(config)
+            return cls(storage_pool, metadata)
 
         # 저장된 토큰으로 인증 (비밀번호는 사용하지 않음). 토큰 없거나 무효면
         # 오프라인 세션으로 강등 → 온라인 명령은 dispatcher에서 'login 필요' 처리.
@@ -120,8 +120,8 @@ class CLISession:
                 "저장된 자격증명이 없습니다. 'stardustfs login'을 먼저 실행하세요."
             )
             await auth.close()
-            jbod, metadata, _enc, _db = _build_core(config)
-            return cls(jbod, metadata)
+            storage_pool, metadata, _enc, _db = _build_core(config)
+            return cls(storage_pool, metadata)
         try:
             await auth.get_valid_token()
         except AuthenticationError as e:
@@ -130,14 +130,14 @@ class CLISession:
                 e,
             )
             await auth.close()
-            jbod, metadata, _enc, _db = _build_core(config)
-            return cls(jbod, metadata)
+            storage_pool, metadata, _enc, _db = _build_core(config)
+            return cls(storage_pool, metadata)
 
         key_file = config.get("key_file")
         if key_file and not Path(key_file).exists():
             await _restore_key_from_server(auth, key_file, logger)
 
-        jbod, metadata, _enc, db_key = _build_core(config)
+        storage_pool, metadata, _enc, db_key = _build_core(config)
 
         device_name = server.get("device_name", "unknown")
         p2p = config.get("p2p", {})
@@ -151,7 +151,7 @@ class CLISession:
         my_devices = await device_mgr.list_devices()
         self_device_id = _identify_self(my_devices, device_name)
         if self_device_id is not None:
-            jbod.device_id = self_device_id
+            storage_pool.device_id = self_device_id
             device_mgr._device_id = self_device_id
         else:
             logger.warning(
@@ -160,17 +160,17 @@ class CLISession:
                 device_name,
             )
         _mount_remote_sources(
-            config, jbod, auth, server_url,
+            config, storage_pool, auth, server_url,
             my_devices=my_devices, self_device_id=self_device_id,
         )
 
         sync_client = None
         if sync:
             sync_client = await cls._make_sync_client(
-                auth, server_url, metadata, db_key, jbod, device_name, config
+                auth, server_url, metadata, db_key, storage_pool, device_name, config
             )
 
-        session = cls(jbod, metadata)
+        session = cls(storage_pool, metadata)
         session.online = True
         session.auth = auth
         session.device_mgr = device_mgr
@@ -182,7 +182,7 @@ class CLISession:
 
     @staticmethod
     async def _make_sync_client(
-        auth, server_url, metadata, db_key, jbod, device_name, config
+        auth, server_url, metadata, db_key, storage_pool, device_name, config
     ):
         """SyncClient를 만들고 1회 초기 동기화한다. 실패해도 클라이언트는 반환한다
         (이후 upload_metadata로 전파 시도 가능). 동기화 실패 시 로컬 DB로 진행."""
@@ -193,7 +193,7 @@ class CLISession:
         resolver = ConflictResolver(metadata, device_name)
         sync_client = SyncClient(
             auth, server_url, metadata, resolver, interval,
-            encryption_key=db_key, jbod_manager=jbod,
+            encryption_key=db_key, storage_pool=storage_pool,
         )
         try:
             await sync_client.initial_sync()
@@ -231,7 +231,7 @@ class CLISession:
 
     def _close_metadata(self) -> None:
         try:
-            self.jbod.close_local_sources()
+            self.storage_pool.close_local_sources()
         except Exception as e:  # noqa: BLE001 — 종료 경로, 로깅만
             logger.debug("로컬 소스 종료 중 예외: %s", e)
         try:

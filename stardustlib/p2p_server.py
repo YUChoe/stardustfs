@@ -1,7 +1,7 @@
 """P2P 파일 서버.
 
 다른 디바이스의 파일 요청을 처리하는 aiohttp 기반 경량 HTTP 서버.
-JBODManager의 첫 번째 소스를 통해 로컬 스토리지에 접근한다.
+StoragePool의 첫 번째 소스를 통해 로컬 스토리지에 접근한다.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import httpx
 from aiohttp import web
 
 from stardustlib.auth_client import AuthClient
-from stardustlib.jbod_manager import InsufficientStorageError, JBODManager
+from stardustlib.storage_pool import InsufficientStorageError, StoragePool
 from stardustlib.parity_store import ParityStore, QuotaExceededError
 
 logger = logging.getLogger(__name__)
@@ -30,13 +30,13 @@ class P2PServer:
 
     def __init__(
         self,
-        jbod_manager: JBODManager,
+        storage_pool: StoragePool,
         auth_client: AuthClient,
         port: int,
         server_url: str,
         parity_store: ParityStore | None = None,
     ) -> None:
-        self._jbod_manager = jbod_manager
+        self._storage_pool = storage_pool
         self._auth_client = auth_client
         self._port = port
         self._server_url = server_url.rstrip("/")
@@ -49,8 +49,8 @@ class P2PServer:
     @property
     def _source_root(self) -> str:
         """첫 번째 소스의 루트 경로를 반환한다."""
-        if self._jbod_manager.sources:
-            return self._jbod_manager.sources[0].path
+        if self._storage_pool.sources:
+            return self._storage_pool.sources[0].path
         return ""
 
     async def start(self) -> None:
@@ -355,12 +355,12 @@ class P2PServer:
         # 소스(루프백 10MiB)에서 용량 부족(500)이 난다.
         source_id = body.get("source_id")
         if source_id:
-            source = self._jbod_manager._get_source_by_id(source_id)
+            source = self._storage_pool._get_source_by_id(source_id)
             if source is None:
                 return 404, {"error": "Source not found"}
         else:
             try:
-                source = self._jbod_manager.select_source(len(data))
+                source = self._storage_pool.select_source(len(data))
             except InsufficientStorageError as e:
                 return 507, {"error": str(e)}
 
@@ -394,12 +394,12 @@ class P2PServer:
         total_size = int(body.get("total_size", len(data)))
         source_id = body.get("source_id")
         if source_id:
-            source = self._jbod_manager._get_source_by_id(source_id)
+            source = self._storage_pool._get_source_by_id(source_id)
             if source is None:
                 return 404, {"error": "Source not found"}
         elif offset == 0:
             try:
-                source = self._jbod_manager.select_source(total_size)
+                source = self._storage_pool.select_source(total_size)
             except InsufficientStorageError as e:
                 return 507, {"error": str(e)}
         else:
@@ -442,7 +442,7 @@ class P2PServer:
         """파일 삭제 로직."""
         source = self._select_source_or_error(body)
         if isinstance(source, tuple):
-            source = self._jbod_manager.sources[0] if self._jbod_manager.sources else None
+            source = self._storage_pool.sources[0] if self._storage_pool.sources else None
             if source is None:
                 return 404, {"error": "No source available"}
 
@@ -497,7 +497,7 @@ class P2PServer:
         """디렉토리 생성 로직."""
         source = self._select_source_or_error(body)
         if isinstance(source, tuple):
-            source = self._jbod_manager.sources[0] if self._jbod_manager.sources else None
+            source = self._storage_pool.sources[0] if self._storage_pool.sources else None
             if source is None:
                 return 404, {"error": "No source available"}
 
@@ -513,7 +513,7 @@ class P2PServer:
         """디렉토리 삭제 로직."""
         source = self._select_source_or_error(body)
         if isinstance(source, tuple):
-            source = self._jbod_manager.sources[0] if self._jbod_manager.sources else None
+            source = self._storage_pool.sources[0] if self._storage_pool.sources else None
             if source is None:
                 return 404, {"error": "No source available"}
 
@@ -531,7 +531,7 @@ class P2PServer:
 
     def _op_space(self, body: dict) -> tuple[int, dict]:
         """용량 정보 로직."""
-        source = self._jbod_manager.sources[0]
+        source = self._storage_pool.sources[0]
         return 200, {
             "available": source.get_available_space(),
             "total": source.get_total_space(),
@@ -779,12 +779,12 @@ class P2PServer:
         """
         source_id = body.get("source_id")
         if source_id:
-            src = self._jbod_manager._get_source_by_id(source_id)
+            src = self._storage_pool._get_source_by_id(source_id)
             if src is None:
                 return 404, {"error": "Source not found"}
             return src
-        if self._jbod_manager.sources:
-            return self._jbod_manager.sources[0]
+        if self._storage_pool.sources:
+            return self._storage_pool.sources[0]
         return 404, {"error": "No source available"}
 
     def _validate_path_err(

@@ -87,7 +87,7 @@ class ReplicationManager:
         auth_client: AuthClient,
         server_url: str,
         metadata_store: Any,
-        jbod_manager: Any,
+        storage_pool: Any,
         *,
         chunk_size: int = chunker.DEFAULT_CHUNK_SIZE,
         min_replicas: int = DEFAULT_MIN_REPLICAS,
@@ -98,8 +98,8 @@ class ReplicationManager:
         self._auth = auth_client
         self._server_url = server_url.rstrip("/")
         self._meta = metadata_store
-        self._jbod = jbod_manager
-        self._engine = getattr(jbod_manager, "encryption_engine", None)
+        self._storage_pool = storage_pool
+        self._engine = getattr(storage_pool, "encryption_engine", None)
         self._chunk_size = chunk_size
         self._min_replicas = min_replicas
         self._timeout = timeout
@@ -159,7 +159,7 @@ class ReplicationManager:
 
         # at-rest 암호문을 그대로 청킹한다(복호화→재암호화 없음). 백업 표현이 저장
         # 표현과 동일해져 복구 후에도 바이트가 일치하고, 백업 비용이 크게 줄어든다.
-        blob = self._jbod.read_ciphertext(virtual_path)
+        blob = self._storage_pool.read_ciphertext(virtual_path)
         file_ref = self._file_ref(virtual_path)
         chunks = chunker.split(blob, self._chunk_size)
 
@@ -186,7 +186,7 @@ class ReplicationManager:
         # 복호화는 검증(GCM 인증 태그)과 평문 크기 확인용이고, 저장은 받은 암호문을
         # 그대로 한다 — at-rest 바이트가 복제 시점과 동일하게 유지된다.
         plaintext = self._engine.decrypt(blob)
-        self._jbod.write_ciphertext(virtual_path, blob, len(plaintext))
+        self._storage_pool.write_ciphertext(virtual_path, blob, len(plaintext))
         return len(plaintext)
 
     def ensure_replicas(self, virtual_path: str) -> HealReport:
@@ -231,7 +231,7 @@ class ReplicationManager:
     ) -> ReplicationResult:
         token = await self._token()
         # 소유자 자신의 device는 홀더에서 제외한다(자기 기기에 백업은 무의미·헤어핀 실패).
-        self_dev = getattr(self._jbod, "device_id", None)
+        self_dev = getattr(self._storage_pool, "device_id", None)
         exclude = [self_dev] if self_dev else []
         replicas_per_chunk: list[int] = []
         for idx, data in chunks:
@@ -368,7 +368,7 @@ class ReplicationManager:
             # 도달 가능한 소스가 없어 복제 불가 — 데이터 자체는 다른 곳에 있을 수 있음.
             return {"chunk_id": chunk_id, "added": 0, "healthy": False}
 
-        self_dev = getattr(self._jbod, "device_id", None)
+        self_dev = getattr(self._storage_pool, "device_id", None)
         exclude = list(current_devices)
         if self_dev and self_dev not in exclude:
             exclude.append(self_dev)

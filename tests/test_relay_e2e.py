@@ -33,7 +33,7 @@ load_dotenv()
 
 from stardustlib.auth_client import AuthClient
 from stardustlib.device_manager import DeviceManager
-from stardustlib.jbod_manager import JBODManager
+from stardustlib.storage_pool import StoragePool
 from stardustlib.metadata_store import MetadataStore
 from stardustlib.p2p_server import P2PServer
 from stardustlib.relay_worker import RelayWorker
@@ -90,13 +90,13 @@ async def relay_pair(_account):
     a_source.initialize()
     a_store = MetadataStore(os.path.join(a_dir, ".meta.db"), b"\x00" * 32)
     a_store.initialize()
-    a_jbod = JBODManager([a_source], a_store, encryption_engine=None)
+    a_storage_pool = StoragePool([a_source], a_store, encryption_engine=None)
 
     a_auth = AuthClient(SERVER_URL)
     await a_auth.login(EMAIL, PASSWORD)
 
     p2p_port = _free_port()
-    a_p2p = P2PServer(a_jbod, a_auth, p2p_port, SERVER_URL)
+    a_p2p = P2PServer(a_storage_pool, a_auth, p2p_port, SERVER_URL)
     await a_p2p.start()
 
     # 디바이스 등록: connection_address를 도달 불가 주소로 → 직접 연결 차단
@@ -113,7 +113,7 @@ async def relay_pair(_account):
     await b_auth.login(EMAIL, PASSWORD)
     b_remote = RemoteSource("b-remote", device_id, b_auth, SERVER_URL, timeout=3.0)
 
-    yield a_dir, a_jbod, device_id, b_remote
+    yield a_dir, a_storage_pool, device_id, b_remote
 
     await a_worker.stop()
     await a_devmgr.stop()
@@ -125,7 +125,7 @@ async def relay_pair(_account):
 
 async def test_relay_read_when_direct_unreachable(relay_pair):
     """직접 연결 불가 시 PC-B가 릴레이로 PC-A 파일을 읽는다."""
-    a_dir, _a_jbod, _device_id, b_remote = relay_pair
+    a_dir, _a_storage_pool, _device_id, b_remote = relay_pair
 
     payload = b"relayed file content \x00\xfe\xff"
     with open(os.path.join(a_dir, "relay.bin"), "wb") as f:
@@ -141,7 +141,7 @@ async def test_relay_read_when_direct_unreachable(relay_pair):
 
 async def test_relay_exists_when_direct_unreachable(relay_pair):
     """릴레이로 exists 조회."""
-    a_dir, _a_jbod, _device_id, b_remote = relay_pair
+    a_dir, _a_storage_pool, _device_id, b_remote = relay_pair
 
     with open(os.path.join(a_dir, "present.bin"), "wb") as f:
         f.write(b"x")
@@ -152,7 +152,7 @@ async def test_relay_exists_when_direct_unreachable(relay_pair):
 
 async def test_relay_read_missing_file_errors(relay_pair):
     """릴레이 경유라도 없는 파일은 규격 오류(OSError)로 전달된다."""
-    _a_dir, _a_jbod, _device_id, b_remote = relay_pair
+    _a_dir, _a_storage_pool, _device_id, b_remote = relay_pair
 
     await asyncio.to_thread(b_remote.initialize)
     with pytest.raises(OSError):

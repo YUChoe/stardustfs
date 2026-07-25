@@ -45,15 +45,15 @@ def _get_os_info() -> str:
     return f"{platform.system()} {platform.release()} ({platform.machine()})"
 
 
-def build_local_source_inventory(jbod_manager) -> list[dict]:
-    """JBOD의 로컬 소스에서 서버 신고용 인벤토리를 만든다.
+def build_local_source_inventory(storage_pool) -> list[dict]:
+    """스토리지 풀의 로컬 소스에서 서버 신고용 인벤토리를 만든다.
 
     원격 소스(is_remote=True)는 제외한다. 각 항목은 식별자/타입/용량/사용 바이트만
     포함하고 물리 경로·파일명은 포함하지 않는다(zero-knowledge).
     type은 클래스명에서 'Source'를 떼고 소문자로 매핑한다(LoopbackSource→loopback).
     """
     inventory: list[dict] = []
-    for source in jbod_manager.sources:
+    for source in storage_pool.sources:
         if getattr(source, "is_remote", False):
             continue
         try:

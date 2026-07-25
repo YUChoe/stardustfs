@@ -16,7 +16,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from stardustlib.auth_client import AuthClient
-from stardustlib.jbod_manager import JBODManager
+from stardustlib.storage_pool import StoragePool
 from stardustlib.p2p_server import P2PServer
 from stardustlib.remote_source import REMOTE_CHUNK_SIZE, RemoteSource
 from stardustlib.storage_source import DirectorySource, LoopbackSource
@@ -78,11 +78,11 @@ def test_directory_chunk_roundtrip(tmp_path):
 
 def _server(sources):
     store = MagicMock()
-    jbod = JBODManager(sources=sources, metadata_store=store)
+    storage_pool = StoragePool(sources=sources, metadata_store=store)
     auth = MagicMock(spec=AuthClient)
     auth.user_id = "u1"
     return P2PServer(
-        jbod_manager=jbod, auth_client=auth, port=0,
+        storage_pool=storage_pool, auth_client=auth, port=0,
         server_url="http://localhost:8000",
     )
 

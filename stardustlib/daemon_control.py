@@ -109,12 +109,12 @@ class DaemonControlServer:
 
     def __init__(
         self,
-        jbod_manager,
+        storage_pool,
         sync_client,
         metadata_db: str,
         repl_scheduler=None,
     ) -> None:
-        self._jbod = jbod_manager
+        self._storage_pool = storage_pool
         self._sync = sync_client
         self._db = metadata_db
         # 리플리케이션 스케줄러(선택). 쓰기 직후 announce로 즉시 백업을 트리거한다.
@@ -170,8 +170,8 @@ class DaemonControlServer:
             with open(local, "rb") as f:
                 data = f.read()
             logger.info("데몬 put 시작: %s (%d bytes)", vpath, len(data))
-            # 로컬 우선, 만석 시 홀펀칭 UDP로 리모트 스필오버(데몬 jbod에 주입됨).
-            await asyncio.to_thread(self._jbod.write_file, vpath, data)
+            # 로컬 우선, 만석 시 홀펀칭 UDP로 리모트 스필오버(데몬 storage_pool에 주입됨).
+            await asyncio.to_thread(self._storage_pool.write_file, vpath, data)
             if self._sync is not None:
                 await self._sync.upload_metadata()
         except Exception as e:  # noqa: BLE001 — 결과를 위임자에게 전달
@@ -219,7 +219,7 @@ class DaemonControlServer:
         local = body.get("local_path", "")
         try:
             logger.info("데몬 get 시작: %s", vpath)
-            data = await asyncio.to_thread(self._jbod.read_file, vpath)
+            data = await asyncio.to_thread(self._storage_pool.read_file, vpath)
             with open(local, "wb") as f:
                 f.write(data)
         except Exception as e:  # noqa: BLE001

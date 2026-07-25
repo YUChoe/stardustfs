@@ -51,7 +51,7 @@ class SyncClient:
         conflict_resolver: ConflictResolver,
         interval_seconds: int = 30,
         encryption_key: bytes | None = None,
-        jbod_manager=None,
+        storage_pool=None,
     ) -> None:
         self._auth_client = auth_client
         self._server_url = server_url.rstrip("/")
@@ -59,7 +59,7 @@ class SyncClient:
         self._conflict_resolver = conflict_resolver
         self._interval_seconds = interval_seconds
         self._encryption_key = encryption_key
-        self._jbod_manager = jbod_manager  # tombstone 전파 시 물리 파일 삭제용 (선택)
+        self._storage_pool = storage_pool  # tombstone 전파 시 물리 파일 삭제용 (선택)
         self._sync_task: asyncio.Task[None] | None = None
         self._running = False
         # 버전 롱폴링(즉시 동기화) 태스크. 서버 미지원(404) 시 비활성화.
@@ -555,16 +555,16 @@ class SyncClient:
         startup=True이면 플래그와 무관하게 1회 전체 스캔(이전 세션 정리),
         그 외에는 이번 사이클에 소유권 이전/감지가 있었을 때만 1회 스캔한다.
         """
-        jbod = self._jbod_manager
-        if jbod is None:
+        storage_pool = self._storage_pool
+        if storage_pool is None:
             return
         try:
             if startup:
-                if hasattr(jbod, "gc_orphan_files"):
-                    jbod.gc_orphan_files()
+                if hasattr(storage_pool, "gc_orphan_files"):
+                    storage_pool.gc_orphan_files()
             else:
-                if hasattr(jbod, "gc_orphan_files_if_needed"):
-                    jbod.gc_orphan_files_if_needed()
+                if hasattr(storage_pool, "gc_orphan_files_if_needed"):
+                    storage_pool.gc_orphan_files_if_needed()
         except Exception as e:
             logger.warning("orphan GC 실패(무시하고 계속): %s", e)
 
@@ -739,19 +739,19 @@ class SyncClient:
 
         로컬 레코드가 이 디바이스 소유였는데(local device_id == 내 device_id),
         서버 레코드에서 다른 디바이스 소유로 바뀌었다면, 내 로컬 물리 파일은 더
-        이상 metadata가 가리키지 않는 orphan이 된다. JBODManager에 GC 필요
+        이상 metadata가 가리키지 않는 orphan이 된다. StoragePool에 GC 필요
         플래그를 세운다(다음 사이클 1회 스캔).
         """
-        jbod = self._jbod_manager
-        if jbod is None:
+        storage_pool = self._storage_pool
+        if storage_pool is None:
             return
-        my_device = getattr(jbod, "device_id", None)
+        my_device = getattr(storage_pool, "device_id", None)
         if my_device is None:
             return
         if server_rec.deleted:
             return  # 삭제는 기존 tombstone 물리 삭제 경로가 처리
         if local_rec.device_id == my_device and server_rec.device_id != my_device:
-            jbod.mark_gc_needed()
+            storage_pool.mark_gc_needed()
 
     def _handle_conflict(
         self, server_rec: FileMetadata, local_rec: FileMetadata
@@ -829,12 +829,12 @@ class SyncClient:
 
         서버 레코드가 tombstone이면 로컬 물리 파일도 삭제한다.
         """
-        # tombstone 전파 시 물리 파일 삭제 (JBODManager 참조가 있을 때만)
-        if server_rec.deleted and self._jbod_manager is not None:
+        # tombstone 전파 시 물리 파일 삭제 (StoragePool 참조가 있을 때만)
+        if server_rec.deleted and self._storage_pool is not None:
             local_rec = self._metadata_store.lookup(server_rec.virtual_path)
             if local_rec is not None:
                 try:
-                    source = self._jbod_manager._get_source_by_id(
+                    source = self._storage_pool._get_source_by_id(
                         local_rec.source_id
                     )
                     if source is not None and source.is_active:

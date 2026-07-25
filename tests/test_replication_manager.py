@@ -26,8 +26,8 @@ class _FakeAuth:
         return "tok"
 
 
-class _FakeJbod:
-    """실제 JBOD처럼 at-rest 암호문을 보관하는 대역(암호화 엔진은 실제 구현)."""
+class _FakeStoragePool:
+    """실제 스토리지 풀처럼 at-rest 암호문을 보관하는 대역(암호화 엔진은 실제 구현)."""
 
     def __init__(self, key: bytes) -> None:
         self.encryption_engine = EncryptionEngine(key)
@@ -135,9 +135,9 @@ class _Cloud:
         mgr._holder_fetch = holder_fetch
 
 
-def _manager(jbod, meta, holders, **cloud_kwargs):
+def _manager(storage_pool, meta, holders, **cloud_kwargs):
     mgr = ReplicationManager(
-        _FakeAuth(), "http://server", meta, jbod,
+        _FakeAuth(), "http://server", meta, storage_pool,
         chunk_size=64, min_replicas=3,
     )
     cloud = _Cloud(holders, **cloud_kwargs)
@@ -152,10 +152,10 @@ def key() -> bytes:
 
 def test_replicate_then_recover_roundtrip(key):
     content = ("한글 데이터 — binary " * 40).encode("utf-8") + os.urandom(50)
-    jbod = _FakeJbod(key)
-    jbod.put("/a/file.bin", content)
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/a/file.bin", content)
     meta = _FakeMeta({"/a/file.bin"})
-    mgr, _cloud = _manager(jbod, meta, ["h1", "h2", "h3"])
+    mgr, _cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
 
     result = mgr.replicate("/a/file.bin")
     assert result.status == "replicated"
@@ -164,17 +164,17 @@ def test_replicate_then_recover_roundtrip(key):
     assert meta.status["/a/file.bin"] == "replicated"
 
     # 복구: 원본과 정확히 일치 (Property 3)
-    jbod.write_file("/a/file.bin", b"corrupted")  # 로컬 훼손 후 복구
+    storage_pool.write_file("/a/file.bin", b"corrupted")  # 로컬 훼손 후 복구
     n = mgr.recover("/a/file.bin")
     assert n == len(content)
-    assert jbod.read_file("/a/file.bin") == content
+    assert storage_pool.read_file("/a/file.bin") == content
 
 
 def test_replicate_insufficient_holders_is_pending(key):
-    jbod = _FakeJbod(key)
-    jbod.put("/f", b"data")
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", b"data")
     meta = _FakeMeta({"/f"})
-    mgr, _cloud = _manager(jbod, meta, ["h1", "h2"])  # 2 < 3
+    mgr, _cloud = _manager(storage_pool, meta, ["h1", "h2"])  # 2 < 3
 
     result = mgr.replicate("/f")
     assert result.status == "pending"
@@ -183,12 +183,12 @@ def test_replicate_insufficient_holders_is_pending(key):
 
 
 def test_replicate_skips_failed_holder(key):
-    jbod = _FakeJbod(key)
-    jbod.put("/f", b"data")
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", b"data")
     meta = _FakeMeta({"/f"})
     # 4 홀더 중 1곳 store 실패 → 3곳 확보 → replicated
     mgr, _cloud = _manager(
-        jbod, meta, ["h1", "h2", "h3", "h4"], store_fail_addresses={"h2"}
+        storage_pool, meta, ["h1", "h2", "h3", "h4"], store_fail_addresses={"h2"}
     )
     result = mgr.replicate("/f")
     assert result.status == "replicated"
@@ -196,9 +196,9 @@ def test_replicate_skips_failed_holder(key):
 
 
 def test_recover_missing_when_no_chunks(key):
-    jbod = _FakeJbod(key)
+    storage_pool = _FakeStoragePool(key)
     meta = _FakeMeta(set())
-    mgr, _cloud = _manager(jbod, meta, ["h1", "h2", "h3"])
+    mgr, _cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
     with pytest.raises(RecoveryError) as ei:
         mgr.recover("/never-replicated")
     assert ei.value.missing_chunks == []
@@ -206,10 +206,10 @@ def test_recover_missing_when_no_chunks(key):
 
 def test_recover_missing_when_all_holders_offline(key):
     content = ("x" * 200).encode("utf-8")
-    jbod = _FakeJbod(key)
-    jbod.put("/f", content)
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", content)
     meta = _FakeMeta({"/f"})
-    mgr, cloud = _manager(jbod, meta, ["h1", "h2", "h3"])
+    mgr, cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
     mgr.replicate("/f")
     # 모든 홀더 오프라인 → 복구 불가
     cloud.offline = {"h1", "h2", "h3"}
@@ -221,25 +221,25 @@ def test_recover_missing_when_all_holders_offline(key):
 def test_recover_succeeds_with_one_reachable_holder(key):
     """스웜: 홀더 1곳만 도달 가능해도 복구 성공."""
     content = ("y" * 300).encode("utf-8")
-    jbod = _FakeJbod(key)
-    jbod.put("/f", content)
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", content)
     meta = _FakeMeta({"/f"})
-    mgr, cloud = _manager(jbod, meta, ["h1", "h2", "h3"])
+    mgr, cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
     mgr.replicate("/f")
     cloud.offline = {"h1", "h2"}  # h3만 온라인
     n = mgr.recover("/f")
     assert n == len(content)
-    assert jbod.read_file("/f") == content
+    assert storage_pool.read_file("/f") == content
 
 
 def test_ensure_replicas_tops_up_degraded_chunk(key):
     """홀더 1곳 오프라인 → 새 홀더로 복제본을 채워 healthy 회복."""
     content = ("z" * 400).encode("utf-8")
-    jbod = _FakeJbod(key)
-    jbod.put("/f", content)
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", content)
     meta = _FakeMeta({"/f"})
     # cap=3: replicate는 h1~h3에 배치, h4는 재복제 예비.
-    mgr, cloud = _manager(jbod, meta, ["h1", "h2", "h3", "h4"], cap=3)
+    mgr, cloud = _manager(storage_pool, meta, ["h1", "h2", "h3", "h4"], cap=3)
     assert mgr.replicate("/f").status == "replicated"
 
     cloud.offline = {"h1"}  # 1곳 오프라인 → 청크별 online 2 < 3
@@ -253,10 +253,10 @@ def test_ensure_replicas_tops_up_degraded_chunk(key):
 
 
 def test_ensure_replicas_noop_when_healthy(key):
-    jbod = _FakeJbod(key)
-    jbod.put("/f", b"data")
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", b"data")
     meta = _FakeMeta({"/f"})
-    mgr, _cloud = _manager(jbod, meta, ["h1", "h2", "h3"], cap=3)
+    mgr, _cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"], cap=3)
     mgr.replicate("/f")
     report = mgr.ensure_replicas("/f")
     assert report.status == "replicated"
@@ -265,10 +265,10 @@ def test_ensure_replicas_noop_when_healthy(key):
 
 def test_ensure_replicas_unrecoverable_when_no_online_source(key):
     content = ("q" * 200).encode("utf-8")
-    jbod = _FakeJbod(key)
-    jbod.put("/f", content)
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", content)
     meta = _FakeMeta({"/f"})
-    mgr, cloud = _manager(jbod, meta, ["h1", "h2", "h3"], cap=3)
+    mgr, cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"], cap=3)
     mgr.replicate("/f")
     cloud.offline = {"h1", "h2", "h3"}  # 소스 없음 → 복구 불가
     report = mgr.ensure_replicas("/f")
@@ -278,9 +278,9 @@ def test_ensure_replicas_unrecoverable_when_no_online_source(key):
 
 
 def _bare_manager(key):
-    jbod = _FakeJbod(key)
+    storage_pool = _FakeStoragePool(key)
     return ReplicationManager(
-        _FakeAuth(), "http://server", _FakeMeta(set()), jbod, min_replicas=2
+        _FakeAuth(), "http://server", _FakeMeta(set()), storage_pool, min_replicas=2
     )
 
 
@@ -422,9 +422,9 @@ async def test_holder_fetch_udp_before_relay(key):
 
 
 def test_file_ref_does_not_leak_path(key):
-    jbod = _FakeJbod(key)
+    storage_pool = _FakeStoragePool(key)
     meta = _FakeMeta(set())
-    mgr, _cloud = _manager(jbod, meta, [])
+    mgr, _cloud = _manager(storage_pool, meta, [])
     ref = mgr._file_ref("/secret/path/document.txt")
     assert "secret" not in ref and "document" not in ref
     assert len(ref) == 64 and all(c in "0123456789abcdef" for c in ref)
@@ -447,10 +447,10 @@ def test_replicate_registers_chunk_hashes(key):
     """복제 시 각 청크의 암호문 해시가 서버에 등록된다."""
     from stardustlib import chunker
 
-    jbod = _FakeJbod(key)
-    jbod.put("/f", b"x" * 200)
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", b"x" * 200)
     meta = _FakeMeta({"/f"})
-    mgr, cloud = _manager(jbod, meta, ["h1", "h2", "h3"])
+    mgr, cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
     try:
         mgr.replicate("/f")
     finally:
@@ -466,30 +466,30 @@ def test_replicate_registers_chunk_hashes(key):
 
 def test_recover_skips_corrupt_holder(key):
     """손상된 사본을 가진 홀더를 배제하고 정상 홀더에서 복구한다(Property 3)."""
-    jbod = _FakeJbod(key)
+    storage_pool = _FakeStoragePool(key)
     original = b"integrity-check" * 20
-    jbod.put("/f", original)
+    storage_pool.put("/f", original)
     meta = _FakeMeta({"/f"})
-    mgr, cloud = _manager(jbod, meta, ["h1", "h2", "h3"])
+    mgr, cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
     try:
         mgr.replicate("/f")
         # 첫 홀더가 손상된 바이트를 반환하도록 만든다
         cloud.corrupt.add("h1")
-        jbod.write_file("/f", b"")  # 로컬 원본 훼손
+        storage_pool.write_file("/f", b"")  # 로컬 원본 훼손
         nbytes = mgr.recover("/f")
     finally:
         mgr.close()
 
     assert nbytes == len(original)
-    assert jbod.read_file("/f") == original
+    assert storage_pool.read_file("/f") == original
 
 
 def test_recover_fails_when_all_holders_corrupt(key):
     """모든 홀더가 손상이면 누락 chunk_id를 명시한 RecoveryError를 낸다."""
-    jbod = _FakeJbod(key)
-    jbod.put("/f", b"y" * 200)
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", b"y" * 200)
     meta = _FakeMeta({"/f"})
-    mgr, cloud = _manager(jbod, meta, ["h1", "h2", "h3"])
+    mgr, cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
     try:
         mgr.replicate("/f")
         cloud.corrupt.update({"h1", "h2", "h3"})
@@ -503,32 +503,32 @@ def test_recover_fails_when_all_holders_corrupt(key):
 
 def test_recover_without_hash_skips_verification(key):
     """레거시 청크(해시 미등록)는 검증을 생략하고 기존 동작을 유지한다(Property 4)."""
-    jbod = _FakeJbod(key)
+    storage_pool = _FakeStoragePool(key)
     original = b"legacy-chunk" * 10
-    jbod.put("/f", original)
+    storage_pool.put("/f", original)
     meta = _FakeMeta({"/f"})
-    mgr, cloud = _manager(jbod, meta, ["h1", "h2", "h3"])
+    mgr, cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
     try:
         mgr.replicate("/f")
         # 서버가 해시를 모르는 상태(구버전/레거시)로 만든다
         for info in cloud.chunk_meta[mgr._file_ref("/f")]:
             info["hash"] = None
-        jbod.write_file("/f", b"")
+        storage_pool.write_file("/f", b"")
         nbytes = mgr.recover("/f")
     finally:
         mgr.close()
 
     assert nbytes == len(original)
-    assert jbod.read_file("/f") == original
+    assert storage_pool.read_file("/f") == original
 
 
 def test_heal_does_not_copy_corrupt_chunk(key):
     """재복제가 손상된 소스를 배제하고 정상 소스만 새 홀더로 복사한다."""
-    jbod = _FakeJbod(key)
-    jbod.put("/f", b"z" * 100)
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", b"z" * 100)
     meta = _FakeMeta({"/f"})
     # 홀더 3개로 복제 후, 1곳을 손상시키고 새 홀더(h4)를 추가해 보충하게 한다
-    mgr, cloud = _manager(jbod, meta, ["h1", "h2", "h3"])
+    mgr, cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
     try:
         mgr.replicate("/f")
         cloud.corrupt.add("h1")          # 첫 소스는 손상
@@ -549,10 +549,10 @@ def test_heal_does_not_copy_corrupt_chunk(key):
 
 def test_heal_reports_unrecoverable_when_only_source_is_corrupt(key):
     """유효한 소스가 없으면(온라인 소스가 손상뿐) unrecoverable로 보고한다."""
-    jbod = _FakeJbod(key)
-    jbod.put("/f", b"w" * 100)
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", b"w" * 100)
     meta = _FakeMeta({"/f"})
-    mgr, cloud = _manager(jbod, meta, ["h1", "h2", "h3"])
+    mgr, cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
     try:
         mgr.replicate("/f")
         cloud.corrupt.update({"h1", "h2", "h3"})
@@ -575,10 +575,10 @@ def test_replicate_uses_at_rest_ciphertext(key):
     """
     from stardustlib import chunker
 
-    jbod = _FakeJbod(key)
-    jbod.put("/f", b"at-rest-bytes" * 30)
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", b"at-rest-bytes" * 30)
     meta = _FakeMeta({"/f"})
-    mgr, cloud = _manager(jbod, meta, ["h1", "h2", "h3"])
+    mgr, cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
     try:
         mgr.replicate("/f")
     finally:
@@ -588,7 +588,7 @@ def test_replicate_uses_at_rest_ciphertext(key):
     rejoined = chunker.join([
         (c["idx"], cloud.holder_store["h1"][c["chunk_id"]]) for c in infos
     ])
-    assert rejoined == jbod.read_ciphertext("/f")
+    assert rejoined == storage_pool.read_ciphertext("/f")
 
 
 def test_recover_restores_identical_at_rest_bytes(key):
@@ -596,30 +596,30 @@ def test_recover_restores_identical_at_rest_bytes(key):
 
     재암호화하면 등록된 청크 해시와 at-rest가 어긋나므로, 동일성이 중요하다.
     """
-    jbod = _FakeJbod(key)
+    storage_pool = _FakeStoragePool(key)
     original = b"restore-identical" * 25
-    jbod.put("/f", original)
+    storage_pool.put("/f", original)
     meta = _FakeMeta({"/f"})
-    mgr, cloud = _manager(jbod, meta, ["h1", "h2", "h3"])
-    before = jbod.read_ciphertext("/f")
+    mgr, cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
+    before = storage_pool.read_ciphertext("/f")
     try:
         mgr.replicate("/f")
-        jbod.write_file("/f", b"")  # 로컬 훼손(다른 암호문으로 덮어씀)
-        assert jbod.read_ciphertext("/f") != before
+        storage_pool.write_file("/f", b"")  # 로컬 훼손(다른 암호문으로 덮어씀)
+        assert storage_pool.read_ciphertext("/f") != before
         mgr.recover("/f")
     finally:
         mgr.close()
 
-    assert jbod.read_ciphertext("/f") == before  # 바이트 동일 복원
-    assert jbod.read_file("/f") == original
+    assert storage_pool.read_ciphertext("/f") == before  # 바이트 동일 복원
+    assert storage_pool.read_file("/f") == original
 
 
 def test_replicate_needs_no_encryption_engine(key):
     """복제는 at-rest 암호문만 다루므로 암호화 엔진 없이도 동작한다."""
-    jbod = _FakeJbod(key)
-    jbod.put("/f", b"opaque" * 20)
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", b"opaque" * 20)
     meta = _FakeMeta({"/f"})
-    mgr, cloud = _manager(jbod, meta, ["h1", "h2", "h3"])
+    mgr, cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
     mgr._engine = None  # 복제 경로는 엔진에 의존하지 않는다
     try:
         result = mgr.replicate("/f")
