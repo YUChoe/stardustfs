@@ -331,7 +331,9 @@ async def startup_v2(config: dict, config_path: str) -> None:
         from stardustlib.p2p_server import P2PServer
 
         p2p_server = None
-        p2p_enabled = p2p_config.get("enabled", False)
+        # 오프라인 모드에서는 서버 정책을 받을 수 없으므로 로컬 설정만 따른다
+        # (기본 활성). 온라인 복구 후 재시작 시 정책이 적용된다.
+        p2p_enabled = p2p_config.get("enabled", True)
         if p2p_enabled:
             p2p_server = P2PServer(
                 jbod_manager, auth_client, p2p_port, server_url,
@@ -400,15 +402,27 @@ async def startup_v2(config: dict, config_path: str) -> None:
         repl_provided = int(jbod_manager.get_total_space())
     repl_fraction = float(repl_config.get("reciprocity_fraction", _RECIPROCITY_FRACTION))
     repl_min = int(repl_config.get("min_replicas", 1))
-    if repl_enabled:
-        from stardustlib.replication_hosting import fetch_policy, report_hosting
+    # 서버 프로비저닝 스위치(기본 허용). 구버전 서버/도달 불가 시 로컬 설정만 적용.
+    policy_p2p_allowed = True
+    policy_hosting_allowed = True
 
-        policy = await fetch_policy(auth_client, server_url)
-        if policy:
+    from stardustlib.replication_hosting import fetch_policy, report_hosting
+
+    # 정책은 P2P 게이팅에도 쓰이므로 replication.enabled와 무관하게 조회한다.
+    policy = await fetch_policy(auth_client, server_url)
+    if policy:
+        policy_p2p_allowed = policy["p2p_enabled"]
+        policy_hosting_allowed = policy["hosting_enabled"]
+        if repl_enabled:
             repl_fraction = policy["reciprocity_fraction"]
             repl_min = policy["min_replicas"]
-            logger.info("리플리케이션 정책 수신: 상호 보관 %.0f%%, 목표 복제본 %d",
-                        repl_fraction * 100, repl_min)
+        logger.info(
+            "서버 정책 수신: 상호 보관 %.0f%%, 목표 복제본 %d, "
+            "p2p=%s, 호스팅=%s",
+            repl_fraction * 100, repl_min,
+            policy_p2p_allowed, policy_hosting_allowed,
+        )
+    if repl_enabled:
         if device_mgr.device_id and repl_provided > 0:
             ok = await report_hosting(
                 auth_client, server_url, device_mgr.device_id, repl_provided
@@ -510,10 +524,18 @@ async def startup_v2(config: dict, config_path: str) -> None:
     p2p_server = None
     relay_worker = None
     parity_store = None
-    p2p_enabled = p2p_config.get("enabled", False)
+    # P2P는 기본 활성. 서버 정책이 금지하면(엔터프라이즈 격리 등) 끈다.
+    p2p_enabled = p2p_config.get("enabled", True) and policy_p2p_allowed
+    if p2p_config.get("enabled", True) and not policy_p2p_allowed:
+        logger.info("서버 정책으로 P2P 비활성 — 피어 서빙을 시작하지 않습니다")
 
     if p2p_enabled:
-        parity_store = _build_parity_store(config, repl_fraction, repl_provided)
+        # 타 사용자 청크 보관(호스팅)은 정책으로 별도 제어된다. 금지 시 패리티
+        # 보관소를 만들지 않아 replica_* op가 503으로 규격 거부된다.
+        if policy_hosting_allowed:
+            parity_store = _build_parity_store(config, repl_fraction, repl_provided)
+        else:
+            logger.info("서버 정책으로 호스팅 비활성 — 타 사용자 청크를 보관하지 않습니다")
         p2p_server = P2PServer(
             jbod_manager, auth_client, p2p_port, server_url,
             parity_store=parity_store,
@@ -595,12 +617,20 @@ async def startup_v2(config: dict, config_path: str) -> None:
         )
 
         def _apply_policy(policy: dict) -> None:
-            """주기적으로 내려받은 정책을 매니저/패리티에 반영한다."""
+            """주기적으로 내려받은 정책을 매니저/패리티에 반영한다.
+
+            호스팅이 금지로 바뀌면 보관 한도를 0으로 내려 신규 청크 수용을 멈춘다
+            (이미 보관 중인 청크는 소유자가 회수할 수 있도록 유지).
+            """
             repl_mgr.set_min_replicas(policy["min_replicas"])
-            if parity_store is not None and repl_provided > 0:
-                parity_store.set_max_bytes(
-                    int(repl_provided * policy["reciprocity_fraction"])
-                )
+            if parity_store is None or repl_provided <= 0:
+                return
+            if not policy.get("hosting_enabled", True):
+                parity_store.set_max_bytes(0)
+                return
+            parity_store.set_max_bytes(
+                int(repl_provided * policy["reciprocity_fraction"])
+            )
 
         repl_scheduler = ReplicationScheduler(
             repl_mgr, metadata_store, device_mgr.device_id,

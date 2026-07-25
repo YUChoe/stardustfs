@@ -56,10 +56,13 @@ async def report_hosting(
 async def fetch_policy(
     auth_client: AuthClient, server_url: str, *, timeout: float = 10.0
 ) -> dict | None:
-    """GET /replication/policy로 리플리케이션 정책을 내려받는다.
+    """GET /replication/policy로 리플리케이션·전송 정책을 내려받는다(프로비저닝).
 
-    {"reciprocity_fraction": float, "min_replicas": int} 또는 실패 시 None
-    (인증/네트워크/미배포 — 호출자가 설정/기본값 사용).
+    {"reciprocity_fraction": float, "min_replicas": int, "p2p_enabled": bool,
+    "hosting_enabled": bool} 또는 실패 시 None(인증/네트워크/미배포 — 호출자가
+    설정/기본값 사용).
+
+    기능 스위치는 구버전 서버가 반환하지 않으므로 기본 True(허용)로 채운다.
     """
     try:
         token = await auth_client.get_valid_token()
@@ -83,6 +86,9 @@ async def fetch_policy(
         return {
             "reciprocity_fraction": float(data["reciprocity_fraction"]),
             "min_replicas": int(data["min_replicas"]),
+            # 구버전 서버는 미반환 → 허용(기본값)으로 간주
+            "p2p_enabled": bool(data.get("p2p_enabled", True)),
+            "hosting_enabled": bool(data.get("hosting_enabled", True)),
         }
     except (ValueError, KeyError, TypeError):
         return None

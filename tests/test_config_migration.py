@@ -87,10 +87,10 @@ class TestMigrateV1ToV2:
     def test_adds_p2p_defaults(
         self, config_file: Path, v1_config: dict
     ):
-        """p2p 섹션이 기본값으로 추가된다."""
+        """p2p 섹션이 기본값으로 추가된다(기본 활성 — 서버 정책으로 제어)."""
         loader = ConfigLoader(str(config_file))
         result = loader.migrate_v1_to_v2(v1_config)
-        assert result["p2p"] == {"port": 9090, "enabled": False}
+        assert result["p2p"] == {"port": 9090, "enabled": True}
 
     def test_creates_backup_file(
         self, config_file: Path, v1_config: dict

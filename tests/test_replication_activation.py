@@ -110,9 +110,10 @@ class _HostingServer:
         return web.json_response({"status": "ok"}, status=self._status)
 
     async def _policy(self, request: web.Request) -> web.Response:
-        return web.json_response(
-            {"reciprocity_fraction": 0.5, "min_replicas": 3}, status=self._status
-        )
+        body = {"reciprocity_fraction": 0.5, "min_replicas": 3}
+        # 프로비저닝 스위치를 반환하는 서버를 모사할 때만 채운다(미설정=구버전 서버).
+        body.update(getattr(self, "policy_extra", {}) or {})
+        return web.json_response(body, status=self._status)
 
 
 @pytest_asyncio.fixture
@@ -147,10 +148,27 @@ async def test_report_hosting_404_graceful():
 
 @pytest.mark.asyncio
 async def test_fetch_policy_success(hosting_server):
+    """스위치를 반환하지 않는 구버전 서버는 기본 허용(True)으로 채운다."""
     auth = _FakeAuth(hosting_server.url)
     policy = await fetch_policy(auth, hosting_server.url)
     await auth.close()
-    assert policy == {"reciprocity_fraction": 0.5, "min_replicas": 3}
+    assert policy == {
+        "reciprocity_fraction": 0.5, "min_replicas": 3,
+        "p2p_enabled": True, "hosting_enabled": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_fetch_policy_reads_provisioning_switches(hosting_server):
+    """서버가 스위치를 내려주면 그 값을 그대로 반영한다."""
+    hosting_server.policy_extra = {
+        "p2p_enabled": True, "hosting_enabled": False,
+    }
+    auth = _FakeAuth(hosting_server.url)
+    policy = await fetch_policy(auth, hosting_server.url)
+    await auth.close()
+    assert policy["p2p_enabled"] is True
+    assert policy["hosting_enabled"] is False
 
 
 @pytest.mark.asyncio

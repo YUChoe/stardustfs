@@ -329,7 +329,9 @@ class ConfigLoader:
             "interval_seconds": 30,
             "conflict_strategy": "copy",
         }
-        data["p2p"] = {"port": 9090, "enabled": False}
+        # P2P는 기본 활성이다(내 기기 간 파일 접근·백업 호스팅의 전제). 비활성은
+        # 엔터프라이즈 격리 등 예외적인 경우이며 서버 정책으로도 제어된다.
+        data["p2p"] = {"port": 9090, "enabled": True}
 
         # 변환된 설정을 원본 경로에 저장
         try:
