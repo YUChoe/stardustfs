@@ -27,20 +27,29 @@ class _FakeAuth:
 
 
 class _FakeJbod:
-    """평문 저장 + 실제 암호화 엔진을 가진 JBOD 대역."""
+    """실제 JBOD처럼 at-rest 암호문을 보관하는 대역(암호화 엔진은 실제 구현)."""
 
     def __init__(self, key: bytes) -> None:
         self.encryption_engine = EncryptionEngine(key)
+        # 실제 구현과 동일하게 암호문을 저장한다(평문 저장이 아님).
         self._files: dict[str, bytes] = {}
 
     def put(self, virtual_path: str, data: bytes) -> None:
-        self._files[virtual_path] = data
+        self._files[virtual_path] = self.encryption_engine.encrypt(data)
 
     def read_file(self, virtual_path: str) -> bytes:
+        return self.encryption_engine.decrypt(self._files[virtual_path])
+
+    def read_ciphertext(self, virtual_path: str) -> bytes:
         return self._files[virtual_path]
 
     def write_file(self, virtual_path: str, data: bytes) -> None:
-        self._files[virtual_path] = data
+        self._files[virtual_path] = self.encryption_engine.encrypt(data)
+
+    def write_ciphertext(
+        self, virtual_path: str, encrypted: bytes, plain_size: int
+    ) -> None:
+        self._files[virtual_path] = encrypted
 
 
 class _FakeMeta:
@@ -554,3 +563,66 @@ def test_heal_reports_unrecoverable_when_only_source_is_corrupt(key):
 
     assert report.status == "pending"
     assert report.unrecoverable  # 조용한 성공 처리 금지
+
+
+# --- at-rest 암호문 재사용(이중 암호화 제거) ---
+
+def test_replicate_uses_at_rest_ciphertext(key):
+    """복제 청크를 이어붙이면 at-rest 암호문과 바이트 단위로 동일하다.
+
+    복호화→재암호화를 거치면 nonce가 달라져 다른 바이트가 되므로, 이 단언이
+    이중 암호화가 없음을 보장한다.
+    """
+    from stardustlib import chunker
+
+    jbod = _FakeJbod(key)
+    jbod.put("/f", b"at-rest-bytes" * 30)
+    meta = _FakeMeta({"/f"})
+    mgr, cloud = _manager(jbod, meta, ["h1", "h2", "h3"])
+    try:
+        mgr.replicate("/f")
+    finally:
+        mgr.close()
+
+    infos = sorted(cloud.chunk_meta[mgr._file_ref("/f")], key=lambda c: c["idx"])
+    rejoined = chunker.join([
+        (c["idx"], cloud.holder_store["h1"][c["chunk_id"]]) for c in infos
+    ])
+    assert rejoined == jbod.read_ciphertext("/f")
+
+
+def test_recover_restores_identical_at_rest_bytes(key):
+    """복구는 받은 암호문을 그대로 기록해 at-rest 바이트를 동일하게 되돌린다.
+
+    재암호화하면 등록된 청크 해시와 at-rest가 어긋나므로, 동일성이 중요하다.
+    """
+    jbod = _FakeJbod(key)
+    original = b"restore-identical" * 25
+    jbod.put("/f", original)
+    meta = _FakeMeta({"/f"})
+    mgr, cloud = _manager(jbod, meta, ["h1", "h2", "h3"])
+    before = jbod.read_ciphertext("/f")
+    try:
+        mgr.replicate("/f")
+        jbod.write_file("/f", b"")  # 로컬 훼손(다른 암호문으로 덮어씀)
+        assert jbod.read_ciphertext("/f") != before
+        mgr.recover("/f")
+    finally:
+        mgr.close()
+
+    assert jbod.read_ciphertext("/f") == before  # 바이트 동일 복원
+    assert jbod.read_file("/f") == original
+
+
+def test_replicate_needs_no_encryption_engine(key):
+    """복제는 at-rest 암호문만 다루므로 암호화 엔진 없이도 동작한다."""
+    jbod = _FakeJbod(key)
+    jbod.put("/f", b"opaque" * 20)
+    meta = _FakeMeta({"/f"})
+    mgr, cloud = _manager(jbod, meta, ["h1", "h2", "h3"])
+    mgr._engine = None  # 복제 경로는 엔진에 의존하지 않는다
+    try:
+        result = mgr.replicate("/f")
+    finally:
+        mgr.close()
+    assert result.status == "replicated"

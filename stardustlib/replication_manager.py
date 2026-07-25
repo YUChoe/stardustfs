@@ -153,14 +153,13 @@ class ReplicationManager:
         로컬 I/O(읽기·암호화·상태 기록)는 호출 스레드에서, 네트워크는 IO 루프에서
         수행한다. 파일이 없으면 FileNotFoundError, 암호화 미설정 시 ReplicationError.
         """
-        if self._engine is None:
-            raise ReplicationError("암호화 엔진이 없어 복제할 수 없습니다")
         meta = self._meta.lookup(virtual_path)
         if meta is None:
             raise FileNotFoundError(virtual_path)
 
-        plaintext = self._jbod.read_file(virtual_path)
-        blob = self._engine.encrypt(plaintext)
+        # at-rest 암호문을 그대로 청킹한다(복호화→재암호화 없음). 백업 표현이 저장
+        # 표현과 동일해져 복구 후에도 바이트가 일치하고, 백업 비용이 크게 줄어든다.
+        blob = self._jbod.read_ciphertext(virtual_path)
         file_ref = self._file_ref(virtual_path)
         chunks = chunker.split(blob, self._chunk_size)
 
@@ -184,8 +183,10 @@ class ReplicationManager:
             raise ReplicationError("암호화 엔진이 없어 복구할 수 없습니다")
         file_ref = self._file_ref(virtual_path)
         blob = self._io.run_coroutine(self._recover_chunks(file_ref))
+        # 복호화는 검증(GCM 인증 태그)과 평문 크기 확인용이고, 저장은 받은 암호문을
+        # 그대로 한다 — at-rest 바이트가 복제 시점과 동일하게 유지된다.
         plaintext = self._engine.decrypt(blob)
-        self._jbod.write_file(virtual_path, plaintext)
+        self._jbod.write_ciphertext(virtual_path, blob, len(plaintext))
         return len(plaintext)
 
     def ensure_replicas(self, virtual_path: str) -> HealReport:

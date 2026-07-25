@@ -373,6 +373,22 @@ class JBODManager:
             FileNotFoundError: 파일이 존재하지 않을 때.
             OSError: 소스가 비활성 상태일 때.
         """
+        encrypted_data = self.read_ciphertext(virtual_path)
+        if self.encryption_engine is not None:
+            return self.encryption_engine.decrypt(encrypted_data)
+        return encrypted_data
+
+    def read_ciphertext(self, virtual_path: str) -> bytes:
+        """복호화하지 않은 at-rest 암호문을 반환한다.
+
+        복제(replicate)에서 사용한다. 저장된 암호문을 그대로 청크로 나눠 복제하므로
+        백업 표현이 at-rest 표현과 동일해지고, 백업마다 복호화→재암호화하는 비용이
+        사라진다.
+
+        Raises:
+            FileNotFoundError: 파일이 존재하지 않을 때.
+            OSError: 소스가 비활성이거나 원격 디바이스에 도달할 수 없을 때.
+        """
         metadata = self.metadata_store.lookup(virtual_path)
         if metadata is None:
             raise FileNotFoundError(f"파일을 찾을 수 없습니다: {virtual_path}")
@@ -384,29 +400,24 @@ class JBODManager:
         owner = metadata.device_id
         # 로컬 소유 또는 레거시(NULL) → 로컬 읽기
         if owner is None or owner == self.device_id:
-            return self._read_local(metadata)
+            return self._read_local_ciphertext(metadata)
         # 원격 소유 → 디바이스 프록시로 라우팅
-        return self._read_remote(metadata)
+        return self._read_remote_ciphertext(metadata)
 
-    def _read_local(self, metadata) -> bytes:
-        """로컬 소스에서 파일을 읽어 복호화한다."""
+    def _read_local_ciphertext(self, metadata) -> bytes:
+        """로컬 소스에서 at-rest 암호문을 읽는다(복호화하지 않음)."""
         source = self._get_source_by_id(metadata.source_id)
         if source is None or not source.is_active:
             raise OSError(
                 f"파일이 위치한 소스가 비활성 상태입니다: {metadata.source_id}"
             )
+        return source.read(metadata.physical_path)
 
-        encrypted_data = source.read(metadata.physical_path)
+    def _read_remote_ciphertext(self, metadata) -> bytes:
+        """원격 디바이스의 P2P 서버에서 at-rest 암호문을 읽는다(복호화하지 않음).
 
-        if self.encryption_engine is not None:
-            return self.encryption_engine.decrypt(encrypted_data)
-        return encrypted_data
-
-    def _read_remote(self, metadata) -> bytes:
-        """원격 디바이스의 P2P 서버에서 파일을 읽어 로컬에서 복호화한다.
-
-        같은 계정이면 master_key가 동일하므로 원격에서 받은 암호문을
-        로컬 encryption_engine으로 복호화할 수 있다.
+        같은 계정이면 master_key가 동일하므로 호출자가 로컬 encryption_engine으로
+        복호화할 수 있다.
 
         비활성(오프라인) 프록시는 routing 재조회(refresh)로 한 번 재네고시에이션을
         시도한다. 디바이스가 그사이 온라인이 되었으면 활성으로 전환되어 읽기가
@@ -432,13 +443,9 @@ class JBODManager:
                     f"원격 디바이스 오프라인: {metadata.device_id}"
                 )
 
-        encrypted_data = remote.read_from_source(
+        return remote.read_from_source(
             metadata.physical_path, metadata.source_id, metadata.file_size
         )
-
-        if self.encryption_engine is not None:
-            return self.encryption_engine.decrypt(encrypted_data)
-        return encrypted_data
 
     def write_file(self, virtual_path: str, data: bytes) -> None:
         """파일을 암호화하여 저장하고 메타데이터를 기록한다.
@@ -456,14 +463,38 @@ class JBODManager:
             encrypted = self.encryption_engine.encrypt(data)
         else:
             encrypted = data
+        self._store_encrypted(virtual_path, encrypted, len(data))
 
+    def write_ciphertext(
+        self, virtual_path: str, encrypted: bytes, plain_size: int
+    ) -> None:
+        """이미 암호화된 블록을 재암호화 없이 그대로 저장한다.
+
+        복제본 복구(recover)에서 사용한다. 홀더가 보관한 암호문이 곧 at-rest 표현이므로
+        복호화→재암호화를 거치지 않고 원본 바이트를 그대로 복원한다(등록된 청크 해시가
+        복구 후에도 유효하게 유지된다).
+
+        Args:
+            virtual_path: 가상 파일 경로.
+            encrypted: at-rest 암호문 블록.
+            plain_size: 메타데이터에 기록할 평문 크기.
+        """
+        self._store_encrypted(virtual_path, encrypted, plain_size)
+
+    def _store_encrypted(
+        self, virtual_path: str, encrypted: bytes, plain_size: int
+    ) -> None:
+        """암호문 블록을 소스에 저장하고 메타데이터를 기록한다(원자적).
+
+        write_file(평문 암호화 후)과 write_ciphertext(암호문 그대로)의 공통 경로.
+        """
         existing = self.metadata_store.lookup(virtual_path)
 
         if existing is not None:
             # 원격 디바이스 소유 파일 수정 → 로컬 소유권 이전(takeover, 3a)
             owner = existing.device_id
             if owner is not None and owner != self.device_id:
-                self._takeover_write(virtual_path, encrypted, len(data))
+                self._takeover_write(virtual_path, encrypted, plain_size)
                 return
             # 기존 파일 덮어쓰기 (로컬 소유 또는 레거시 NULL)
             source = self._get_source_by_id(existing.source_id)
@@ -476,7 +507,7 @@ class JBODManager:
                 source.write(existing.physical_path, encrypted)
                 self.metadata_store.update(
                     virtual_path,
-                    file_size=len(data),
+                    file_size=plain_size,
                     modified_at=time.time(),
                     device_id=self.device_id,
                 )
@@ -495,7 +526,7 @@ class JBODManager:
             try:
                 source = self.select_source(len(encrypted))
             except InsufficientStorageError:
-                if self._write_to_remote(virtual_path, encrypted, len(data)):
+                if self._write_to_remote(virtual_path, encrypted, plain_size):
                     return
                 raise
             physical_path = self._generate_physical_path(virtual_path)
@@ -508,7 +539,7 @@ class JBODManager:
                     virtual_path=virtual_path,
                     source_id=source.source_id,
                     physical_path=physical_path,
-                    file_size=len(data),
+                    file_size=plain_size,
                     created_at=now,
                     modified_at=now,
                     device_id=self.device_id,
