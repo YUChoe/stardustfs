@@ -74,13 +74,51 @@ def transfer_via_daemon(
     )
 
 
+def announce_via_daemon(metadata_db: str, virtual_paths: list[str]) -> int | None:
+    """데몬에 수동 백업(announce)을 요청한다.
+
+    Returns:
+        등록된 경로 수. 데몬 미실행/연결 실패 시 None(호출자가 안내).
+
+    Raises:
+        OSError: 데몬이 응답했으나 처리 실패(예: 리플리케이션 비활성 503).
+    """
+    ctl = read_ctl(metadata_db)
+    if ctl is None:
+        return None
+    url = f"http://127.0.0.1:{ctl['port']}/ctl/announce"
+    try:
+        resp = httpx.post(
+            url,
+            json={"virtual_paths": virtual_paths},
+            headers={"X-Ctl-Token": ctl["token"]},
+            timeout=30.0,
+        )
+    except httpx.HTTPError as e:
+        logger.info("데몬 announce 실패: %s", e)
+        return None
+    if resp.status_code == 200:
+        return int(resp.json().get("announced", 0))
+    raise OSError(
+        f"데몬 백업 요청 실패: HTTP {resp.status_code}"
+    )
+
+
 class DaemonControlServer:
     """데몬의 로컬 전송 위임 서버(127.0.0.1)."""
 
-    def __init__(self, jbod_manager, sync_client, metadata_db: str) -> None:
+    def __init__(
+        self,
+        jbod_manager,
+        sync_client,
+        metadata_db: str,
+        repl_scheduler=None,
+    ) -> None:
         self._jbod = jbod_manager
         self._sync = sync_client
         self._db = metadata_db
+        # 리플리케이션 스케줄러(선택). 쓰기 직후 announce로 즉시 백업을 트리거한다.
+        self._repl_scheduler = repl_scheduler
         self._token = secrets.token_hex(16)
         self._runner: web.AppRunner | None = None
 
@@ -89,6 +127,7 @@ class DaemonControlServer:
         app.add_routes([
             web.post("/ctl/put", self._handle_put),
             web.post("/ctl/get", self._handle_get),
+            web.post("/ctl/announce", self._handle_announce),
         ])
         self._runner = web.AppRunner(app)
         await self._runner.setup()
@@ -138,8 +177,39 @@ class DaemonControlServer:
         except Exception as e:  # noqa: BLE001 — 결과를 위임자에게 전달
             logger.warning("데몬 put 실패 %s: %s", vpath, e)
             return web.json_response({"error": str(e)}, status=500)
+        # 주기(기본 300초)를 기다리지 않고 즉시 백업하도록 알린다.
+        self._announce(vpath)
         logger.info("데몬 put 완료: %s (%d bytes)", vpath, len(data))
         return web.json_response({"ok": True, "bytes": len(data)})
+
+    def _announce(self, virtual_path: str) -> None:
+        """리플리케이션 스케줄러에 즉시 백업을 알린다(스케줄러 없으면 무시)."""
+        scheduler = self._repl_scheduler
+        if scheduler is None:
+            return
+        try:
+            scheduler.announce(virtual_path)
+        except Exception as e:  # noqa: BLE001 — 전송 결과에 영향 주지 않음
+            logger.warning("백업 announce 실패 %s: %s", virtual_path, e)
+
+    async def _handle_announce(self, request: web.Request) -> web.Response:
+        """수동 백업 요청(GUI 컨텍스트 메뉴). 경로들을 즉시 백업 대상으로 등록한다."""
+        if not self._authorised(request):
+            return web.json_response({"error": "unauthorised"}, status=403)
+        body = await request.json()
+        vpaths = body.get("virtual_paths") or []
+        if not isinstance(vpaths, list):
+            return web.json_response(
+                {"error": "virtual_paths must be a list"}, status=422
+            )
+        if self._repl_scheduler is None:
+            return web.json_response(
+                {"error": "replication is not enabled"}, status=503
+            )
+        for vpath in vpaths:
+            self._announce(str(vpath))
+        logger.info("수동 백업 announce: %d개", len(vpaths))
+        return web.json_response({"ok": True, "announced": len(vpaths)})
 
     async def _handle_get(self, request: web.Request) -> web.Response:
         if not self._authorised(request):

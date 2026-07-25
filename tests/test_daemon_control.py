@@ -100,3 +100,94 @@ async def test_get_missing_file_500(tmp_path):
             )
     finally:
         await server.stop()
+
+
+# --- announce (즉시 백업 요청) ---
+
+class _FakeScheduler:
+    def __init__(self) -> None:
+        self.announced: list[str] = []
+
+    def announce(self, vpath: str) -> None:
+        self.announced.append(vpath)
+
+
+@pytest.mark.asyncio
+async def test_put_announces_for_immediate_backup(tmp_path):
+    """put 완료 후 스케줄러에 announce해 주기 대기 없이 백업되게 한다."""
+    db = str(tmp_path / "m.db")
+    sched = _FakeScheduler()
+    server = DaemonControlServer(
+        _FakeJbod(), _FakeSync(), db, repl_scheduler=sched
+    )
+    await server.start()
+    try:
+        src = tmp_path / "up.bin"
+        src.write_bytes(b"data")
+        await asyncio.to_thread(transfer_via_daemon, db, "put", "/f", str(src))
+        assert sched.announced == ["/f"]
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_put_without_scheduler_still_succeeds(tmp_path):
+    """리플리케이션 비활성(스케줄러 없음)이어도 put은 정상 동작한다."""
+    db = str(tmp_path / "m.db")
+    jbod = _FakeJbod()
+    server = DaemonControlServer(jbod, _FakeSync(), db)  # repl_scheduler=None
+    await server.start()
+    try:
+        src = tmp_path / "up.bin"
+        src.write_bytes(b"data")
+        res = await asyncio.to_thread(
+            transfer_via_daemon, db, "put", "/f", str(src)
+        )
+        assert res["ok"] is True
+        assert jbod.store["/f"] == b"data"
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_manual_announce_endpoint(tmp_path):
+    """수동 백업 요청(GUI 컨텍스트 메뉴)이 경로들을 스케줄러에 등록한다."""
+    db = str(tmp_path / "m.db")
+    sched = _FakeScheduler()
+    server = DaemonControlServer(
+        _FakeJbod(), _FakeSync(), db, repl_scheduler=sched
+    )
+    await server.start()
+    try:
+        count = await asyncio.to_thread(
+            daemon_control.announce_via_daemon, db, ["/a", "/b"]
+        )
+        assert count == 2
+        assert sched.announced == ["/a", "/b"]
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_manual_announce_without_replication_503(tmp_path):
+    """리플리케이션 비활성이면 수동 요청은 규격 오류(503)를 낸다(조용한 무시 금지)."""
+    db = str(tmp_path / "m.db")
+    server = DaemonControlServer(_FakeJbod(), _FakeSync(), db)
+    await server.start()
+    try:
+        with pytest.raises(OSError):
+            await asyncio.to_thread(
+                daemon_control.announce_via_daemon, db, ["/a"]
+            )
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_manual_announce_no_daemon_returns_none(tmp_path):
+    """데몬 미실행이면 None을 반환해 호출자가 안내할 수 있게 한다."""
+    db = str(tmp_path / "absent.db")
+    count = await asyncio.to_thread(
+        daemon_control.announce_via_daemon, db, ["/a"]
+    )
+    assert count is None

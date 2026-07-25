@@ -19,6 +19,9 @@ _BACKLOG_DRAIN_DELAY = 2.0
 # 복제 미완료(pending)가 남으면 전체 주기(backup_interval)를 기다리지 않고 짧게 재시도한다.
 # 지속 실패(예: 도달 불가·전송 한도) 시 backup_interval까지 지수 백오프로 늘려 폭주를 막는다.
 _RETRY_MIN_DELAY = 15.0
+# announce(쓰기 직후 즉시 백업) 병합 창(초). 연속 업로드 버스트를 한 사이클로 모으고,
+# 도달 불가 홀더 상황에서 announce가 hot loop가 되지 않도록 최소 간격을 보장한다.
+_ANNOUNCE_COALESCE_DELAY = 2.0
 
 
 class ReplicationScheduler:
@@ -53,6 +56,9 @@ class ReplicationScheduler:
         self._policy_interval = policy_interval
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
+        # announce: 쓰기/수동 요청으로 즉시 백업할 경로. 백업 루프를 깨워 우선 처리한다.
+        self._announced: set[str] = set()
+        self._wake = asyncio.Event()
         # vpath → 처음 degraded로 관측된 시각(monotonic). 유예 경과 시 재복제.
         self._degraded_since: dict[str, float] = {}
         # 로컬에 물리 파일이 없어 백업 불가한 vpath(다른 device 소유의 NULL 레코드 등).
@@ -113,6 +119,21 @@ class ReplicationScheduler:
         except asyncio.TimeoutError:
             pass
 
+    def announce(self, virtual_path: str) -> None:
+        """파일을 즉시 백업 대상으로 등록하고 백업 루프를 깨운다.
+
+        쓰기 직후(데몬 전송 위임) 또는 사용자의 수동 요청(GUI)에서 호출한다. 주기
+        (기본 300초)를 기다리지 않고 다음 사이클에서 우선 처리한다. 여러 번 호출해도
+        집합으로 병합되며, 실제 사이클은 병합 창(_ANNOUNCE_COALESCE_DELAY) 이후 1회
+        수행된다.
+
+        데몬 이벤트 루프에서 호출해야 한다(asyncio.Event는 스레드 안전하지 않음).
+        """
+        self._announced.add(virtual_path)
+        # 이전에 '로컬에 없음'으로 캐시됐더라도 새로 기록됐을 수 있으므로 해제한다.
+        self._skip_backup.discard(virtual_path)
+        self._wake.set()
+
     async def _backup_loop(self) -> None:
         while not self._stop.is_set():
             processed = 0
@@ -123,7 +144,32 @@ class ReplicationScheduler:
             except Exception as e:  # noqa: BLE001 — 루프 유지
                 logger.error("백업 주기 오류: %s", e, exc_info=True)
             delay = self._next_delay(processed)
-            await self._sleep(delay)
+            await self._wait_next(delay)
+
+    async def _wait_next(self, seconds: float) -> None:
+        """다음 사이클까지 대기한다. announce가 오면 병합 창 후 즉시 진행한다.
+
+        정지 신호는 즉시 깨운다. announce로 깨어난 경우 버스트를 모으기 위해 짧은
+        병합 창만큼 더 기다린 뒤 사이클을 시작한다(파일마다 사이클 도는 것 방지).
+        """
+        stop_task = asyncio.ensure_future(self._stop.wait())
+        wake_task = asyncio.ensure_future(self._wake.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {stop_task, wake_task},
+                timeout=seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in (stop_task, wake_task):
+                if not task.done():
+                    task.cancel()
+        if self._stop.is_set():
+            return
+        if wake_task in done:
+            self._wake.clear()
+            # 연속 announce를 한 사이클로 모은다(정지 시 즉시 탈출).
+            await self._sleep(_ANNOUNCE_COALESCE_DELAY)
 
     def _next_delay(self, processed: int) -> float:
         """다음 백업 주기까지 대기 시간을 정한다.
@@ -148,14 +194,20 @@ class ReplicationScheduler:
     async def run_backup_cycle(self) -> int:
         """미복제/미완료(none|pending) 로컬 파일 ≤max개를 복제한다.
 
-        pending(목표 미달)도 매 주기 재시도해 홀더가 확보되면 곧 replicated가 된다
-        (heal의 24h 유예와 달리 즉시 재시도). 처리한 파일 수를 반환한다.
+        announce된 경로(쓰기 직후/수동 요청)를 먼저 처리하고, 남은 자리를 일반 대상으로
+        채운다. pending(목표 미달)도 매 주기 재시도해 홀더가 확보되면 곧 replicated가
+        된다(heal의 24h 유예와 달리 즉시 재시도). 처리한 파일 수를 반환한다.
         """
         paths = self._metadata.list_virtual_paths_for_replication(
             ("none", "pending"), self._owner_device_id
         )
+        # announce된 경로를 앞으로. 이미 복제 완료됐으면 대상 목록에 없으므로 빠진다.
+        announced = self._take_announced()
+        eligible = set(paths)
+        ordered = [vp for vp in announced if vp in eligible]
+        ordered += [vp for vp in paths if vp not in announced]
         targets = [
-            vp for vp in paths[: self._max] if vp not in self._skip_backup
+            vp for vp in ordered[: self._max] if vp not in self._skip_backup
         ]
         if not targets:
             return 0
@@ -190,6 +242,14 @@ class ReplicationScheduler:
         await asyncio.gather(*[_one(vp) for vp in targets])
         self._last_pending = pending[0]
         return done[0]
+
+    def _take_announced(self) -> list[str]:
+        """announce 큐를 비우고 목록으로 반환한다(중복 처리 방지)."""
+        if not self._announced:
+            return []
+        items = list(self._announced)
+        self._announced.clear()
+        return items
 
     async def _heal_loop(self) -> None:
         while not self._stop.is_set():

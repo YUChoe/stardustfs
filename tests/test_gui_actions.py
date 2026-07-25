@@ -162,3 +162,17 @@ def test_restore_paths_requires_online(tmp_path):
     # 오프라인(server.url 없음) → 온라인 세션 불가 → RuntimeError(로그인 필요)
     with pytest.raises(RuntimeError):
         actions.restore_paths(cfg_path, ["/some/file.txt"])
+
+
+def test_announce_paths_without_daemon(tmp_path):
+    """announce_paths는 데몬 미실행 시 daemon=False로 알린다(예외 없음).
+
+    온라인 세션이 필요 없는 경량 요청이므로 오프라인 설정에서도 호출 가능하다.
+    """
+    base = tmp_path / "setup-announce"
+    cfg_path = actions.create_config(
+        str(base), "", "dev-an", generate_key=True
+    )
+    result = actions.announce_paths(cfg_path, ["/some/file.txt"])
+    assert result["daemon"] is False
+    assert result["announced"] == 0

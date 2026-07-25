@@ -68,6 +68,11 @@ _KO: dict[str, str] = {
     "backup_pick": "백업할 파일을 선택하세요.",
     "backup_done": "백업 완료: {ok}개 / 미완료(pending) {pending}개",
     "restore_done": "복원 완료: {ok}개 / 실패 {failed}개",
+    # 즉시 백업 요청(announce)
+    "ctx_announce": "지금 백업 요청",
+    "announce_busy": "백업 요청 중...",
+    "announce_done": "백업 요청 완료: {count}개 (데몬이 곧 처리)",
+    "announce_no_daemon": "데몬이 실행 중이 아닙니다. 백업 요청을 보낼 수 없습니다.",
     "err_status": "오류: {msg}",
     # 업로드/다운로드
     "upload_pick": "업로드할 파일",
@@ -245,6 +250,11 @@ _EN: dict[str, str] = {
     "backup_pick": "Select files to back up.",
     "backup_done": "Backed up: {ok} done / {pending} pending",
     "restore_done": "Restored: {ok} done / {failed} failed",
+    # Immediate backup request (announce)
+    "ctx_announce": "Back up now",
+    "announce_busy": "Requesting backup...",
+    "announce_done": "Backup requested: {count} file(s), the daemon will handle it shortly",
+    "announce_no_daemon": "The daemon is not running, so the backup request could not be sent.",
     "err_status": "Error: {msg}",
     "upload_pick": "File to upload",
     "uploading": "Uploading: {name}",

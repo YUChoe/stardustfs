@@ -392,6 +392,11 @@ class MetadataStore:
         device_id는 이 변경을 수행한 디바이스 ID (없으면 기존 값 유지).
         source_id/physical_path는 소유권 이전(takeover) 시 물리 위치를 함께
         갱신하기 위해 사용한다 (없으면 기존 값 유지).
+
+        내용이 바뀌었으므로 replication_status를 'none'으로 무효화한다. 청크 ID는
+        경로 기반이라 홀더가 옛 내용을 그대로 들고 있어도 건강해 보이므로, 여기서
+        무효화하지 않으면 수정된 파일이 자동 백업 대상('none'|'pending')에서 영구히
+        제외되어 낡은 백업이 '완료'로 남는다.
         """
         conn = self._get_conn()
         set_clauses = [
@@ -400,6 +405,7 @@ class MetadataStore:
             "version = version + 1",
             "sync_status = 'pending'",
             "evicted = 0",  # 내용/위치 갱신 = 재구체화 → 축출 플래그 해제
+            "replication_status = 'none'",  # 내용 변경 → 기존 복제본은 무효
         ]
         params: list = [file_size, modified_at]
         if device_id is not None:

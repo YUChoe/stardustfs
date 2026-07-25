@@ -771,6 +771,31 @@ def heal_paths(config_path: str, vpaths: list[str]) -> list[dict]:
     return asyncio.run(_run_online(config_path, aop, sync=False))
 
 
+def announce_paths(config_path: str, vpaths: list[str]) -> dict:
+    """선택한 파일들의 백업을 데몬에 즉시 요청한다(announce).
+
+    데몬의 백업 주기(기본 300초)를 기다리지 않고 다음 사이클에서 우선 처리하게 한다.
+    전송은 데몬이 수행하므로 GUI는 대기하지 않는다(비차단).
+
+    Returns:
+        {"announced": int} 또는 데몬 미실행 시 {"announced": 0, "daemon": False}.
+
+    Raises:
+        OSError: 데몬이 리플리케이션 비활성(503) 등으로 요청을 거부한 경우.
+    """
+    from stardustlib import daemon_control
+
+    config = ConfigLoader(config_path).load()
+    db = config.get("metadata_db")
+    if not db:
+        return {"announced": 0, "daemon": False}
+    norm = [_vpath(p) for p in vpaths]
+    count = daemon_control.announce_via_daemon(db, norm)
+    if count is None:
+        return {"announced": 0, "daemon": False}
+    return {"announced": count, "daemon": True}
+
+
 def _delegate(config_path: str, op: str, virtual_path: str, local_path: str):
     """데몬이 실행 중이면 전송을 데몬에 위임한다(홀펀칭 활용). 반환 dict 또는 None.
 

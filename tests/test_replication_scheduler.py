@@ -297,3 +297,125 @@ async def test_policy_loop_applies_policy():
         await asyncio.sleep(0.01)
     await sched.stop()
     assert applied and applied[0]["min_replicas"] == 5
+
+
+# --- 수정 시 복제 상태 무효화 (낡은 백업이 '완료'로 남는 버그 회귀) ---
+
+def test_update_invalidates_replication_status():
+    """파일 수정 시 replication_status가 none으로 되돌아 자동 백업 대상에 다시 잡힌다.
+
+    청크 ID는 경로 기반이라 홀더가 옛 내용을 들고 있어도 건강해 보인다. 무효화하지
+    않으면 수정된 파일이 ('none','pending') 대상에서 영구히 빠져 낡은 백업이
+    '완료'로 남는다.
+    """
+    s = _store()
+    try:
+        s.insert("/a", "src", "p_a", 10, 0.0, 0.0, device_id="devA")
+        s.set_replication_status("/a", "replicated")
+        assert s.list_virtual_paths_for_replication(("none", "pending"), "devA") == []
+
+        # 내용 수정
+        s.update("/a", file_size=20, modified_at=1.0, device_id="devA")
+
+        assert s.get_replication_status("/a") == "none"
+        assert s.list_virtual_paths_for_replication(
+            ("none", "pending"), "devA"
+        ) == ["/a"]
+    finally:
+        s.close()
+
+
+def test_takeover_update_invalidates_replication_status():
+    """소유권 이전(source/physical 갱신)도 복제 상태를 무효화한다."""
+    s = _store()
+    try:
+        s.insert("/a", "srcOld", "p_old", 10, 0.0, 0.0, device_id="devB")
+        s.set_replication_status("/a", "replicated")
+        s.update(
+            "/a", file_size=30, modified_at=2.0, device_id="devA",
+            source_id="srcNew", physical_path="p_new",
+        )
+        rec = s.lookup("/a")
+        assert rec is not None
+        assert rec.replication_status == "none"
+        assert rec.source_id == "srcNew"
+        assert rec.physical_path == "p_new"
+    finally:
+        s.close()
+
+
+# --- announce (즉시 백업 요청) ---
+
+@pytest.mark.asyncio
+async def test_announce_prioritises_path_in_next_cycle():
+    """announce된 경로가 대상 목록 앞으로 와서 상한 안에 먼저 처리된다."""
+    mgr = _FakeManager()
+    sched = ReplicationScheduler(
+        mgr, _FakeMeta(["/a", "/b", "/c"]), "devA", max_files_per_cycle=1,
+    )
+    sched.announce("/c")
+    n = await sched.run_backup_cycle()
+    assert n == 1
+    assert mgr.replicated == ["/c"]  # 목록 순서상 /a가 아니라 announce된 /c
+
+
+@pytest.mark.asyncio
+async def test_announce_queue_is_drained_once():
+    """announce 큐는 한 사이클에서 비워져 다음 사이클에 중복 우선되지 않는다."""
+    mgr = _FakeManager()
+    sched = ReplicationScheduler(mgr, _FakeMeta(["/a"]), "devA")
+    sched.announce("/a")
+    await sched.run_backup_cycle()
+    assert sched._announced == set()
+
+
+@pytest.mark.asyncio
+async def test_announce_clears_skip_cache():
+    """이전에 '로컬에 없음'으로 캐시된 경로도 announce하면 다시 시도한다."""
+    mgr = _FakeManager()
+    mgr.missing_paths = {"/gone"}
+    sched = ReplicationScheduler(mgr, _FakeMeta(["/gone"]), "devA")
+    await sched.run_backup_cycle()
+    assert "/gone" in sched._skip_backup
+
+    mgr.missing_paths = set()  # 다시 기록됨
+    sched.announce("/gone")
+    assert "/gone" not in sched._skip_backup
+    n = await sched.run_backup_cycle()
+    assert n == 1
+    assert mgr.replicated == ["/gone"]
+
+
+@pytest.mark.asyncio
+async def test_announce_ignores_already_replicated_path():
+    """대상 목록에 없는(이미 복제 완료) 경로를 announce해도 오류 없이 무시된다."""
+    mgr = _FakeManager()
+    sched = ReplicationScheduler(mgr, _FakeMeta([]), "devA")
+    sched.announce("/done")
+    n = await sched.run_backup_cycle()
+    assert n == 0
+    assert mgr.replicated == []
+
+
+@pytest.mark.asyncio
+async def test_announce_wakes_backup_loop_before_interval():
+    """announce가 긴 백업 주기 대기를 깨워 즉시 사이클을 돌린다."""
+    mgr = _FakeManager()
+    sched = ReplicationScheduler(
+        mgr, _FakeMeta(["/a"]), "devA", backup_interval=3600.0,
+    )
+    # 병합 창을 짧게 해 테스트가 오래 걸리지 않도록 한다.
+    import stardustlib.replication_scheduler as mod
+    original = mod._ANNOUNCE_COALESCE_DELAY
+    mod._ANNOUNCE_COALESCE_DELAY = 0.01
+    try:
+        await sched.start()
+        await asyncio.sleep(0.05)  # 최초 사이클 완료(=/a 복제, 이후 3600초 대기)
+        assert mgr.replicated == ["/a"]
+
+        sched.announce("/a")
+        await asyncio.sleep(0.2)  # 주기(3600초)를 기다리지 않고 재실행되어야 함
+        assert mgr.replicated.count("/a") >= 2
+    finally:
+        mod._ANNOUNCE_COALESCE_DELAY = original
+        await sched.stop()

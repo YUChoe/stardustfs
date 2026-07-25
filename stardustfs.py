@@ -637,7 +637,8 @@ async def startup_v2(config: dict, config_path: str) -> None:
         from stardustlib.daemon_control import DaemonControlServer
 
         control_server = DaemonControlServer(
-            jbod_manager, sync_client, config["metadata_db"]
+            jbod_manager, sync_client, config["metadata_db"],
+            repl_scheduler=repl_scheduler,
         )
         await control_server.start()
     except Exception as e:  # noqa: BLE001 — 비치명(위임 없으면 GUI가 직접 수행)

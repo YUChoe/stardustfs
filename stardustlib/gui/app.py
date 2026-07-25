@@ -337,6 +337,7 @@ class StardustApp:
             self.tree.column(c, width=w, anchor=anchor)
         self.tree.pack(fill="both", expand=True, padx=6)
         self.tree.bind("<Double-1>", self._on_double)
+        self._build_context_menu()
         paned.add(file_frame, weight=3)
 
         mgmt_frame = ttk.Frame(paned)
@@ -650,6 +651,62 @@ class StardustApp:
         self.device_label.config(text=self.t["device_status"].format(
             online=s.get("online", 0), total=s.get("total", 0),
         ))
+
+    # --- 컨텍스트 메뉴 ---
+
+    def _build_context_menu(self) -> None:
+        """파일 목록의 오른쪽 클릭 팝업 메뉴를 만든다."""
+        menu = tk.Menu(self.tree, tearoff=0)
+        menu.add_command(label=self.t["ctx_announce"],
+                         command=self._announce_selected)
+        menu.add_separator()
+        menu.add_command(label=self.t["backup_now"],
+                         command=self._backup_selected)
+        menu.add_command(label=self.t["heal_now"], command=self._heal_selected)
+        menu.add_command(label=self.t["restore_now"],
+                         command=self._restore_selected)
+        menu.add_separator()
+        menu.add_command(label=self.t["download"], command=self._download)
+        menu.add_command(label=self.t["delete"], command=self._delete)
+        theme.style_menu(menu, dark=self.theme == "dark")
+        self._ctx_menu = menu
+        # Windows/X11은 Button-3, macOS는 Button-2
+        self.tree.bind("<Button-3>", self._on_context_menu)
+        self.tree.bind("<Button-2>", self._on_context_menu)
+
+    def _on_context_menu(self, event) -> None:
+        """클릭 위치의 행을 선택(이미 다중 선택된 행이면 유지)하고 메뉴를 띄운다."""
+        iid = self.tree.identify_row(event.y)
+        if iid and iid not in self.tree.selection():
+            self.tree.selection_set(iid)
+        if not self.tree.selection():
+            return
+        try:
+            self._ctx_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._ctx_menu.grab_release()
+
+    def _announce_selected(self) -> None:
+        """선택 파일의 백업을 데몬에 즉시 요청한다(주기 대기 없음)."""
+        files = [r for r in self._selected_rows() if r["type"] == "file"]
+        if not files:
+            messagebox.showinfo(self.t["app_title"], self.t["backup_pick"])
+            return
+        cfg = self.config_path
+        paths = [self._join(r["name"]) for r in files]
+        self._submit(
+            lambda: actions.announce_paths(cfg, paths),
+            self._show_announce_result, self.t["announce_busy"],
+        )
+
+    def _show_announce_result(self, result: dict) -> None:
+        """announce 결과를 상태바에 표시한다(데몬 미실행이면 안내)."""
+        if not result.get("daemon"):
+            self._set_status(self.t["announce_no_daemon"])
+            return
+        self._set_status(
+            self.t["announce_done"].format(count=result.get("announced", 0))
+        )
 
     def _selected(self) -> dict | None:
         sel = self.tree.selection()
