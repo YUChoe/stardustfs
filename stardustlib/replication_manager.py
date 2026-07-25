@@ -235,7 +235,10 @@ class ReplicationManager:
         replicas_per_chunk: list[int] = []
         for idx, data in chunks:
             chunk_id = self._chunk_id(file_ref, idx)
-            await self._register_chunk(token, chunk_id, file_ref, idx, len(data))
+            await self._register_chunk(
+                token, chunk_id, file_ref, idx, len(data),
+                chunk_hash=chunker.chunk_hash(data),
+            )
             holders = await self._placement(token, len(data), exclude=exclude)
             placed = 0
             for holder in holders:
@@ -273,7 +276,9 @@ class ReplicationManager:
         for info in chunk_infos:
             chunk_id = info["chunk_id"]
             idx = info["idx"]
-            data = await self._fetch_from_any_holder(token, chunk_id)
+            data = await self._fetch_from_any_holder(
+                token, chunk_id, info.get("hash")
+            )
             if data is None:
                 missing.append(chunk_id)
             else:
@@ -343,13 +348,21 @@ class ReplicationManager:
             return {"chunk_id": chunk_id, "added": 0, "healthy": True}
 
         # 온라인 홀더에서 청크를 받아온다(재암호화 없이 그대로 복사).
+        # 손상된 사본을 새 홀더로 퍼뜨리지 않도록 복사 전에 무결성을 검증한다.
+        expected_hash = info.get("hash")
         data = None
         for h in online:
-            data = await self._holder_fetch(
+            candidate = await self._holder_fetch(
                 h.get("device_id"), h.get("connection_address"), chunk_id, token
             )
-            if data is not None:
-                break
+            if candidate is None:
+                continue
+            if not self._verify_chunk(
+                chunk_id, candidate, expected_hash, h.get("device_id")
+            ):
+                continue  # 손상된 소스 → 다음 온라인 홀더
+            data = candidate
+            break
         if data is None:
             # 도달 가능한 소스가 없어 복제 불가 — 데이터 자체는 다른 곳에 있을 수 있음.
             return {"chunk_id": chunk_id, "added": 0, "healthy": False}
@@ -379,9 +392,14 @@ class ReplicationManager:
         }
 
     async def _fetch_from_any_holder(
-        self, token: str, chunk_id: str
+        self, token: str, chunk_id: str, expected_hash: str | None = None
     ) -> bytes | None:
-        """청크의 홀더 중 온라인·도달 가능한 곳에서 처음 성공한 데이터를 반환한다."""
+        """온라인·도달 가능한 홀더에서 청크를 받아 무결성 검증까지 통과한 것을 반환한다.
+
+        expected_hash가 있으면 받은 바이트의 SHA-256과 비교해, 불일치하면 그 홀더의
+        응답을 버리고 다음 홀더를 시도한다(손상된 사본 격리). expected_hash가 None인
+        레거시 청크는 검증을 생략한다.
+        """
         holders = await self._list_replicas(token, chunk_id)
         for holder in holders:
             if holder.get("is_online") is False:
@@ -391,9 +409,34 @@ class ReplicationManager:
             if not device_id and not address:
                 continue
             data = await self._holder_fetch(device_id, address, chunk_id, token)
-            if data is not None:
-                return data
+            if data is None:
+                continue
+            if not self._verify_chunk(chunk_id, data, expected_hash, device_id):
+                continue  # 손상된 사본 → 다음 홀더
+            return data
         return None
+
+    @staticmethod
+    def _verify_chunk(
+        chunk_id: str, data: bytes, expected_hash: str | None,
+        device_id: str | None,
+    ) -> bool:
+        """받은 청크가 등록된 해시와 일치하는지 확인한다(해시 없으면 통과).
+
+        불일치는 경고로 남긴다 — 조용히 성공 처리하지 않고 호출자가 다음 홀더를
+        시도하거나 규격 에러로 종결한다.
+        """
+        if not expected_hash:
+            return True  # 레거시 청크(해시 미등록) 또는 구버전 서버
+        actual = chunker.chunk_hash(data)
+        if actual == expected_hash:
+            return True
+        logger.warning(
+            "청크 무결성 불일치 — 홀더 배제: chunk=%s holder=%s "
+            "expected=%s actual=%s",
+            chunk_id, device_id, expected_hash[:12], actual[:12],
+        )
+        return False
 
     # ------------------------------------------------------------------
     # 서버 제어 평면 호출 (단위 테스트에서 패치 가능)
@@ -409,12 +452,23 @@ class ReplicationManager:
         return {"Authorization": f"Bearer {token}"}
 
     async def _register_chunk(
-        self, token: str, chunk_id: str, file_ref: str, idx: int, size: int
+        self, token: str, chunk_id: str, file_ref: str, idx: int, size: int,
+        chunk_hash: str | None = None,
     ) -> None:
+        """청크를 서버 레지스트리에 등록한다(내용 해시 포함).
+
+        chunk_hash는 복구·재복제에서 받은 바이트를 검증하는 데 쓰인다. 구버전 서버는
+        이 필드를 무시한다(선택 필드).
+        """
+        payload: dict[str, Any] = {
+            "chunk_id": chunk_id, "file_ref": file_ref,
+            "idx": idx, "size": size,
+        }
+        if chunk_hash is not None:
+            payload["hash"] = chunk_hash
         await self._client.post(
             f"{self._server_url}/replication/chunks",
-            json={"chunk_id": chunk_id, "file_ref": file_ref,
-                  "idx": idx, "size": size},
+            json=payload,
             headers=self._auth_headers(token),
         )
 

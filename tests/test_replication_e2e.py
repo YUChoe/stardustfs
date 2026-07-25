@@ -100,10 +100,18 @@ class _MockCentral:
     async def _register_chunk(self, request: web.Request) -> web.Response:
         b = await request.json()
         key = (_OWNER, b["file_ref"])
-        entry = {"chunk_id": b["chunk_id"], "idx": b["idx"], "size": b["size"]}
+        entry = {
+            "chunk_id": b["chunk_id"], "idx": b["idx"], "size": b["size"],
+            "hash": b.get("hash"),
+        }
         lst = self.chunks.setdefault(key, [])
-        if all(c["chunk_id"] != b["chunk_id"] for c in lst):
+        existing = next(
+            (c for c in lst if c["chunk_id"] == b["chunk_id"]), None
+        )
+        if existing is None:
             lst.append(entry)
+        elif b.get("hash"):
+            existing["hash"] = b["hash"]  # 재복제 시 해시 갱신(실서버와 동일)
         self.chunk_owner[b["chunk_id"]] = _OWNER
         return web.json_response({"status": "ok"})
 

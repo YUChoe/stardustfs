@@ -7,7 +7,19 @@
 
 from __future__ import annotations
 
+import hashlib
+
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MiB
+
+
+def chunk_hash(data: bytes) -> str:
+    """청크 암호문의 SHA-256 hex(64자)를 반환한다.
+
+    내용 검증용 해시다. 대상은 평문이 아니라 암호문 바이트이므로 서버·홀더가 이 값을
+    보관해도 평문 정보가 노출되지 않는다. chunk_id(위치 식별자, file_ref:idx의 해시)와
+    는 별개로, 홀더가 돌려준 바이트가 복제 시점과 같은지 확인하는 데 쓴다.
+    """
+    return hashlib.sha256(data).hexdigest()
 
 
 def split(blob: bytes, size: int = DEFAULT_CHUNK_SIZE) -> list[tuple[int, bytes]]:

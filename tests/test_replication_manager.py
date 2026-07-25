@@ -65,6 +65,8 @@ class _Cloud:
         self.holders = holders
         self.offline = offline_addresses or set()
         self.store_fail = store_fail_addresses or set()
+        # 이 주소의 홀더는 손상된 바이트를 반환한다(무결성 검증 테스트용).
+        self.corrupt: set[str] = set()
         # placement가 반환할 최대 후보 수(None=무제한, 실서버는 count로 제한).
         self.cap = cap
         self.chunk_meta: dict[str, list[dict]] = {}
@@ -74,9 +76,12 @@ class _Cloud:
     def attach(self, mgr: ReplicationManager) -> None:
         cloud = self
 
-        async def register_chunk(token, chunk_id, file_ref, idx, size):
+        async def register_chunk(
+            token, chunk_id, file_ref, idx, size, chunk_hash=None
+        ):
             cloud.chunk_meta.setdefault(file_ref, []).append(
-                {"chunk_id": chunk_id, "idx": idx, "size": size}
+                {"chunk_id": chunk_id, "idx": idx, "size": size,
+                 "hash": chunk_hash}
             )
 
         async def placement(token, size, exclude):
@@ -107,7 +112,10 @@ class _Cloud:
             ]
 
         async def holder_fetch(device_id, address, chunk_id, token):
-            return cloud.holder_store.get(address, {}).get(chunk_id)
+            data = cloud.holder_store.get(address, {}).get(chunk_id)
+            if data is not None and address in cloud.corrupt:
+                return b"\x00" * len(data)  # 손상된 사본
+            return data
 
         mgr._register_chunk = register_chunk
         mgr._placement = placement
@@ -411,3 +419,138 @@ def test_file_ref_does_not_leak_path(key):
     ref = mgr._file_ref("/secret/path/document.txt")
     assert "secret" not in ref and "document" not in ref
     assert len(ref) == 64 and all(c in "0123456789abcdef" for c in ref)
+
+
+# --- 청크 무결성 해시 ---
+
+def test_chunk_hash_is_deterministic_and_sensitive():
+    """같은 바이트는 같은 해시, 1바이트만 달라도 다른 해시(Property 1)."""
+    from stardustlib import chunker
+
+    data = b"cipher-bytes"
+    assert chunker.chunk_hash(data) == chunker.chunk_hash(b"cipher-bytes")
+    assert len(chunker.chunk_hash(data)) == 64
+    assert chunker.chunk_hash(data) != chunker.chunk_hash(b"cipher-byteS")
+    assert chunker.chunk_hash(b"") == chunker.chunk_hash(b"")
+
+
+def test_replicate_registers_chunk_hashes(key):
+    """복제 시 각 청크의 암호문 해시가 서버에 등록된다."""
+    from stardustlib import chunker
+
+    jbod = _FakeJbod(key)
+    jbod.put("/f", b"x" * 200)
+    meta = _FakeMeta({"/f"})
+    mgr, cloud = _manager(jbod, meta, ["h1", "h2", "h3"])
+    try:
+        mgr.replicate("/f")
+    finally:
+        mgr.close()
+
+    infos = cloud.chunk_meta[mgr._file_ref("/f")]
+    assert infos and all(i["hash"] for i in infos)
+    # 등록된 해시가 홀더에 저장된 실제 바이트의 해시와 일치한다
+    for info in infos:
+        stored = cloud.holder_store["h1"][info["chunk_id"]]
+        assert info["hash"] == chunker.chunk_hash(stored)
+
+
+def test_recover_skips_corrupt_holder(key):
+    """손상된 사본을 가진 홀더를 배제하고 정상 홀더에서 복구한다(Property 3)."""
+    jbod = _FakeJbod(key)
+    original = b"integrity-check" * 20
+    jbod.put("/f", original)
+    meta = _FakeMeta({"/f"})
+    mgr, cloud = _manager(jbod, meta, ["h1", "h2", "h3"])
+    try:
+        mgr.replicate("/f")
+        # 첫 홀더가 손상된 바이트를 반환하도록 만든다
+        cloud.corrupt.add("h1")
+        jbod.write_file("/f", b"")  # 로컬 원본 훼손
+        nbytes = mgr.recover("/f")
+    finally:
+        mgr.close()
+
+    assert nbytes == len(original)
+    assert jbod.read_file("/f") == original
+
+
+def test_recover_fails_when_all_holders_corrupt(key):
+    """모든 홀더가 손상이면 누락 chunk_id를 명시한 RecoveryError를 낸다."""
+    jbod = _FakeJbod(key)
+    jbod.put("/f", b"y" * 200)
+    meta = _FakeMeta({"/f"})
+    mgr, cloud = _manager(jbod, meta, ["h1", "h2", "h3"])
+    try:
+        mgr.replicate("/f")
+        cloud.corrupt.update({"h1", "h2", "h3"})
+        with pytest.raises(RecoveryError) as exc:
+            mgr.recover("/f")
+    finally:
+        mgr.close()
+
+    assert exc.value.missing_chunks  # 어느 청크가 문제인지 특정된다
+
+
+def test_recover_without_hash_skips_verification(key):
+    """레거시 청크(해시 미등록)는 검증을 생략하고 기존 동작을 유지한다(Property 4)."""
+    jbod = _FakeJbod(key)
+    original = b"legacy-chunk" * 10
+    jbod.put("/f", original)
+    meta = _FakeMeta({"/f"})
+    mgr, cloud = _manager(jbod, meta, ["h1", "h2", "h3"])
+    try:
+        mgr.replicate("/f")
+        # 서버가 해시를 모르는 상태(구버전/레거시)로 만든다
+        for info in cloud.chunk_meta[mgr._file_ref("/f")]:
+            info["hash"] = None
+        jbod.write_file("/f", b"")
+        nbytes = mgr.recover("/f")
+    finally:
+        mgr.close()
+
+    assert nbytes == len(original)
+    assert jbod.read_file("/f") == original
+
+
+def test_heal_does_not_copy_corrupt_chunk(key):
+    """재복제가 손상된 소스를 배제하고 정상 소스만 새 홀더로 복사한다."""
+    jbod = _FakeJbod(key)
+    jbod.put("/f", b"z" * 100)
+    meta = _FakeMeta({"/f"})
+    # 홀더 3개로 복제 후, 1곳을 손상시키고 새 홀더(h4)를 추가해 보충하게 한다
+    mgr, cloud = _manager(jbod, meta, ["h1", "h2", "h3"])
+    try:
+        mgr.replicate("/f")
+        cloud.corrupt.add("h1")          # 첫 소스는 손상
+        cloud.offline.update({"h2"})     # 온라인 소스를 줄여 degraded 유발
+        cloud.holders.append("h4")       # 새 홀더 후보
+        mgr.ensure_replicas("/f")
+    finally:
+        mgr.close()
+
+    from stardustlib import chunker
+
+    # h4로 복사된 바이트는 손상본이 아니라 정상본이어야 한다
+    for info in cloud.chunk_meta[mgr._file_ref("/f")]:
+        copied = cloud.holder_store.get("h4", {}).get(info["chunk_id"])
+        if copied is not None:
+            assert chunker.chunk_hash(copied) == info["hash"]
+
+
+def test_heal_reports_unrecoverable_when_only_source_is_corrupt(key):
+    """유효한 소스가 없으면(온라인 소스가 손상뿐) unrecoverable로 보고한다."""
+    jbod = _FakeJbod(key)
+    jbod.put("/f", b"w" * 100)
+    meta = _FakeMeta({"/f"})
+    mgr, cloud = _manager(jbod, meta, ["h1", "h2", "h3"])
+    try:
+        mgr.replicate("/f")
+        cloud.corrupt.update({"h1", "h2", "h3"})
+        cloud.offline.update({"h2", "h3"})  # 온라인은 h1(손상)뿐
+        report = mgr.ensure_replicas("/f")
+    finally:
+        mgr.close()
+
+    assert report.status == "pending"
+    assert report.unrecoverable  # 조용한 성공 처리 금지
