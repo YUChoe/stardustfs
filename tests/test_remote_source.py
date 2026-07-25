@@ -24,6 +24,19 @@ from stardustlib.remote_source import RemoteSource, _EventLoopThread
 # ------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _same_lan_as_peer(monkeypatch):
+    """테스트 피어(192.168.1.100)와 같은 LAN으로 고정한다.
+
+    직접 TCP는 같은 /24 서브넷일 때만 시도되므로, 실행 머신의 실제 IP에 따라
+    결과가 달라지지 않도록 로컬 IP를 고정한다. 도달 불가 케이스를 검증하는
+    테스트는 이 값을 각자 덮어쓴다.
+    """
+    from stardustlib import remote_source as mod
+
+    monkeypatch.setattr(mod, "_local_ip", lambda: "192.168.1.5")
+
+
 @pytest.fixture
 def auth_client():
     """인증된 상태의 AuthClient mock."""
@@ -664,3 +677,80 @@ class TestUdpFallback:
         )
         assert out == {"data": "relayed"}
         remote_source._relay_fallback.assert_called_once()
+
+
+# ------------------------------------------------------------------
+# 직접 TCP 도달 가능성 판단 (같은 LAN 전용)
+# ------------------------------------------------------------------
+
+
+class TestDirectTcpViable:
+    """direct_tcp_viable: 도달 불가 주소는 직접 TCP를 건너뛴다."""
+
+    def test_public_address_is_viable(self):
+        """공인 주소는 시도할 가치가 있다(상시 홀더 등)."""
+        from stardustlib.remote_source import direct_tcp_viable
+
+        assert direct_tcp_viable("8.8.8.8:9090") is True
+
+    def test_loopback_is_viable(self):
+        """같은 머신(로컬/테스트)은 시도한다."""
+        from stardustlib.remote_source import direct_tcp_viable
+
+        assert direct_tcp_viable("127.0.0.1:9090") is True
+
+    def test_hostname_is_viable(self):
+        """IP로 파싱 불가(호스트명)면 판단할 수 없으므로 시도한다."""
+        from stardustlib.remote_source import direct_tcp_viable
+
+        assert direct_tcp_viable("peer.example.com:9090") is True
+
+    def test_empty_address_not_viable(self):
+        from stardustlib.remote_source import direct_tcp_viable
+
+        assert direct_tcp_viable(None) is False
+        assert direct_tcp_viable("") is False
+
+    def test_private_address_in_other_subnet_not_viable(self, monkeypatch):
+        """다른 네트워크의 사설 IP는 도달 불가 — 시도하지 않는다."""
+        from stardustlib import remote_source
+
+        monkeypatch.setattr(remote_source, "_local_ip", lambda: "192.168.1.10")
+        assert remote_source.direct_tcp_viable("10.5.5.5:9090") is False
+        assert remote_source.direct_tcp_viable("192.168.77.11:9090") is False
+
+    def test_private_address_in_same_subnet_is_viable(self, monkeypatch):
+        """같은 LAN(/24)이면 직접 TCP가 가장 빠른 경로 — 시도한다."""
+        from stardustlib import remote_source
+
+        monkeypatch.setattr(remote_source, "_local_ip", lambda: "192.168.1.10")
+        assert remote_source.direct_tcp_viable("192.168.1.50:9090") is True
+
+    def test_not_viable_when_local_ip_unknown(self, monkeypatch):
+        """로컬 IP를 모르면 사설 주소는 보수적으로 건너뛴다."""
+        from stardustlib import remote_source
+
+        monkeypatch.setattr(remote_source, "_local_ip", lambda: None)
+        assert remote_source.direct_tcp_viable("192.168.1.50:9090") is False
+
+    def test_unreachable_peer_skips_direct_and_uses_udp(
+        self, remote_source, monkeypatch
+    ):
+        """도달 불가 주소면 직접 TCP 없이 곧바로 홀펀칭 UDP로 간다."""
+        from stardustlib import remote_source as mod
+
+        _activate(remote_source)
+        # 픽스처 주소(192.168.1.100)를 다른 서브넷으로 만들어 도달 불가로 판정
+        monkeypatch.setattr(mod, "_local_ip", lambda: "10.0.0.5")
+
+        calls = []
+
+        async def udp(device_id, op, payload):
+            calls.append(op)
+            return (200, {"data": "QQ=="})
+
+        remote_source.set_udp_transport(udp)
+        # httpx 요청이 하나도 없어야 한다(httpx_mock 미등록이므로 호출 시 실패)
+        data = remote_source.read("dir/file.enc")
+        assert data == b"A"
+        assert calls == ["read"]

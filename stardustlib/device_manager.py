@@ -1,8 +1,9 @@
 """디바이스 등록 및 heartbeat 관리.
 
 중앙 서버에 디바이스를 등록하고, 주기적으로 heartbeat를 전송하여
-온라인 상태를 유지한다. NAT 뒤 직접 연결은 UDP 홀펀칭(holepunch)으로 연다
-(UPnP는 폐지). reflexive 공인 IP 조회는 NAT 보조로 유지한다.
+온라인 상태를 유지한다. 광고하는 connection_address는 로컬(LAN) 주소이며, 직접 TCP는
+같은 LAN에서만 성립한다. 다른 네트워크로의 직접 연결은 UDP 홀펀칭(holepunch)이
+담당한다(UPnP·reflexive 공인 IP 보정은 폐지 — 사용자 포트포워딩을 전제하지 않는다).
 """
 
 from __future__ import annotations
@@ -37,26 +38,6 @@ def _get_local_ip() -> str:
             return s.getsockname()[0]
     except OSError:
         return "127.0.0.1"
-
-
-def _is_private_or_cgnat_ip(ip: str) -> bool:
-    """IP가 사설 대역 또는 도달 불가 대역인지 판별한다.
-
-    공인 라우팅이 불가능한 주소(사설 RFC1918, 루프백, 링크로컬, CGNAT 100.64/10
-    등)이면 True를 반환한다. 이중 NAT 환경에서 UPnP가 보고한 '외부 IP'가 실제로는
-    상위 NAT의 사설 주소인 경우를 걸러내기 위해 사용한다.
-
-    파싱 실패 시 보수적으로 True(신뢰 불가)를 반환한다.
-    """
-    import ipaddress
-
-    try:
-        addr = ipaddress.ip_address(ip)
-    except ValueError:
-        return True
-    # is_global이 False면 공인 라우팅 불가(사설/루프백/링크로컬/예약 등)
-    # CGNAT 100.64.0.0/10은 is_global=False로 분류되므로 별도 처리 불필요
-    return not addr.is_global
 
 
 def _get_os_info() -> str:
@@ -338,31 +319,8 @@ class DeviceManager:
         """현재 P2P 접속 주소 (IP:port)를 반환한다."""
         return self._connection_address
 
-    async def query_reflexive_ip(self) -> str | None:
-        """서버에 server-reflexive(공인) IP를 조회한다 (HTTP STUN 등가).
-
-        GET /network/reflexive. 서버가 본 요청자의 공인 source IP를 반환한다.
-        실패 시 None을 반환한다(예외 없음).
-        """
-        try:
-            token = await self._auth_client.get_valid_token()
-            response = await self._client.get(
-                f"{self._server_url}/network/reflexive",
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            if response.status_code < 400:
-                ip = response.json().get("public_ip", "")
-                return ip or None
-            logger.warning(
-                "reflexive IP 조회 실패: HTTP %d", response.status_code
-            )
-            return None
-        except Exception as e:
-            logger.warning("reflexive IP 조회 중 예외: %s", e)
-            return None
-
     def set_connection_address(self, address: str) -> None:
-        """P2P 접속 주소를 외부에서 설정한다 (UPnP 성공 시 사용)."""
+        """P2P 접속 주소를 외부에서 설정한다 (테스트에서 대상 주소 지정 등)."""
         self._connection_address = address
 
     @property

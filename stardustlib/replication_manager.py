@@ -28,7 +28,7 @@ import httpx
 from stardustlib import chunker
 from stardustlib.auth_client import AuthClient
 from stardustlib.exceptions import AuthenticationError
-from stardustlib.remote_source import _EventLoopThread
+from stardustlib.remote_source import _EventLoopThread, direct_tcp_viable
 
 logger = logging.getLogger(__name__)
 
@@ -485,8 +485,8 @@ class ReplicationManager:
         encoded = base64.b64encode(data).decode("ascii")
         body = {"chunk_id": chunk_id, "data": encoded}
         authed = {**body, "auth_token": token}
-        # (1) 직접 TCP
-        if address:
+        # (1) 직접 TCP — 도달 가능성 없는 주소(다른 네트워크의 사설 IP)는 건너뛴다
+        if address and direct_tcp_viable(address):
             try:
                 resp = await self._client.post(
                     f"http://{address}/p2p/replica_store",
@@ -534,8 +534,8 @@ class ReplicationManager:
             except (KeyError, ValueError, TypeError):
                 return None
 
-        # (1) 직접 TCP
-        if address:
+        # (1) 직접 TCP — 도달 가능성 없는 주소는 건너뛴다
+        if address and direct_tcp_viable(address):
             try:
                 resp = await self._client.post(
                     f"http://{address}/p2p/replica_fetch",

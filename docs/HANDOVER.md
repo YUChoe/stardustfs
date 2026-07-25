@@ -49,8 +49,9 @@ WebDAV를 통해 단일 파일시스템에 접근한다. 파일은 클라이언�
 - `relay_worker.py`: 대상 측 릴레이 워커(`/relay/poll` 루프 → P2PServer.dispatch)
 - `p2p_server.py`: aiohttp P2P 서버. `handle_*`는 인증 후 `_op_*` 호출, `dispatch(op, payload)`는 릴레이 워커용
 - `sync_client.py`: 메타데이터 동기화. 주기 폴링 + 버전 롱폴링(즉시 동기화) + CAS + orphan GC 트리거
-- `device_manager.py`: 디바이스 등록/heartbeat/reflexive 공인 IP 보정(UPnP 폐지,
-  NAT 직접 연결은 홀펀칭이 담당)
+- `device_manager.py`: 디바이스 등록/heartbeat. 광고 주소는 LAN 주소(UPnP·reflexive
+  공인 IP 보정 모두 폐지 — 사용자 포트포워딩을 전제하지 않음). 직접 TCP는 같은 LAN
+  전용이고, 다른 네트워크의 직접 연결은 홀펀칭이 담당
 - `webdav_provider.py`: wsgidav 기반 WebDAV. 오프라인 원격 파일은 `.offline` placeholder
 
 ## 4. 완료된 작업 (시간순, 최신이 아래)
@@ -80,7 +81,9 @@ WebDAV를 통해 단일 파일시스템에 접근한다. 파일은 클라이언�
 ## 5. 실환경에서 검증된 동작 (2 PC, 이중 NAT)
 
 - PC-A/PC-B가 서로 다른 하위 NAT에 격리(직접 P2P 도달 불가) → 릴레이로 read/write 동작
-- reflexive 보정: UPnP 외부 IP가 사설/CGNAT(10.100.9.213)일 때 공인 IP(113.10.5.125)로 보정
+- reflexive 공인 IP 보정(과거): UPnP 외부 IP가 사설/CGNAT일 때 공인 IP로 보정했으나,
+  상위 NAT 포트포워딩이 없으면 여전히 도달 불가라 폐지됨. 현재는 홀펀칭 UDP가 대체
+  (실측: 서로 다른 NAT 뒤 12MiB 스필오버 성공)
 - 소유권 이전 시나리오 정상. 메타데이터 version 롱폴링으로 ~1.4초 내 전파(폴링 30초 대비)
 
 ## 6. 핵심 설계 결정 (반드시 준수)
@@ -92,7 +95,7 @@ WebDAV를 통해 단일 파일시스템에 접근한다. 파일은 클라이언�
 - "실패 시 graceful 건너뛰기" 금지. 용량부족 등은 규격 에러(InsufficientStorageError 등) 반환
 - orphan GC는 관리 파일(`<hex32>_` 형식)만 대상. metadata DB/사용자 파일은 절대 미삭제.
   device_id가 None이면 GC 전체 건너뜀(전체 삭제 방지)
-- 릴레이/롱폴링/reflexive는 모두 단일 uvicorn 워커 + 메모리 상태 가정. 다중 워커는 외부 큐 필요(범위 밖)
+- 릴레이/롱폴링/랑데부는 모두 단일 uvicorn 워커 + 메모리 상태 가정. 다중 워커는 외부 큐 필요(범위 밖)
 
 ## 7. 개발 환경 및 규칙
 
@@ -155,7 +158,7 @@ E2E 테스트는 롱폴/릴레이 미배포 서버에서는 자동 skip된다(�
 
 - 서버 커밋(2c4bfb6 릴레이, a92bb61 롱폴링)을 운영 서버에 배포해야 해당 기능 동작
 - 미배포 서버에서는 클라이언트가 404 감지 후 기존 방식으로 자동 폴백(하위 호환)
-- DB 스키마 변경 없음(릴레이/롱폴링/reflexive 모두 메모리 상태 또는 기존 컬럼 사용)
+- DB 스키마 변경 없음(릴레이/롱폴링/랑데부 모두 메모리 상태 또는 기존 컬럼 사용)
 
 ## 10. 다음 단계 (미완료)
 

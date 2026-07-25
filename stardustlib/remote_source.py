@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ipaddress
 import logging
+import socket
 import threading
 from typing import Any
 
@@ -24,6 +26,63 @@ logger = logging.getLogger(__name__)
 # 리모트 전송 청크 크기(4 MiB). rudp 단일 메시지 한계(frag_count u16 × 1200B ≈
 # 78.6MB)와 홀더 MAX_WRITE_SIZE(100MB) 내. 이를 넘는 파일은 청크로 나눠 전송한다.
 REMOTE_CHUNK_SIZE = 4 * 1024 * 1024
+
+# 직접 TCP 연결(connect) 타임아웃(초). 디바이스가 광고하는 주소는 사설(LAN) 주소이므로
+# 직접 TCP는 같은 LAN에서만 성립한다. 다른 네트워크면 SYN 무응답으로 대기만 하다가
+# 홀펀칭 UDP로 내려가므로 연결 단계만 짧게 잡는다(읽기/쓰기 타임아웃은 대용량 LAN
+# 전송을 막지 않도록 기존 값 유지).
+DIRECT_CONNECT_TIMEOUT = 2.0
+
+
+def direct_tcp_viable(peer_address: str | None) -> bool:
+    """직접 TCP를 시도할 가치가 있는지 판단한다.
+
+    디바이스는 LAN 주소를 광고한다(사용자에게 포트포워딩을 기대하지 않으므로 공인
+    주소 보정은 하지 않는다). 따라서 상대가 사설 주소인데 내 서브넷이 아니면 도달
+    가능성이 없어, 시도하지 않고 곧바로 홀펀칭 UDP로 내려간다.
+
+    판단이 애매하거나(호스트명 등) 상대가 공인 주소면 True를 반환한다 — 짧은 연결
+    타임아웃이 안전망이 된다.
+    """
+    if not peer_address:
+        return False
+    host = peer_address.rsplit(":", 1)[0]
+    try:
+        peer = ipaddress.ip_address(host)
+    except ValueError:
+        return True  # 호스트명 등 — 판단 불가, 짧은 타임아웃으로 시도
+    if peer.is_loopback:
+        return True  # 같은 머신(로컬/테스트)
+    if peer.is_global:
+        return True  # 공인 주소(상시 홀더 등) — 시도할 가치 있음
+    # 사설/CGNAT: 내 인터페이스와 같은 서브넷일 때만 도달 가능
+    return _in_same_subnet(peer)
+
+
+def _in_same_subnet(peer) -> bool:
+    """상대 사설 주소가 내 로컬 인터페이스와 같은 /24 서브넷인지 확인한다.
+
+    /24보다 넓은 사내망(예: /16)에서는 False가 되어 홀펀칭 UDP로 내려간다 — 느릴 수
+    있으나 동작에는 문제가 없다(보수적 판단).
+    """
+    local = _local_ip()
+    if local is None:
+        return False
+    try:
+        my_net = ipaddress.ip_network(f"{local}/24", strict=False)
+    except ValueError:
+        return False
+    return peer in my_net
+
+
+def _local_ip() -> str | None:
+    """기본 경로의 로컬 인터페이스 IP를 반환한다(실패 시 None)."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return str(s.getsockname()[0])
+    except OSError:
+        return None
 
 
 class _EventLoopThread:
@@ -454,8 +513,23 @@ class RemoteSource(StorageSource):
         request_body = {**payload, "auth_token": token}
         url = f"http://{self._peer_address}{endpoint}"
 
+        # 도달 가능성이 없는 주소(다른 네트워크의 사설 IP)면 직접 TCP를 건너뛴다.
+        if not direct_tcp_viable(self._peer_address):
+            logger.debug(
+                "직접 TCP 건너뜀(%s, 도달 불가 주소 %s) — UDP/릴레이로 진행: %s",
+                endpoint, self._peer_address, self._device_id,
+            )
+            return await self._fallback(
+                endpoint, request_body,
+                OSError(f"direct TCP not viable for {self._peer_address}"),
+            )
+
+        # 연결 단계만 짧게(읽기/쓰기는 대용량 LAN 전송을 위해 기존 타임아웃 유지).
+        timeout = httpx.Timeout(self._timeout, connect=DIRECT_CONNECT_TIMEOUT)
         try:
-            response = await self._client.post(url, json=request_body)
+            response = await self._client.post(
+                url, json=request_body, timeout=timeout
+            )
         except httpx.TimeoutException as e:
             logger.info(
                 "직접 P2P 타임아웃(%s) — UDP/릴레이 fallback 시도: %s",
