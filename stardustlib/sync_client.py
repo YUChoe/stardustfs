@@ -646,12 +646,24 @@ class SyncClient:
                     replication_status=row["replication_status"],
                 ))
 
+            # 청크 매니페스트도 함께 가져온다. 서버 blob은 SQLite 파일 전체이므로
+            # file_chunks 행이 그 안에 들어 있다. 이걸 읽지 않으면 수신 측에 파일
+            # 레코드만 생기고 매니페스트가 없어, 읽기가 레거시 단일 blob 경로로 빠져
+            # 첫 청크만 복호화해 조용히 잘린 내용을 돌려준다(에러도 나지 않는다).
+            server_chunks = self._read_server_chunks(server_conn)
+
             # 각 서버 레코드에 대해 로컬과 비교 병합
             logger.info(
-                "Merge: 서버 DB에서 %d개 레코드 조회됨", len(server_records)
+                "Merge: 서버 DB에서 %d개 레코드 조회됨 (청크 매니페스트 %s)",
+                len(server_records),
+                "포함" if server_chunks is not None else "없음(구버전)",
             )
             for server_rec in server_records:
-                self._merge_record(server_rec)
+                chunks = (
+                    server_chunks.get(server_rec.virtual_path, [])
+                    if server_chunks is not None else None
+                )
+                self._merge_record(server_rec, chunks)
 
             server_store.close()
         finally:
@@ -660,6 +672,44 @@ class SyncClient:
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+    @staticmethod
+    def _read_server_chunks(server_conn) -> dict | None:
+        """서버 DB(전체 blob)에서 가상 경로별 청크 매니페스트를 읽는다.
+
+        Returns:
+            {virtual_path: [ChunkRef...]}. 서버 DB에 file_chunks 테이블이 없으면
+            (청크 네이티브 이전 클라이언트가 올린 blob) None — 이 경우 로컬 매니페스트를
+            건드리지 않는다. 테이블은 있고 그 파일에 행이 없으면 빈 목록이 되어 로컬
+            매니페스트를 비운다(서버 표현이 레거시 blob이라는 뜻).
+        """
+        from stardustlib.models import ChunkRef
+
+        exists = server_conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='file_chunks'"
+        ).fetchone()
+        if exists is None:
+            return None
+
+        result: dict = {}
+        rows = server_conn.execute(
+            "SELECT virtual_path, chunk_index, chunk_ref, source_id, "
+            "device_id, size, hash FROM file_chunks "
+            "ORDER BY virtual_path, chunk_index"
+        ).fetchall()
+        for row in rows:
+            result.setdefault(row["virtual_path"], []).append(
+                ChunkRef(
+                    index=row["chunk_index"],
+                    chunk_ref=row["chunk_ref"],
+                    source_id=row["source_id"],
+                    device_id=row["device_id"],
+                    size=row["size"],
+                    hash=row["hash"],
+                )
+            )
+        return result
 
     def _merge_record(
         self, server_rec: FileMetadata, chunks: list | None = None

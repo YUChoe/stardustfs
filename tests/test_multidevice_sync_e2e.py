@@ -91,6 +91,11 @@ class SimulatedDevice:
             self.auth_client, SERVER_URL, self.store, resolver,
             interval_seconds=30, encryption_key=self.encryption_key,
         )
+        # 이 파일은 전체 blob 동기화 경로를 검증한다(sync_upload가 _force_upload).
+        # 레코드 모드를 켜 두면 업로드는 blob으로 나가고 다운로드는 레코드를 먼저
+        # 보므로, 공유 테스트 계정이 한 번 레코드 모드가 된 뒤에는 blob으로 올린
+        # 변경이 상대 디바이스에 보이지 않는다. 양쪽 경로를 일치시킨다.
+        self.sync_client._record_mode = False
 
     async def create_file(self, path: str, size: int = 100):
         """로컬에 파일 메타데이터를 생성한다."""

@@ -345,3 +345,97 @@ async def test_conflict_path_adopts_manifest(sync_client, store, httpx_mock):
     assert [c.chunk_ref for c in store.get_chunks("/f.bin")] == [
         "aa/x_c0000", "bb/y_c0001"
     ]
+
+
+# ------------------------------------------------------------------
+# 전체 blob 폴백 경로의 매니페스트 전파
+#
+# 기존 blob 사용자는 서버가 /sync/metadata/records에 404를 돌려주므로(설계된 동작)
+# 전체 blob 동기화 경로를 쓴다. 이 경로가 청크 매니페스트를 빼먹으면 수신 측에 파일
+# 레코드만 생기고, 읽기가 레거시 단일 blob 경로로 빠져 첫 청크만 복호화해 조용히
+# 잘린 내용을 돌려준다(에러도 나지 않는다). 실환경 검증에서 발견한 결함이다.
+# ------------------------------------------------------------------
+
+def _server_db(tmp_path, with_chunks=True, has_table=True):
+    """서버가 보관한 전체 blob에 해당하는 metadata DB를 만든다."""
+    path = str(tmp_path / "server.db")
+    server = MetadataStore(path, _KEY)
+    server.initialize()
+    conn = server._get_conn()
+    conn.execute(
+        "INSERT INTO files "
+        "(virtual_path, source_id, physical_path, file_size, created_at, "
+        "modified_at, version, device_id, sync_status, deleted, evicted, "
+        "replication_status, chunked) "
+        "VALUES ('/big.bin', 'src-1', 'aa/x_c0000', 100, 1.0, 1.0, 9, "
+        "'other-dev', 'synced', 0, 0, 'none', ?)",
+        (1 if with_chunks else 0,),
+    )
+    conn.commit()
+    if with_chunks:
+        server.put_chunks("/big.bin", _chunks())
+        server.commit()
+    if not has_table:
+        conn.execute("DROP TABLE file_chunks")
+        conn.commit()
+    server.close()
+    return path
+
+
+def test_blob_merge_carries_chunk_manifest(sync_client, store, tmp_path):
+    """전체 blob 병합이 서버 DB의 file_chunks를 가져와 매니페스트를 채택한다."""
+    server_path = _server_db(tmp_path)
+    with open(server_path, "rb") as f:
+        blob = sync_client._encrypt_blob(f.read())
+
+    import asyncio
+    asyncio.get_event_loop_policy()
+    asyncio.run(sync_client._merge_server_metadata(blob))
+
+    local = store.get_chunks("/big.bin")
+    assert [c.index for c in local] == [0, 1]
+    assert local[1].source_id == "src-2"       # 청크별 보관처가 넘어왔다
+    assert local[1].hash == "bb" * 32
+
+
+def test_blob_merge_clears_manifest_for_legacy_server_file(
+    sync_client, store, tmp_path
+):
+    """서버 표현이 레거시 blob이면 로컬 매니페스트를 비운다."""
+    _seed(store, "/big.bin", chunks=_chunks())
+    server_path = _server_db(tmp_path, with_chunks=False)
+    with open(server_path, "rb") as f:
+        blob = sync_client._encrypt_blob(f.read())
+
+    import asyncio
+    asyncio.run(sync_client._merge_server_metadata(blob))
+
+    assert store.get_chunks("/big.bin") == []
+
+
+def test_blob_merge_leaves_manifest_when_server_db_has_no_table(
+    sync_client, store, tmp_path
+):
+    """청크 네이티브 이전 클라이언트가 올린 blob(file_chunks 테이블 없음)은
+    로컬 매니페스트를 건드리지 않는다."""
+    _seed(store, "/big.bin", chunks=_chunks())
+    server_path = _server_db(tmp_path, with_chunks=False, has_table=False)
+    with open(server_path, "rb") as f:
+        blob = sync_client._encrypt_blob(f.read())
+
+    import asyncio
+    asyncio.run(sync_client._merge_server_metadata(blob))
+
+    assert [c.index for c in store.get_chunks("/big.bin")] == [0, 1]
+
+
+def test_read_server_chunks_returns_none_without_table(tmp_path):
+    """file_chunks 테이블이 없으면 None(건드리지 않음)을 반환한다."""
+    server_path = _server_db(tmp_path, with_chunks=False, has_table=False)
+    server = MetadataStore(server_path, _KEY)
+    server.initialize()   # initialize가 테이블을 다시 만들지 않는지도 함께 본다
+    conn = server._get_conn()
+    conn.execute("DROP TABLE IF EXISTS file_chunks")
+    conn.commit()
+    assert SyncClient._read_server_chunks(conn) is None
+    server.close()
