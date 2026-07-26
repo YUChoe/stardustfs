@@ -51,6 +51,9 @@ class StardustApp:
         self._rows: dict[str, dict] = {}
         # daemon은 항상 온라인으로 감독(supervise)한다. 다음 재시작 허용 시각(쿨다운).
         self._daemon_restart_until = 0.0
+        # 직전 폴링에서 본 daemon 생존 여부. 정지→실행 전이를 감지해 조회 세션을
+        # 다시 연다(daemon이 FAT 이미지를 만들기 전에 열린 세션은 소스가 비활성이다).
+        self._daemon_was_running: bool | None = None
         self._last_meta_mtime = 0.0
         self.lang = i18n.detect_lang()
         self.t = i18n.get_text(self.lang)
@@ -1114,13 +1117,33 @@ class StardustApp:
             self._daemon_dot(
                 self.t["daemon_running"].format(pid=payload.get("pid")), green
             )
+            if self._daemon_was_running is False:
+                self._reopen_after_daemon_start()
+            self._daemon_was_running = True
             return
         # running이 아니면(정지 또는 stale=중단/행) 항상 온라인 유지를 위해 재시작.
+        self._daemon_was_running = False
         if payload.get("stale"):
             self._daemon_dot(self.t["daemon_stale"], orange)
         else:
             self._daemon_dot(self.t["daemon_stopped"], grey)
         self._ensure_daemon()
+
+    def _reopen_after_daemon_start(self) -> None:
+        """daemon이 새로 뜬 직후 조회 세션을 버리고 목록을 다시 읽는다.
+
+        daemon이 없을 때 연 세션은 루프백 FAT 이미지가 아직 없어 소스가 비활성으로
+        잡힌다(조회 세션은 read_only라 이미지를 만들지 않는다). daemon이 이미지를
+        포맷한 뒤 세션을 다시 열어야 스토리지가 정상으로 보인다.
+        """
+        cfg = self.config_path
+        if not cfg:
+            return
+        # 세션 close는 세션을 만든 워커 스레드에서 해야 한다(sqlite 스레드 제약).
+        self.worker.submit(
+            lambda: actions.invalidate(cfg),
+            lambda *_a: self.refresh(),
+        )
 
     def _reload_daemon(self) -> None:
         """실행 중인 daemon에 config 리로드 신호를 보낸다(무중단 remount).

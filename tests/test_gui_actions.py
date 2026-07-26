@@ -176,3 +176,66 @@ def test_announce_paths_without_daemon(tmp_path):
     result = actions.announce_paths(cfg_path, ["/some/file.txt"])
     assert result["daemon"] is False
     assert result["announced"] == 0
+
+
+# --- daemon 감독: 정지→실행 전이에서 조회 세션 재개방 ---
+
+class _DaemonStub:
+    """App._on_daemon만 떼어 검증하기 위한 최소 스텁(Tk 불필요)."""
+
+    def __init__(self) -> None:
+        self.t = {
+            "daemon_running": "daemon {pid}",
+            "daemon_stopped": "stopped",
+            "daemon_stale": "stale",
+            "daemon_unknown": "unknown",
+        }
+        self._daemon_was_running = None
+        self.reopened = 0
+        self.ensured = 0
+
+    def _daemon_dot(self, text, color) -> None:
+        pass
+
+    def _reopen_after_daemon_start(self) -> None:
+        self.reopened += 1
+
+    def _ensure_daemon(self) -> None:
+        self.ensured += 1
+
+
+def test_daemon_stopped_triggers_start():
+    """미실행이면 감독 로직이 daemon을 기동한다(GUI만 쓰는 사용자 경로)."""
+    from stardustlib.gui.app import StardustApp
+
+    stub = _DaemonStub()
+    StardustApp._on_daemon(stub, True, {"running": False})
+    assert stub.ensured == 1
+    assert stub.reopened == 0
+
+
+def test_daemon_start_transition_reopens_session():
+    """정지→실행 전이에서만 조회 세션을 다시 연다.
+
+    daemon이 없을 때 연 세션은 루프백 FAT 이미지가 없어 소스가 비활성이므로,
+    daemon이 이미지를 만든 뒤 다시 열어야 스토리지가 정상으로 보인다.
+    """
+    from stardustlib.gui.app import StardustApp
+
+    stub = _DaemonStub()
+    StardustApp._on_daemon(stub, True, {"running": False})
+    StardustApp._on_daemon(stub, True, {"running": True, "pid": 1})
+    assert stub.reopened == 1
+    # 계속 실행 중이면 매 폴링마다 다시 열지 않는다
+    StardustApp._on_daemon(stub, True, {"running": True, "pid": 1})
+    assert stub.reopened == 1
+
+
+def test_daemon_running_at_startup_does_not_reopen():
+    """GUI 시작 시 이미 실행 중이면 세션을 다시 열 필요가 없다."""
+    from stardustlib.gui.app import StardustApp
+
+    stub = _DaemonStub()
+    StardustApp._on_daemon(stub, True, {"running": True, "pid": 7})
+    assert stub.reopened == 0
+    assert stub.ensured == 0
