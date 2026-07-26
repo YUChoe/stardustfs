@@ -423,14 +423,16 @@ async def startup_v2(config: dict, config_path: str) -> None:
             policy_p2p_allowed, policy_hosting_allowed,
         )
     if repl_enabled:
-        if device_mgr.device_id and repl_provided > 0:
+        if device_mgr.device_id:
+            # 제공 용량이 0이어도(스토리지 미초기화·호스팅 금지) 신고한다. 신고를
+            # 건너뛰면 서버에 남은 옛 값으로 배치가 계속돼 홀더가 507만 반환한다.
             ok = await report_hosting(
                 auth_client, server_url, device_mgr.device_id, repl_provided
             )
             if ok:
                 logger.info("호스팅 용량 신고: %d bytes (상호 보관 %.0f%%)",
                             repl_provided, repl_fraction * 100)
-        elif not device_mgr.device_id:
+        else:
             logger.warning("device 미등록 — 호스팅 신고를 건너뜁니다")
 
     # 로컬 소스 인벤토리를 서버에 신고(리모트 디바이스 GUI의 스토리지 목록용).
@@ -616,21 +618,43 @@ async def startup_v2(config: dict, config_path: str) -> None:
             min_replicas=repl_min,
         )
 
-        def _apply_policy(policy: dict) -> None:
-            """주기적으로 내려받은 정책을 매니저/패리티에 반영한다.
+        def _current_provided() -> int:
+            """지금 이 device가 제공하는 용량(bytes).
+
+            설정에 명시됐으면 그 값, 없으면 현재 스토리지 총량을 다시 읽는다(소스
+            추가·제거 반영). 패리티 보관을 하지 않는 상태(호스팅 금지·보관소 없음)면
+            0이다 — 서버가 이 device를 배치 후보에서 빼도록.
+            """
+            if parity_store is None:
+                return 0
+            if "provided_bytes" in repl_config:
+                return int(repl_config["provided_bytes"])
+            try:
+                return int(storage_pool.get_total_space())
+            except Exception as e:  # noqa: BLE001 — 신고 경로, 비치명
+                logger.warning("제공 용량 계산 실패, 0으로 신고: %s", e)
+                return 0
+
+        async def _apply_policy(policy: dict) -> None:
+            """주기적으로 내려받은 정책을 매니저/패리티에 반영하고 용량을 재신고한다.
 
             호스팅이 금지로 바뀌면 보관 한도를 0으로 내려 신규 청크 수용을 멈춘다
             (이미 보관 중인 청크는 소유자가 회수할 수 있도록 유지).
+
+            보관 한도와 서버에 신고하는 제공 용량을 같은 값에서 파생시켜, 서버 배치
+            회계가 홀더의 실제 수용 한도보다 낙관적으로 남는 상태(507 반복)를 막는다.
             """
             repl_mgr.set_min_replicas(policy["min_replicas"])
-            if parity_store is None or repl_provided <= 0:
-                return
-            if not policy.get("hosting_enabled", True):
-                parity_store.set_max_bytes(0)
-                return
-            parity_store.set_max_bytes(
-                int(repl_provided * policy["reciprocity_fraction"])
-            )
+            hosting_allowed = policy.get("hosting_enabled", True)
+            provided = _current_provided() if hosting_allowed else 0
+            if parity_store is not None:
+                parity_store.set_max_bytes(
+                    int(provided * policy["reciprocity_fraction"])
+                )
+            if device_mgr.device_id:
+                await report_hosting(
+                    auth_client, server_url, device_mgr.device_id, provided
+                )
 
         repl_scheduler = ReplicationScheduler(
             repl_mgr, metadata_store, device_mgr.device_id,

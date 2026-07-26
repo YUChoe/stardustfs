@@ -421,6 +421,170 @@ async def test_holder_fetch_udp_before_relay(key):
     assert data == b"cipher" and relayed["called"] is False
 
 
+# --- 보관 한도 초과(507) 홀더 배제 ---
+
+@pytest.mark.asyncio
+async def test_direct_quota_response_blocks_holder(key):
+    """직접 TCP 507이면 그 홀더를 배치 후보 배제 목록에 넣는다."""
+    mgr = _bare_manager(key)
+
+    class _Resp:
+        status_code = 507
+
+    async def post(*a, **k):
+        return _Resp()
+
+    mgr._client.post = post
+    ok = await mgr._holder_store("devQ", "1.2.3.4:9090", "c1", b"x", "tok")
+    assert ok is False
+    assert mgr.quota_blocked_devices() == ["devQ"]
+
+
+@pytest.mark.asyncio
+async def test_relay_quota_response_blocks_holder(key):
+    """릴레이가 status=507을 전달하면(RelayOpError) 홀더를 배제한다."""
+    from stardustlib.relay_client import RelayOpError
+
+    mgr = _bare_manager(key)
+
+    async def boom(*a, **k):
+        raise httpx.ConnectError("unreachable")
+
+    async def fake_relay(device_id, op, payload):
+        raise RelayOpError("Relay op failed (status=507): quota", status=507)
+
+    mgr._client.post = boom
+    mgr._relay_op = fake_relay
+    ok = await mgr._holder_store("devQ", "1.2.3.4:9090", "c1", b"x", "tok")
+    assert ok is False
+    assert mgr.quota_blocked_devices() == ["devQ"]
+
+
+@pytest.mark.asyncio
+async def test_udp_quota_response_blocks_holder(key):
+    """UDP(홀펀칭) 경로의 507도 배제 대상이다."""
+    mgr = _bare_manager(key)
+
+    async def boom(*a, **k):
+        raise httpx.ConnectError("unreachable")
+
+    async def udp(device_id, op, payload):
+        return (507, {"error": "quota exceeded"})
+
+    mgr._client.post = boom
+    mgr.set_udp_transport(udp)
+    ok = await mgr._holder_store("devQ", "1.2.3.4:9090", "c1", b"x", "tok")
+    assert ok is False
+    assert mgr.quota_blocked_devices() == ["devQ"]
+
+
+@pytest.mark.asyncio
+async def test_relay_reachability_failure_does_not_block_holder(key):
+    """도달 불가(비-507)는 일시적이므로 배제하지 않는다."""
+    mgr = _bare_manager(key)
+
+    async def boom(*a, **k):
+        raise httpx.ConnectError("unreachable")
+
+    async def fake_relay(device_id, op, payload):
+        raise OSError("Relay timeout: target device did not respond")
+
+    mgr._client.post = boom
+    mgr._relay_op = fake_relay
+    ok = await mgr._holder_store("devQ", "1.2.3.4:9090", "c1", b"x", "tok")
+    assert ok is False
+    assert mgr.quota_blocked_devices() == []
+
+
+def test_quota_block_expires(key):
+    """배제 기간이 지나면 다시 후보가 된다(홀더가 공간을 회수한 경우)."""
+    import time as _time
+
+    from stardustlib import replication_manager as rm
+
+    mgr = _bare_manager(key)
+    mgr._mark_quota_blocked("devQ")
+    assert mgr.quota_blocked_devices() == ["devQ"]
+    # 만료 시각을 과거로 돌려 경과를 모형화한다
+    mgr._quota_blocked["devQ"] = _time.monotonic() - 1.0
+    assert mgr.quota_blocked_devices() == []
+    assert rm.QUOTA_BLOCK_SECONDS > 0
+
+
+def test_replicate_stops_asking_for_quota_blocked_holder(key):
+    """첫 청크에서 507이 나면 이후 청크의 placement에서 그 홀더를 제외한다."""
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", b"q" * 500)  # chunk_size=64 → 다중 청크
+    meta = _FakeMeta({"/f"})
+    mgr = ReplicationManager(
+        _FakeAuth(), "http://server", meta, storage_pool,
+        chunk_size=64, min_replicas=1,
+    )
+    storage_pool.device_id = "self-dev"
+    excludes: list[list[str]] = []
+
+    async def register_chunk(token, chunk_id, file_ref, idx, size,
+                             chunk_hash=None):
+        return None
+
+    async def placement(token, size, exclude):
+        excludes.append(list(exclude))
+        return [{"device_id": "devQ", "connection_address": "devQ"}]
+
+    async def record_replica(token, chunk_id, device_id):
+        return True
+
+    async def relay_quota(device_id, op, payload):
+        from stardustlib.relay_client import RelayOpError
+
+        raise RelayOpError("Relay op failed (status=507): quota", status=507)
+
+    async def boom(*a, **k):
+        raise httpx.ConnectError("unreachable")
+
+    mgr._register_chunk = register_chunk
+    mgr._placement = placement
+    mgr._record_replica = record_replica
+    mgr._relay_op = relay_quota
+    mgr._client.post = boom
+    try:
+        result = mgr.replicate("/f")
+    finally:
+        mgr.close()
+
+    assert result.status == "pending"
+    assert len(excludes) >= 2
+    assert "devQ" not in excludes[0]      # 첫 청크는 후보로 요청
+    assert "devQ" in excludes[1]          # 507 관측 후 배제
+    assert "self-dev" in excludes[1]      # 자기 device 제외는 유지
+
+
+def test_placement_requests_spare_candidates(key):
+    """placement는 목표 복제본 수보다 여유 있게 후보를 요청한다."""
+    from stardustlib import replication_manager as rm
+
+    mgr = _bare_manager(key)
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"holders": []}
+
+    async def post(url, json=None, headers=None, **k):
+        captured.update(json or {})
+        return _Resp()
+
+    mgr._client.post = post
+    import asyncio as _asyncio
+
+    _asyncio.run(mgr._placement("tok", 100, ["x"]))
+    assert captured["count"] == mgr.min_replicas + rm.PLACEMENT_SPARE
+    assert captured["exclude"] == ["x"]
+
+
 def test_file_ref_does_not_leak_path(key):
     storage_pool = _FakeStoragePool(key)
     meta = _FakeMeta(set())

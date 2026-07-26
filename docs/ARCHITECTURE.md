@@ -162,6 +162,13 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
   → 각 청크를 홀더의 ParityStore에 push → 레지스트리 확정. 모든 청크가 목표
   복제본 수(`min_replicas`, 기본 1=원본 외 1부)를 확보하면 replicated, 아니면
   pending(경고). file_ref/chunk_id는 가상경로 SHA-256(서버에 경로 비노출).
+  placement에는 목표보다 `PLACEMENT_SPARE`(2)개 많은 후보를 요청해 일부 홀더가
+  실패해도 같은 청크에서 대체 홀더로 넘어가고, 목표를 채우면 남은 후보는 쓰지 않는다.
+- 홀더 보관 한도 초과(507) 처리: 서버 배치 회계(신고 `provided_bytes` 기준)가 홀더의
+  실제 ParityStore 한도보다 낙관적으로 남을 수 있다(신고값 노후화·구버전 홀더).
+  507을 낸 홀더는 클라이언트가 `QUOTA_BLOCK_SECONDS`(30분) 동안 배치 후보에서
+  제외해(직접·UDP·릴레이 어느 경로에서 관측되든) 매 청크·매 주기 재시도가 폭주하지
+  않게 하고, WARNING으로 1회 알린다. 만료되면 다시 후보가 되어 공간 회수를 반영한다.
 - 복제본 전송: 홀더로 직접 TCP push/fetch를 짧은 타임아웃(`DIRECT_HOLDER_TIMEOUT`,
   3s)으로 시도하고, 실패하면 홀펀칭 UDP, 그래도 실패하면 서버 릴레이로 내려가는
   캐스케이드다(RemoteSource와 동일 원리, 상세 [TRANSPORT.md](./TRANSPORT.md)). 직접
@@ -179,7 +186,11 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
 - 운영 활성화(`replication.enabled`, 기본 활성): daemon이 시작 시 GET
   `/replication/policy`로 호혜 비율·목표 복제본 수를 내려받아 적용하고(주기 갱신),
   `provided_bytes`(미설정 시 로컬 총 용량)를 서버에 신고하며 ParityStore를
-  `provided*비율`로 켠다. `replication_scheduler`가 백그라운드로 미복제(none)·미달
+  `provided*비율`로 켠다. 신고는 정책 갱신 주기(`policy_interval_seconds`, 기본 1h)
+  마다 반복되고, 신고값과 ParityStore 한도를 같은 값에서 파생시켜 서버 회계가 홀더의
+  실제 수용 한도와 어긋나지 않게 한다. 제공 용량이 0이거나 호스팅이 정책으로 금지되면
+  0을 신고해(신고 생략이 아니라) 서버가 이 device를 배치 후보에서 뺀다 — 생략하면
+  서버에 남은 옛 값으로 배치가 계속돼 홀더가 507만 반환한다. `replication_scheduler`가 백그라운드로 미복제(none)·미달
   (pending) 로컬 파일을 자동 backup하고(제한된 동시성 `backup_concurrency`로 병렬,
   한 파일이 연결 타임아웃을 기다리는 동안 다른 파일 진행), replicated가 degraded로
   떨어진 채 유예(`heal_grace_seconds`, 기본 24h) 이상 지속되면 heal한다. 파일 단위

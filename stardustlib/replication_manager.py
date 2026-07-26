@@ -20,6 +20,7 @@ import asyncio
 import base64
 import hashlib
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -36,6 +37,15 @@ logger = logging.getLogger(__name__)
 DEFAULT_MIN_REPLICAS = 1  # 원본 외 추가 사본 수. 서버 /replication/policy로 재정의됨.
 # 홀더 직접 연결 시도 타임아웃(초). 짧게 잡아 도달 불가 시 릴레이로 빨리 fallback.
 DIRECT_HOLDER_TIMEOUT = 3.0
+# 보관 한도 초과(507)를 응답한 홀더를 배치 후보에서 제외하는 기간(초). 서버 회계가
+# 홀더 실제 한도보다 낙관적일 때(신고값 노후화 등) 같은 홀더로 매 청크·매 주기
+# 재시도하는 폭주를 막는다. 만료되면 다시 후보가 되어 공간 회수를 반영한다.
+QUOTA_BLOCK_SECONDS = 1800.0
+# placement에 목표 복제본 수보다 여유 있게 후보를 요청한다. 일부 홀더가 쿼터 초과
+# (507)나 도달 불가로 실패해도 같은 청크에서 대체 홀더로 넘어갈 수 있다.
+PLACEMENT_SPARE = 2
+# 홀더 보관 한도 초과 상태 코드(p2p replica_store).
+_QUOTA_STATUS = 507
 
 
 class ReplicationError(Exception):
@@ -110,6 +120,8 @@ class ReplicationManager:
         # 직접 UDP(홀펀칭) 전송 콜백: async (device_id, op, payload) -> (status, result).
         # 데몬이 HolePunchService.send_op를 주입한다. 같은 _io 루프에서 await된다.
         self._udp_send = None
+        # 보관 한도 초과(507)를 낸 홀더 → 배제 만료 시각(monotonic 초).
+        self._quota_blocked: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # 식별자 (서버에 가상경로 비노출 — SHA-256 해시)
@@ -124,6 +136,30 @@ class ReplicationManager:
         """목표 복제본 수를 갱신한다(정책 변경 반영)."""
         if n >= 1:
             self._min_replicas = n
+
+    def _mark_quota_blocked(self, device_id: str) -> None:
+        """보관 한도를 초과한 홀더를 QUOTA_BLOCK_SECONDS 동안 배치 후보에서 뺀다.
+
+        서버 회계(신고 제공 용량)가 홀더의 실제 한도보다 낙관적일 때 배치가 계속
+        같은 홀더를 지목하므로, 클라이언트가 직접 기억해 재시도를 낭비하지 않는다.
+        """
+        first_time = device_id not in self._quota_blocked
+        self._quota_blocked[device_id] = time.monotonic() + QUOTA_BLOCK_SECONDS
+        if first_time:
+            logger.warning(
+                "홀더 보관 한도 초과(507) — %.0f분간 배치 제외: dev=%s. "
+                "홀더의 제공 용량 신고가 실제 한도보다 큰 상태일 수 있습니다",
+                QUOTA_BLOCK_SECONDS / 60, device_id,
+            )
+
+    def quota_blocked_devices(self) -> list[str]:
+        """현재 보관 한도 초과로 배제 중인 홀더 목록(만료분은 정리한다)."""
+        now = time.monotonic()
+        for device_id in [
+            d for d, until in self._quota_blocked.items() if until <= now
+        ]:
+            del self._quota_blocked[device_id]
+        return list(self._quota_blocked)
 
     def set_udp_transport(self, fn) -> None:
         """직접 UDP(홀펀칭) 전송 콜백을 설정한다.
@@ -166,9 +202,18 @@ class ReplicationManager:
         )
         self._meta.set_replication_status(virtual_path, result.status)
         if result.status != "replicated":
+            blocked = self.quota_blocked_devices()
+            reason = (
+                f" — 보관 한도 초과로 배제된 홀더: {blocked}" if blocked else ""
+            )
+            # 청크가 많으면 복제수 목록이 장문이 되므로 최소/최대만 요약한다.
+            counts = result.replicas_per_chunk
             logger.warning(
-                "파일 복제 미완료(pending): %s — 청크별 복제수=%s (목표 %d)",
-                virtual_path, result.replicas_per_chunk, self._min_replicas,
+                "파일 복제 미완료(pending): %s — 청크 %d개, 복제수 min=%d max=%d "
+                "(목표 %d)%s",
+                virtual_path, len(counts),
+                min(counts) if counts else 0, max(counts) if counts else 0,
+                self._min_replicas, reason,
             )
         return result
 
@@ -271,7 +316,7 @@ class ReplicationManager:
         token = await self._token()
         # 소유자 자신의 device는 홀더에서 제외한다(자기 기기에 백업은 무의미·헤어핀 실패).
         self_dev = getattr(self._storage_pool, "device_id", None)
-        exclude = [self_dev] if self_dev else []
+        base_exclude = [self_dev] if self_dev else []
         replicas_per_chunk: list[int] = []
         for idx, data in chunks:
             chunk_id = self._chunk_id(file_ref, idx)
@@ -279,9 +324,14 @@ class ReplicationManager:
                 token, chunk_id, file_ref, idx, len(data),
                 chunk_hash=chunker.chunk_hash(data),
             )
+            # 한도 초과로 배제 중인 홀더는 매 청크마다 다시 걸러낸다(같은 파일의
+            # 첫 청크에서 507이 나면 나머지 청크는 그 홀더를 요청하지 않는다).
+            exclude = base_exclude + self.quota_blocked_devices()
             holders = await self._placement(token, len(data), exclude=exclude)
             placed = 0
             for holder in holders:
+                if placed >= self._min_replicas:
+                    break  # 목표 충족 — 여유 후보는 쓰지 않는다
                 address = holder.get("connection_address")
                 device_id = holder.get("device_id")
                 if not device_id:
@@ -413,6 +463,10 @@ class ReplicationManager:
         exclude = list(current_devices)
         if self_dev and self_dev not in exclude:
             exclude.append(self_dev)
+        # 한도 초과로 배제 중인 홀더는 재복제 후보에서도 뺀다.
+        exclude += [
+            d for d in self.quota_blocked_devices() if d not in exclude
+        ]
         candidates = await self._placement(token, len(data), exclude=exclude)
         added = 0
         for cand in candidates:
@@ -517,9 +571,15 @@ class ReplicationManager:
     async def _placement(
         self, token: str, size: int, exclude: list[str]
     ) -> list[dict]:
+        """배치 후보를 받는다. 목표 복제본 수 + 여유분(PLACEMENT_SPARE)을 요청해
+        일부 홀더가 실패해도 같은 청크에서 대체 홀더를 쓸 수 있게 한다."""
         resp = await self._client.post(
             f"{self._server_url}/replication/placement",
-            json={"size": size, "count": self._min_replicas, "exclude": exclude},
+            json={
+                "size": size,
+                "count": self._min_replicas + PLACEMENT_SPARE,
+                "exclude": exclude,
+            },
             headers=self._auth_headers(token),
         )
         if resp.status_code != 200:
@@ -577,6 +637,9 @@ class ReplicationManager:
         전송 순서: (1) 직접 TCP(광고 주소, 주로 LAN) → (2) 직접 UDP(홀펀칭) →
         (3) 릴레이(정책 허가 시, 최후). 각 단계에서 200=성공(True), 비-200(쿼터 등)은
         재경로 무의미하므로 False, 도달 불가(타임아웃/연결 실패)면 다음 단계로 넘어간다.
+
+        보관 한도 초과(507)는 어느 경로에서 관측되든 그 홀더를 일정 시간 배치
+        후보에서 배제해(quota_blocked) 같은 실패를 반복하지 않는다.
         """
         encoded = base64.b64encode(data).decode("ascii")
         body = {"chunk_id": chunk_id, "data": encoded}
@@ -588,6 +651,8 @@ class ReplicationManager:
                     f"http://{address}/p2p/replica_store",
                     json=authed, timeout=DIRECT_HOLDER_TIMEOUT,
                 )
+                if resp.status_code == _QUOTA_STATUS and device_id:
+                    self._mark_quota_blocked(device_id)
                 return resp.status_code == 200
             except (httpx.TimeoutException, httpx.NetworkError):
                 pass  # 도달 불가 → 다음 경로
@@ -597,6 +662,8 @@ class ReplicationManager:
                 status, _result = await self._udp_send(
                     device_id, "replica_store", authed
                 )
+                if status == _QUOTA_STATUS:
+                    self._mark_quota_blocked(device_id)
                 return status == 200  # 비-200(쿼터 등)은 릴레이해도 동일
             except Exception:  # noqa: BLE001 — 펀치/전송 실패 → 릴레이
                 pass
@@ -607,10 +674,14 @@ class ReplicationManager:
             await self._relay_op(device_id, "replica_store", authed)
             return True
         except Exception as e:  # noqa: BLE001
-            logger.info(
-                "홀더 store 실패(direct+udp+relay) dev=%s addr=%s: %s",
-                device_id, address, e,
-            )
+            # RelayOpError.status로 홀더 핸들러의 원래 상태를 구분한다.
+            if getattr(e, "status", None) == _QUOTA_STATUS:
+                self._mark_quota_blocked(device_id)
+            else:
+                logger.info(
+                    "홀더 store 실패(direct+udp+relay) dev=%s addr=%s: %s",
+                    device_id, address, e,
+                )
             return False
 
     async def _holder_fetch(

@@ -9,6 +9,7 @@ asyncio.to_thread로 호출해 daemon 이벤트 루프를 막지 않는다. 한 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 
 logger = logging.getLogger(__name__)
@@ -84,12 +85,18 @@ class ReplicationScheduler:
         )
 
     async def _policy_loop(self) -> None:
-        """주기적으로 서버 정책을 내려받아 적용한다(시작 시 즉시 1회)."""
+        """주기적으로 서버 정책을 내려받아 적용한다(시작 시 즉시 1회).
+
+        on_policy는 동기 함수 또는 코루틴 함수일 수 있다(용량 재신고처럼 네트워크
+        I/O가 필요한 적용은 코루틴으로 받는다).
+        """
         while not self._stop.is_set():
             try:
                 policy = await self._policy_fetcher()
                 if policy and self._on_policy is not None:
-                    self._on_policy(policy)
+                    applied = self._on_policy(policy)
+                    if inspect.isawaitable(applied):
+                        await applied
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001 — 루프 유지

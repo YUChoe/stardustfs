@@ -299,6 +299,33 @@ async def test_policy_loop_applies_policy():
     assert applied and applied[0]["min_replicas"] == 5
 
 
+@pytest.mark.asyncio
+async def test_policy_loop_awaits_coroutine_callback():
+    """on_policy가 코루틴 함수면 await한다(용량 재신고처럼 I/O가 필요한 적용)."""
+    mgr = _FakeManager()
+    applied: list[dict] = []
+
+    async def fetcher():
+        return {"reciprocity_fraction": 0.5, "min_replicas": 2}
+
+    async def on_policy(policy: dict) -> None:
+        applied.append(policy)
+
+    sched = ReplicationScheduler(
+        mgr, _FakeMeta([]), "devA",
+        backup_interval=10_000, heal_interval=10_000, policy_interval=10_000,
+        policy_fetcher=fetcher,
+        on_policy=on_policy,
+    )
+    await sched.start()
+    for _ in range(50):
+        if applied:
+            break
+        await asyncio.sleep(0.01)
+    await sched.stop()
+    assert applied and applied[0]["min_replicas"] == 2
+
+
 # --- 수정 시 복제 상태 무효화 (낡은 백업이 '완료'로 남는 버그 회귀) ---
 
 def test_update_invalidates_replication_status():

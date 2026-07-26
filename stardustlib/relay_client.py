@@ -22,6 +22,18 @@ logger = logging.getLogger(__name__)
 _REQUEST_TIMEOUT = 35.0
 
 
+class RelayOpError(OSError):
+    """대상 device 핸들러가 비-200 상태를 반환했다.
+
+    호출자가 재시도 가치를 판단할 수 있도록 원래 상태 코드를 status에 담는다
+    (예: 507 쿼터 초과는 재경로·재시도가 무의미).
+    """
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 class RelayClient:
     """요청자 측 릴레이 클라이언트.
 
@@ -120,8 +132,9 @@ class RelayClient:
                     if isinstance(result, dict)
                     else None
                 )
-                raise OSError(
-                    f"Relay op failed (status={status}): {error}"
+                raise RelayOpError(
+                    f"Relay op failed (status={status}): {error}",
+                    status=status if isinstance(status, int) else None,
                 )
 
             return result if isinstance(result, dict) else {}
