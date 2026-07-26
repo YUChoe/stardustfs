@@ -219,8 +219,8 @@ class ReplicationScheduler:
             # 삼켜진 것처럼 보인다. 이유를 남긴다.
             if announced:
                 logger.info(
-                    "백업 요청 대상 없음: 요청 %d개 — 이미 복제 완료거나 "
-                    "이 device 소유 파일이 아닙니다", len(announced),
+                    "백업 요청 대상 없음: 요청 %d개 — 이미 복제 완료(replicated)"
+                    "거나 이 기기에 그 파일의 청크가 없습니다", len(announced),
                 )
             return 0
         logger.info(

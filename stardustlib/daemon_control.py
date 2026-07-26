@@ -162,7 +162,10 @@ class DaemonControlServer:
             web.post("/ctl/announce", self._handle_announce),
             web.post("/ctl/progress", self._handle_progress),
         ])
-        self._runner = web.AppRunner(app)
+        # 접근 로그를 끈다. GUI가 /ctl/progress를 3초마다 폴링하므로 요청당 한 줄이
+        # 쌓이면 하루 약 3만 줄이 되어 실제 이벤트가 묻힌다. 각 핸들러가 필요한 것만
+        # 직접 남긴다(put/get/announce는 자체 logger.info 보유).
+        self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
         site = web.TCPSite(self._runner, "127.0.0.1", 0)
         await site.start()
