@@ -26,6 +26,8 @@ from aiohttp import web
 logger = logging.getLogger(__name__)
 
 _CTL_TIMEOUT = 600.0  # 초 — 대용량 전송 허용
+# 진행 조회는 GUI 폴링 경로라 짧게 잡는다(실패 시 표시를 생략한다).
+_PROGRESS_TIMEOUT = 2.0
 
 
 def _ctl_path(metadata_db: str) -> str:
@@ -104,6 +106,33 @@ def announce_via_daemon(metadata_db: str, virtual_paths: list[str]) -> int | Non
     )
 
 
+def progress_via_daemon(metadata_db: str) -> dict | None:
+    """데몬의 복제 진행 상태를 조회한다(GUI 폴링).
+
+    Returns:
+        {"active": bool, ...} 또는 데몬 미실행·조회 실패 시 None. 폴링 경로라
+        실패는 조용히 넘긴다(호출자는 진행 표시를 생략한다).
+    """
+    ctl = read_ctl(metadata_db)
+    if ctl is None:
+        return None
+    try:
+        resp = httpx.post(
+            f"http://127.0.0.1:{ctl['port']}/ctl/progress",
+            json={},
+            headers={"X-Ctl-Token": ctl["token"]},
+            timeout=_PROGRESS_TIMEOUT,
+        )
+    except httpx.HTTPError:
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        return resp.json()
+    except ValueError:
+        return None
+
+
 class DaemonControlServer:
     """데몬의 로컬 전송 위임 서버(127.0.0.1)."""
 
@@ -113,12 +142,15 @@ class DaemonControlServer:
         sync_client,
         metadata_db: str,
         repl_scheduler=None,
+        repl_progress=None,
     ) -> None:
         self._storage_pool = storage_pool
         self._sync = sync_client
         self._db = metadata_db
         # 리플리케이션 스케줄러(선택). 쓰기 직후 announce로 즉시 백업을 트리거한다.
         self._repl_scheduler = repl_scheduler
+        # 복제 진행 추적기(선택). GUI가 /ctl/progress로 폴링한다.
+        self._repl_progress = repl_progress
         self._token = secrets.token_hex(16)
         self._runner: web.AppRunner | None = None
 
@@ -128,6 +160,7 @@ class DaemonControlServer:
             web.post("/ctl/put", self._handle_put),
             web.post("/ctl/get", self._handle_get),
             web.post("/ctl/announce", self._handle_announce),
+            web.post("/ctl/progress", self._handle_progress),
         ])
         self._runner = web.AppRunner(app)
         await self._runner.setup()
@@ -210,6 +243,21 @@ class DaemonControlServer:
             self._announce(str(vpath))
         logger.info("수동 백업 announce: %d개", len(vpaths))
         return web.json_response({"ok": True, "announced": len(vpaths)})
+
+    async def _handle_progress(self, request: web.Request) -> web.Response:
+        """현재 복제 진행 상태를 반환한다(GUI 폴링).
+
+        진행 중이 아니면 {"active": false}. 응답에는 가상 경로와 수치만 담는다.
+        """
+        if not self._authorised(request):
+            return web.json_response({"error": "unauthorised"}, status=403)
+        snapshot = (
+            self._repl_progress.snapshot()
+            if self._repl_progress is not None else None
+        )
+        if snapshot is None:
+            return web.json_response({"active": False})
+        return web.json_response(snapshot.as_dict())
 
     async def _handle_get(self, request: web.Request) -> web.Response:
         if not self._authorised(request):

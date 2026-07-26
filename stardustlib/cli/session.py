@@ -35,6 +35,18 @@ def _identify_self(my_devices: list[dict], device_name: str) -> str | None:
     return None
 
 
+async def _fetch_min_replicas(auth, server_url: str) -> int | None:
+    """서버 정책의 목표 복제본 수. 조회 실패(구버전·오프라인)면 None."""
+    from stardustlib.replication_hosting import fetch_policy
+
+    try:
+        policy = await fetch_policy(auth, server_url)
+    except Exception as e:  # noqa: BLE001 — 정책 조회 실패는 비치명
+        logger.debug("복제 정책 조회 실패, 기본값 사용: %s", e)
+        return None
+    return int(policy["min_replicas"]) if policy else None
+
+
 class CLISession:
     """단발 CLI 명령이 사용하는 코어 컴포넌트 묶음.
 
@@ -52,18 +64,27 @@ class CLISession:
         self.server_url: str | None = None
         self.my_devices: list[dict] | None = None
         self.self_device_id: str | None = None
+        # 서버 /replication/policy의 목표 복제본 수. 조회 실패 시 None(기본값 사용).
+        self.min_replicas: int | None = None
 
     def make_replication_manager(self):
         """리플리케이션 매니저를 생성한다(온라인 세션 전용).
+
+        서버 정책의 목표 복제본 수를 반영한다 — 기본값으로 고정하면 정책이
+        min_replicas=2여도 1개만 확보하고 replicated로 처리된다.
 
         호출자가 close()로 정리한다.
         """
         if not self.online or self.auth is None or not self.server_url:
             raise RuntimeError("리플리케이션은 온라인 세션이 필요합니다")
-        from stardustlib.replication_manager import ReplicationManager
+        from stardustlib.replication_manager import (
+            DEFAULT_MIN_REPLICAS,
+            ReplicationManager,
+        )
 
         return ReplicationManager(
-            self.auth, self.server_url, self.metadata, self.storage_pool
+            self.auth, self.server_url, self.metadata, self.storage_pool,
+            min_replicas=self.min_replicas or DEFAULT_MIN_REPLICAS,
         )
 
     @classmethod
@@ -154,10 +175,16 @@ class CLISession:
             storage_pool.device_id = self_device_id
             device_mgr._device_id = self_device_id
         else:
+            # 자기 device를 특정하지 못하면 복제 배치에서 자기 기기를 제외하지 못해
+            # 자기 자신을 홀더로 고를 수 있다. 무엇으로 조회했는지 남겨 진단 가능하게.
+            from stardustlib.device_manager import _get_os_info
+
             logger.warning(
-                "이 device가 서버에 등록돼 있지 않습니다 (name=%s). daemon을 먼저 "
-                "실행해 등록하세요. 원격 라우팅 없이 진행합니다.",
-                device_name,
+                "이 device를 서버 목록에서 찾지 못했습니다 (name=%s, os=%s). "
+                "등록된 device: %s. daemon을 먼저 실행해 등록하세요. "
+                "원격 라우팅과 자기 기기 제외 없이 진행합니다.",
+                device_name, _get_os_info(),
+                [(d.get("name"), d.get("os")) for d in my_devices],
             )
         _mount_remote_sources(
             config, storage_pool, auth, server_url,
@@ -178,6 +205,7 @@ class CLISession:
         session.server_url = server_url
         session.my_devices = my_devices
         session.self_device_id = self_device_id
+        session.min_replicas = await _fetch_min_replicas(auth, server_url)
         return session
 
     @staticmethod

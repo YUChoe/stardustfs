@@ -457,6 +457,26 @@ class RemoteSource(StorageSource):
         )
         return list(result.get("entries", []))
 
+    def announce_backup(self, virtual_path: str) -> bool:
+        """이 원격 device에 백업 수행을 위임한다(POST /p2p/backup_announce).
+
+        청크를 보관한 기기가 직접 올리게 해서, 데이터를 갖지 않은 기기가 원본을
+        릴레이로 당겨오는 왕복을 없앤다. 도달 불가·스케줄러 미가동이면 False.
+        """
+        self._check_active()
+        try:
+            self._io.run_coroutine(
+                self._p2p_request(
+                    "/p2p/backup_announce", {"virtual_path": virtual_path}
+                )
+            )
+            return True
+        except Exception as e:  # noqa: BLE001 — 위임 실패는 호출자가 알린다
+            logger.info(
+                "백업 위임 실패(device=%s): %s", self._device_id, e
+            )
+            return False
+
     def get_available_space(self) -> int:
         """P2P POST /p2p/space 요청으로 가용 공간을 반환한다."""
         self._check_active()

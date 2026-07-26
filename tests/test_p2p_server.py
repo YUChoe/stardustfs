@@ -753,3 +753,52 @@ class TestDispatchLoopback:
         )
         assert status == 200
         assert result["exists"] is True
+
+
+class TestBackupAnnounce:
+    """백업 위임 op: 청크를 보관한 device가 자기 몫을 올리게 예약한다."""
+
+    @pytest.fixture
+    def server(self, storage_pool, mock_auth_client):
+        return P2PServer(
+            storage_pool=storage_pool,
+            auth_client=mock_auth_client,
+            port=9998,
+            server_url="http://localhost:8000",
+        )
+
+    def test_announce_calls_scheduler(self, server):
+        received = []
+        server.set_backup_announcer(received.append)
+
+        status, result = server._op_backup_announce(
+            {"virtual_path": "/docs/a.txt"}
+        )
+        assert status == 200
+        assert result["status"] == "announced"
+        assert received == ["/docs/a.txt"]
+
+    def test_announce_without_scheduler_is_503(self, server):
+        status, _ = server._op_backup_announce({"virtual_path": "/a.txt"})
+        assert status == 503
+
+    def test_announce_requires_path(self, server):
+        server.set_backup_announcer(lambda _p: None)
+        status, _ = server._op_backup_announce({})
+        assert status == 400
+
+    @pytest.mark.asyncio
+    async def test_announce_via_relay_requires_same_user(self, server):
+        """릴레이/UDP 경로도 같은 사용자 토큰이어야 한다(파일 op와 동일 인가)."""
+        received = []
+        server.set_backup_announcer(received.append)
+
+        async def _other_user(_token):
+            return "intruder"
+
+        server._resolve_token_user = _other_user
+        status, _ = await server.dispatch_async(
+            "backup_announce", {"virtual_path": "/a.txt", "auth_token": "t"}
+        )
+        assert status == 403
+        assert received == []

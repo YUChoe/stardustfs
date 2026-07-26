@@ -205,9 +205,7 @@ class ReplicationScheduler:
         채운다. pending(목표 미달)도 매 주기 재시도해 홀더가 확보되면 곧 replicated가
         된다(heal의 24h 유예와 달리 즉시 재시도). 처리한 파일 수를 반환한다.
         """
-        paths = self._metadata.list_virtual_paths_for_replication(
-            ("none", "pending"), self._owner_device_id
-        )
+        paths = self._paths_to_back_up(("none", "pending"))
         # announce된 경로를 앞으로. 이미 복제 완료됐으면 대상 목록에 없으므로 빠진다.
         announced = self._take_announced()
         eligible = set(paths)
@@ -261,6 +259,23 @@ class ReplicationScheduler:
         self._last_pending = pending[0]
         return done[0]
 
+    def _paths_to_back_up(self, statuses: tuple[str, ...]) -> list[str]:
+        """백업 대상 경로. 이 device에 물리 청크가 있는 파일만 고른다.
+
+        소유는 사용자 단위이므로 파일 레코드 소속(`files.device_id`)이 아니라 청크
+        보관 위치로 수행 주체를 정한다. 청크가 여러 device에 흩어진 파일은 각
+        device가 자기 몫만 올리고, 서버 레지스트리에서 파일 전체가 채워진다.
+
+        구버전 MetadataStore(조회 미지원)나 device_id 미확정이면 기존 선정으로
+        내려간다.
+        """
+        by_chunks = getattr(self._metadata, "list_paths_with_local_chunks", None)
+        if callable(by_chunks) and self._owner_device_id:
+            return by_chunks(statuses, self._owner_device_id)
+        return self._metadata.list_virtual_paths_for_replication(
+            statuses, self._owner_device_id
+        )
+
     def _take_announced(self) -> list[str]:
         """announce 큐를 비우고 목록으로 반환한다(중복 처리 방지)."""
         if not self._announced:
@@ -290,9 +305,7 @@ class ReplicationScheduler:
         """
         # replicated(건강했다가 줄어든) 파일만 유예 후 보충. pending은 backup 루프가
         # 즉시 재시도하므로 제외한다.
-        paths = self._metadata.list_virtual_paths_for_replication(
-            ("replicated",), self._owner_device_id
-        )
+        paths = self._paths_to_back_up(("replicated",))
         now = asyncio.get_running_loop().time()
         repaired = 0
         for vpath in paths[: self._max]:

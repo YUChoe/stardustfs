@@ -191,3 +191,70 @@ async def test_manual_announce_no_daemon_returns_none(tmp_path):
         daemon_control.announce_via_daemon, db, ["/a"]
     )
     assert count is None
+
+
+# --- 복제 진행 조회 (/ctl/progress) ---
+
+@pytest.mark.asyncio
+async def test_progress_reports_active_replication(tmp_path):
+    """진행 중이면 경로·단계·수치를 돌려준다(사용자 데이터 없음)."""
+    from stardustlib.replication_progress import STAGE_STORING, ProgressTracker
+
+    db = str(tmp_path / "m.db")
+    tracker = ProgressTracker()
+    tracker.begin("/movies/big.mp4", 188, STAGE_STORING)
+    tracker.advance(42, secured=40)
+
+    server = DaemonControlServer(
+        _FakeStoragePool(), _FakeSync(), db, repl_progress=tracker
+    )
+    await server.start()
+    try:
+        res = await asyncio.to_thread(
+            daemon_control.progress_via_daemon, db
+        )
+        assert res["active"] is True
+        assert res["path"] == "/movies/big.mp4"
+        assert res["stage"] == STAGE_STORING
+        assert res["done"] == 42 and res["total"] == 188
+        assert res["secured"] == 40
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_progress_inactive_when_idle(tmp_path):
+    from stardustlib.replication_progress import ProgressTracker
+
+    db = str(tmp_path / "m.db")
+    server = DaemonControlServer(
+        _FakeStoragePool(), _FakeSync(), db,
+        repl_progress=ProgressTracker(),
+    )
+    await server.start()
+    try:
+        res = await asyncio.to_thread(daemon_control.progress_via_daemon, db)
+        assert res == {"active": False}
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_progress_inactive_without_tracker(tmp_path):
+    """리플리케이션 비활성이면 추적기가 없다 — 조회는 비활성으로 응답한다."""
+    db = str(tmp_path / "m.db")
+    server = DaemonControlServer(_FakeStoragePool(), _FakeSync(), db)
+    await server.start()
+    try:
+        res = await asyncio.to_thread(daemon_control.progress_via_daemon, db)
+        assert res == {"active": False}
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_progress_returns_none_without_daemon(tmp_path):
+    """데몬 미실행이면 None(GUI는 진행 표시를 생략한다)."""
+    db = str(tmp_path / "absent.db")
+    res = await asyncio.to_thread(daemon_control.progress_via_daemon, db)
+    assert res is None

@@ -26,7 +26,7 @@ from typing import Any
 
 import httpx
 
-from stardustlib import chunker
+from stardustlib import chunker, replication_progress
 from stardustlib.auth_client import AuthClient
 from stardustlib.encryption_engine import EncryptionEngine
 from stardustlib.exceptions import AuthenticationError
@@ -48,6 +48,9 @@ PLACEMENT_SPARE = 2
 _QUOTA_STATUS = 507
 # 청크가 이 수 이상인 파일은 복제 진행 로그를 남긴다(대용량 파일 무응답 오인 방지).
 PROGRESS_MIN_CHUNKS = 20
+# 한 청크 전송이 이 시간을 넘기면 지연으로 보고 홀더를 로그에 남긴다.
+# 직접 TCP(3s) + 릴레이 long-poll(35s)을 모두 소진한 경우를 잡는 기준.
+SLOW_HOLDER_SECONDS = 30.0
 # 한 파일 복제 중 남길 진행 로그 횟수(진행률 대략 1/N 단위).
 PROGRESS_REPORTS = 10
 
@@ -72,6 +75,8 @@ class ReplicationResult:
     chunk_count: int
     min_replicas: int
     replicas_per_chunk: list[int] = field(default_factory=list)
+    # 제외 규칙 적용 후 배치 후보가 하나도 없던 청크 수(조용한 실패 방지).
+    no_holder_chunks: int = 0
 
 
 @dataclass
@@ -109,6 +114,7 @@ class ReplicationManager:
         timeout: float = 10.0,
         max_concurrent_repair: int = 4,
         io: _EventLoopThread | None = None,
+        progress=None,
     ) -> None:
         self._auth = auth_client
         self._server_url = server_url.rstrip("/")
@@ -126,6 +132,10 @@ class ReplicationManager:
         self._udp_send = None
         # 보관 한도 초과(507)를 낸 홀더 → 배제 만료 시각(monotonic 초).
         self._quota_blocked: dict[str, float] = {}
+        # 자기 device_id 미확정 경고를 1회만 남기기 위한 플래그.
+        self._warned_no_self_device = False
+        # 진행 상태 추적기(선택). daemon이 주입하면 제어 채널·GUI에 노출된다.
+        self._progress = progress
 
     # ------------------------------------------------------------------
     # 식별자 (서버에 가상경로 비노출 — SHA-256 해시)
@@ -155,6 +165,46 @@ class ReplicationManager:
                 "홀더의 제공 용량 신고가 실제 한도보다 큰 상태일 수 있습니다",
                 QUOTA_BLOCK_SECONDS / 60, device_id,
             )
+
+    def _resolve_file_status(
+        self, file_ref: str, result: ReplicationResult
+    ) -> str:
+        """파일 전체의 복제 상태를 서버 레지스트리 기준으로 판정한다.
+
+        각 device는 자기 로컬 청크만 올리므로, 이 device의 전송 결과만으로는 파일이
+        완료됐는지 알 수 없다(다른 device가 나머지를 올린다). 레지스트리에 등록된
+        모든 청크가 min_replicas 이상이면 replicated다.
+
+        조회 실패 시에는 이 device의 전송 결과를 그대로 쓴다(보수적).
+        """
+        try:
+            summary = self._io.run_coroutine(self._health(file_ref))
+        except Exception as e:  # noqa: BLE001 — 판정 실패는 비치명
+            logger.debug("복제 상태 조회 실패, 로컬 결과 사용: %s", e)
+            return result.status
+        if summary.chunk_count == 0:
+            return result.status
+        return "pending" if summary.degraded else "replicated"
+
+    def _origin_devices(self, virtual_path: str) -> dict[int, str]:
+        """청크 index → 원본을 보관한 device_id.
+
+        `file_chunks.device_id`가 NULL이면 이 device 로컬이므로 자기 device_id로
+        채운다. 청크 레코드가 없으면 빈 맵이다(원본 위치를 알 수 없어 제외 불가).
+
+        소유는 사용자 단위이므로 "실행 중인 기기"가 아니라 이 원본 위치가 홀더
+        배제의 기준이다 — 원본이 있는 기기에 사본을 두면 내구성 이득이 없다.
+        """
+        get_chunks = getattr(self._meta, "get_chunks", None)
+        if not callable(get_chunks):
+            return {}
+        self_dev = getattr(self._storage_pool, "device_id", None)
+        origins: dict[int, str] = {}
+        for chunk in get_chunks(virtual_path):
+            device_id = getattr(chunk, "device_id", None) or self_dev
+            if device_id:
+                origins[chunk.index] = device_id
+        return origins
 
     def quota_blocked_devices(self) -> list[str]:
         """현재 보관 한도 초과로 배제 중인 홀더 목록(만료분은 정리한다)."""
@@ -189,27 +239,62 @@ class ReplicationManager:
     # ------------------------------------------------------------------
 
     def replicate(self, virtual_path: str) -> ReplicationResult:
-        """파일을 암호화·청킹해 ≥min_replicas 홀더에 복제한다.
+        """이 device가 보관한 청크를 ≥min_replicas 홀더에 복제한다.
 
         로컬 I/O(읽기·암호화·상태 기록)는 호출 스레드에서, 네트워크는 IO 루프에서
         수행한다. 파일이 없으면 FileNotFoundError, 암호화 미설정 시 ReplicationError.
+
+        올릴 로컬 청크가 없으면(청크가 전부 다른 device 보관) status="skipped"로
+        끝내고 복제 상태를 바꾸지 않는다 — 그 기기가 자기 몫을 올린다.
         """
         meta = self._meta.lookup(virtual_path)
         if meta is None:
             raise FileNotFoundError(virtual_path)
 
-        file_ref = self._file_ref(virtual_path)
-        chunks = self._chunks_to_replicate(virtual_path)
+        try:
+            return self._replicate_tracked(virtual_path)
+        finally:
+            # 성공·실패·예외 어느 경로에서도 진행 표시를 정리한다.
+            self._progress_call("finish")
 
-        result = self._io.run_coroutine(
-            self._replicate_chunks(file_ref, chunks)
+    def _replicate_tracked(self, virtual_path: str) -> ReplicationResult:
+        """replicate 본체. 진행 정리는 호출자(replicate)가 책임진다."""
+        file_ref = self._file_ref(virtual_path)
+        self._progress_call(
+            "begin", virtual_path, 0, replication_progress.STAGE_READING
         )
+        chunks = self._chunks_to_replicate(virtual_path)
+        origins = self._origin_devices(virtual_path)
+        if not chunks:
+            logger.info(
+                "로컬 청크 없음, 백업 건너뜀(보관 기기가 담당): %s", virtual_path
+            )
+            return ReplicationResult(
+                status="skipped", chunk_count=0,
+                min_replicas=self._min_replicas,
+            )
+
+        self._progress_call(
+            "set_stage", replication_progress.STAGE_STORING, len(chunks)
+        )
+        result = self._io.run_coroutine(
+            self._replicate_chunks(file_ref, chunks, origins)
+        )
+        # 이 device는 자기 청크만 올렸다. 파일 전체 상태는 서버 레지스트리로
+        # 판정해야 다른 device가 올린 몫이 반영된다.
+        result.status = self._resolve_file_status(file_ref, result)
         self._meta.set_replication_status(virtual_path, result.status)
         if result.status != "replicated":
             blocked = self.quota_blocked_devices()
             reason = (
                 f" — 보관 한도 초과로 배제된 홀더: {blocked}" if blocked else ""
             )
+            if result.no_holder_chunks:
+                reason += (
+                    f" — 배치 후보가 없는 청크 {result.no_holder_chunks}개"
+                    f"(원본 보관 기기·자기 기기·한도 초과 기기를 제외하면 남는"
+                    f" 홀더가 없습니다)"
+                )
             # 청크가 많으면 복제수 목록이 장문이 되므로 최소/최대만 요약한다.
             counts = result.replicas_per_chunk
             logger.warning(
@@ -222,19 +307,55 @@ class ReplicationManager:
         return result
 
     def _chunks_to_replicate(self, virtual_path: str) -> list:
-        """복제할 청크 목록 (idx, 암호문)을 만든다.
+        """이 device가 올릴 청크 목록 (idx, 암호문)을 만든다.
 
-        청크 표현 파일은 at-rest 청크를 그대로 복제 청크로 쓴다(재분할 없음). 저장·
-        전송·복제가 같은 경계를 공유하므로 복구 후 바이트가 그대로 일치하고, 청크
-        해시도 재계산 없이 유효하다. 레거시 통짜 blob은 지금처럼 고정 크기로 나눈다.
+        at-rest 청크를 그대로 복제 청크로 쓴다(재분할 없음). 저장·전송·복제가 같은
+        경계를 공유하므로 복구 후 바이트가 그대로 일치하고 청크 해시도 재계산 없이
+        유효하다.
+
+        원격 device가 보관한 청크는 읽지 않는다. 데이터를 갖지 않은 기기가 원본을
+        릴레이로 당겨오는 왕복을 막기 위해서다(그 청크는 보관 기기가 올린다).
+        올릴 로컬 청크가 없으면 빈 목록을 돌려주고 호출자가 skipped로 끝낸다.
         """
         read_chunks = getattr(self._storage_pool, "read_chunks", None)
-        if callable(read_chunks):
-            parts = read_chunks(virtual_path)
-            if parts:
-                return sorted(parts, key=lambda p: p[0])
-        blob = self._storage_pool.read_ciphertext(virtual_path)
-        return chunker.split(blob, self._chunk_size)
+        if not callable(read_chunks):
+            return []
+        parts = read_chunks(
+            virtual_path, local_only=True,
+            on_progress=self._make_read_reporter(),
+        )
+        return sorted(parts, key=lambda p: p[0])
+
+    def _progress_call(self, method: str, *args) -> None:
+        """진행 추적기 호출(미주입이면 no-op). 추적 실패가 복제를 막지 않는다."""
+        tracker = self._progress
+        if tracker is None:
+            return
+        try:
+            getattr(tracker, method)(*args)
+        except Exception as e:  # noqa: BLE001 — 추적은 부가 기능
+            logger.debug("진행 추적 실패(%s): %s", method, e)
+
+    def _make_read_reporter(self):
+        """읽기 단계 진행 로그·추적 콜백. 청크가 적으면 로그는 남기지 않는다."""
+        state = {"every": None}
+
+        def report(done: int, total: int) -> None:
+            self._progress_call("advance", done)
+            if state["every"] is None:
+                state["every"] = (
+                    max(1, total // PROGRESS_REPORTS)
+                    if total >= PROGRESS_MIN_CHUNKS else 0
+                )
+                if state["every"]:
+                    self._progress_call(
+                        "set_stage", replication_progress.STAGE_READING, total
+                    )
+            every = state["every"]
+            if every and (done % every == 0 or done == total):
+                logger.info("복제 읽기: %d/%d 청크", done, total)
+
+        return report
 
     def recover(self, virtual_path: str) -> int:
         """복제본에서 파일을 복구해 로컬에 기록한다. 기록 바이트 수를 반환한다.
@@ -285,7 +406,10 @@ class ReplicationManager:
         min_replicas를 충족하면 replicated, 아니면 pending으로 표시한다.
         """
         report = self._io.run_coroutine(
-            self._ensure_chunks(self._file_ref(virtual_path))
+            self._ensure_chunks(
+                self._file_ref(virtual_path),
+                self._origin_devices(virtual_path),
+            )
         )
         # 메타데이터가 있는 파일이면 상태를 갱신한다(복구 전용 호출은 없을 수 있음).
         if self._meta.lookup(virtual_path) is not None:
@@ -315,16 +439,25 @@ class ReplicationManager:
     # ------------------------------------------------------------------
 
     async def _replicate_chunks(
-        self, file_ref: str, chunks: list[tuple[int, bytes]]
+        self, file_ref: str, chunks: list[tuple[int, bytes]],
+        origins: dict[int, str] | None = None,
     ) -> ReplicationResult:
         token = await self._token()
         # 소유자 자신의 device는 홀더에서 제외한다(자기 기기에 백업은 무의미·헤어핀 실패).
         self_dev = getattr(self._storage_pool, "device_id", None)
         base_exclude = [self_dev] if self_dev else []
+        if not self_dev and not self._warned_no_self_device:
+            self._warned_no_self_device = True
+            logger.warning(
+                "자기 device_id를 알 수 없어 배치에서 자기 기기를 제외하지 못합니다. "
+                "원본 보관 기기 제외 규칙에만 의존합니다(daemon 미등록 상태일 수 있음)"
+            )
+        origins = origins or {}
         # pending 재시도에서 이미 확보한 청크를 다시 올리지 않기 위한 기존 등록 정보.
         registered = await self._registered_by_idx(token, file_ref)
         replicas_per_chunk: list[int] = []
         skipped = 0
+        no_holder = 0
         total = len(chunks)
         # 큰 파일은 한 사이클이 수 분 걸리므로 진행 상황을 주기적으로 남긴다
         # (요청은 받았는데 아무 로그도 없어 멈춘 것처럼 보이는 것을 막는다).
@@ -342,6 +475,7 @@ class ReplicationManager:
                 if online >= self._min_replicas:
                     replicas_per_chunk.append(online)
                     skipped += 1
+                    self._report_store_progress(done, replicas_per_chunk)
                     self._log_progress(
                         done, total, report_every, replicas_per_chunk
                     )
@@ -353,7 +487,13 @@ class ReplicationManager:
             # 한도 초과로 배제 중인 홀더는 매 청크마다 다시 걸러낸다(같은 파일의
             # 첫 청크에서 507이 나면 나머지 청크는 그 홀더를 요청하지 않는다).
             exclude = base_exclude + self.quota_blocked_devices()
+            # 이 청크의 원본을 보관한 기기도 제외한다(같은 기기 사본은 무의미).
+            origin = origins.get(idx)
+            if origin and origin not in exclude:
+                exclude.append(origin)
             holders = await self._placement(token, len(data), exclude=exclude)
+            if not holders:
+                no_holder += 1
             placed = 0
             for holder in holders:
                 if placed >= self._min_replicas:
@@ -368,6 +508,7 @@ class ReplicationManager:
                     if await self._record_replica(token, chunk_id, device_id):
                         placed += 1
             replicas_per_chunk.append(placed)
+            self._report_store_progress(done, replicas_per_chunk)
             self._log_progress(done, total, report_every, replicas_per_chunk)
 
         if skipped:
@@ -383,6 +524,7 @@ class ReplicationManager:
             chunk_count=len(chunks),
             min_replicas=self._min_replicas,
             replicas_per_chunk=replicas_per_chunk,
+            no_holder_chunks=no_holder,
         )
 
     def _log_progress(
@@ -396,6 +538,13 @@ class ReplicationManager:
             return
         ok = sum(1 for n in replicas_per_chunk if n >= self._min_replicas)
         logger.info("복제 진행: %d/%d 청크 (목표 확보 %d)", done, total, ok)
+
+    def _report_store_progress(
+        self, done: int, replicas_per_chunk: list[int]
+    ) -> None:
+        """전송 단계 진행을 추적기에 반영한다(로그와 별개로 매 청크)."""
+        secured = sum(1 for n in replicas_per_chunk if n >= self._min_replicas)
+        self._progress_call("advance", done, secured)
 
     async def _registered_by_idx(
         self, token: str, file_ref: str
@@ -452,7 +601,9 @@ class ReplicationManager:
         # 여부를 판정해 청크로 되돌리거나 단일 블록으로 합친다.
         return sorted(parts, key=lambda p: p[0])
 
-    async def _ensure_chunks(self, file_ref: str) -> HealReport:
+    async def _ensure_chunks(
+        self, file_ref: str, origins: dict[int, str] | None = None
+    ) -> HealReport:
         token = await self._token()
         chunk_infos = await self._list_chunks(token, file_ref)
         if not chunk_infos:
@@ -461,10 +612,13 @@ class ReplicationManager:
             )
 
         sem = asyncio.Semaphore(self._max_concurrent_repair)
+        origins = origins or {}
 
         async def heal(info: dict) -> dict:
             async with sem:  # 동시 재복제 상한
-                return await self._heal_chunk(token, info)
+                return await self._heal_chunk(
+                    token, info, origins.get(info.get("idx"))
+                )
 
         outcomes = await asyncio.gather(*[heal(i) for i in chunk_infos])
         repaired = sum(1 for o in outcomes if o["added"] > 0)
@@ -496,8 +650,13 @@ class ReplicationManager:
             min_online=min_online,
         )
 
-    async def _heal_chunk(self, token: str, info: dict) -> dict:
-        """한 청크의 복제본을 min_replicas까지 채운다(불변 청크 복사)."""
+    async def _heal_chunk(
+        self, token: str, info: dict, origin: str | None = None
+    ) -> dict:
+        """한 청크의 복제본을 min_replicas까지 채운다(불변 청크 복사).
+
+        origin은 이 청크의 원본을 보관한 device_id로, 배치 후보에서 제외한다.
+        """
         chunk_id = info["chunk_id"]
         holders = await self._list_replicas(token, chunk_id)
         online = [
@@ -533,6 +692,9 @@ class ReplicationManager:
         exclude = list(current_devices)
         if self_dev and self_dev not in exclude:
             exclude.append(self_dev)
+        # 원본을 보관한 기기에는 사본을 두지 않는다.
+        if origin and origin not in exclude:
+            exclude.append(origin)
         # 한도 초과로 배제 중인 홀더는 재복제 후보에서도 뺀다.
         exclude += [
             d for d in self.quota_blocked_devices() if d not in exclude
@@ -711,6 +873,24 @@ class ReplicationManager:
         보관 한도 초과(507)는 어느 경로에서 관측되든 그 홀더를 일정 시간 배치
         후보에서 배제해(quota_blocked) 같은 실패를 반복하지 않는다.
         """
+        started = time.monotonic()
+        try:
+            return await self._holder_store_paths(
+                device_id, address, chunk_id, data, token
+            )
+        finally:
+            elapsed = time.monotonic() - started
+            if elapsed >= SLOW_HOLDER_SECONDS:
+                logger.warning(
+                    "홀더 전송 지연 %.0f초(직접+릴레이 타임아웃 소진): dev=%s addr=%s",
+                    elapsed, device_id, address,
+                )
+
+    async def _holder_store_paths(
+        self, device_id: str, address: str, chunk_id: str,
+        data: bytes, token: str,
+    ) -> bool:
+        """_holder_store의 전송 캐스케이드 본체(직접 TCP → UDP → 릴레이)."""
         encoded = base64.b64encode(data).decode("ascii")
         body = {"chunk_id": chunk_id, "data": encoded}
         authed = {**body, "auth_token": token}

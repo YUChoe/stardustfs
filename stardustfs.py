@@ -608,14 +608,18 @@ async def startup_v2(config: dict, config_path: str) -> None:
 
     # (6-b) 리플리케이션 스케줄러 (자동 백업/heal/정책 갱신) — 기본 활성
     repl_scheduler = None
+    repl_progress = None
     if repl_enabled:
         from stardustlib.replication_hosting import fetch_policy
         from stardustlib.replication_manager import ReplicationManager
+        from stardustlib.replication_progress import ProgressTracker
         from stardustlib.replication_scheduler import ReplicationScheduler
 
+        # 진행 상태는 제어 채널(/ctl/progress)로 GUI에 노출된다.
+        repl_progress = ProgressTracker()
         repl_mgr = ReplicationManager(
             auth_client, server_url, metadata_store, storage_pool,
-            min_replicas=repl_min,
+            min_replicas=repl_min, progress=repl_progress,
         )
 
         def _current_provided() -> int:
@@ -668,6 +672,18 @@ async def startup_v2(config: dict, config_path: str) -> None:
             policy_interval=repl_config.get("policy_interval_seconds", 3600),
         )
         await repl_scheduler.start()
+        # 다른 device가 보낸 백업 위임(/p2p/backup_announce)을 스케줄러에 연결한다.
+        # p2p 핸들러는 홀펀칭 IO 루프에서 실행될 수 있고 스케줄러의 announce는
+        # asyncio.Event를 쓰므로, 데몬 루프로 넘겨 호출한다.
+        if p2p_server is not None:
+            _daemon_loop = asyncio.get_running_loop()
+
+            def _announce_from_peer(vpath: str) -> None:
+                _daemon_loop.call_soon_threadsafe(
+                    repl_scheduler.announce, vpath
+                )
+
+            p2p_server.set_backup_announcer(_announce_from_peer)
         # 축출 파일 읽기 시 복제 홀더에서 복구해 로컬 재구체화하는 콜백 주입.
         storage_pool._recover_fn = repl_mgr.recover
         # 홀더 전송을 직접 TCP→직접 UDP(홀펀칭)→릴레이 순으로. 같은 IO 루프에서 await.
@@ -693,6 +709,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
         control_server = DaemonControlServer(
             storage_pool, sync_client, config["metadata_db"],
             repl_scheduler=repl_scheduler,
+            repl_progress=repl_progress,
         )
         await control_server.start()
     except Exception as e:  # noqa: BLE001 — 비치명(위임 없으면 GUI가 직접 수행)

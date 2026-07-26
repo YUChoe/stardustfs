@@ -557,12 +557,21 @@ class StoragePool:
             )
         return self._read_resolved_ciphertext(metadata)
 
-    def read_chunks(self, virtual_path: str) -> list:
+    def read_chunks(
+        self, virtual_path: str, local_only: bool = False, on_progress=None
+    ) -> list:
         """at-rest 청크 암호문을 (chunk_index, bytes) 목록으로 반환한다.
 
         복제(replicate)에서 재분할 없이 그대로 복제 청크로 쓰기 위한 경로다. 저장된
         청크 경계를 그대로 넘겨주므로 at-rest·복제 표현이 완전히 일치한다.
-        레거시 통짜 blob 파일은 빈 목록을 반환한다(호출자가 read_ciphertext로 처리).
+        청크 레코드가 없는 파일은 빈 목록을 반환한다.
+
+        local_only=True면 이 device가 보관한 청크만 읽는다. 다른 device 보관 청크를
+        읽으려면 원격 전송(릴레이)이 필요한데, 백업에서는 그 청크를 보관 기기가
+        직접 올리므로 왕복이 무의미하다.
+
+        on_progress(done, total)를 주면 청크를 읽을 때마다 호출한다(대용량 파일의
+        읽기 구간이 로그 공백이 되지 않게).
 
         Raises:
             FileNotFoundError: 파일이 존재하지 않을 때.
@@ -570,9 +579,18 @@ class StoragePool:
         """
         self._resolve_metadata(virtual_path)
         chunks = self.metadata_store.get_chunks(virtual_path)
-        return [
-            (c.index, self._read_chunk_bytes(virtual_path, c)) for c in chunks
-        ]
+        if local_only:
+            chunks = [
+                c for c in chunks
+                if c.device_id is None or c.device_id == self.device_id
+            ]
+        total = len(chunks)
+        parts = []
+        for done, chunk in enumerate(chunks, start=1):
+            parts.append((chunk.index, self._read_chunk_bytes(virtual_path, chunk)))
+            if on_progress is not None:
+                on_progress(done, total)
+        return parts
 
     def migrate_to_chunks(self, virtual_path: str) -> bool:
         """레거시 통짜 blob 파일을 청크 표현으로 전환한다(무손실).

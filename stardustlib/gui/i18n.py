@@ -67,6 +67,10 @@ _KO: dict[str, str] = {
     "restore_busy": "복원 중...",
     "backup_pick": "백업할 파일을 선택하세요.",
     "backup_done": "백업 완료: {ok}개 / 미완료(pending) {pending}개",
+    "backup_delegated": " · 다른 기기에 위임 {count}건",
+    "backup_progress": "백업 중: {name} {done}/{total} 청크",
+    "backup_progress_reading": "백업 준비 중: {name} {done}/{total} 청크 읽는 중",
+    "backup_delegate_offline": " · 위임 실패(오프라인): {devices}",
     "restore_done": "복원 완료: {ok}개 / 실패 {failed}개",
     # 즉시 백업 요청(announce)
     "ctx_announce": "지금 백업 요청",
@@ -249,6 +253,10 @@ _EN: dict[str, str] = {
     "restore_busy": "Restoring...",
     "backup_pick": "Select files to back up.",
     "backup_done": "Backed up: {ok} done / {pending} pending",
+    "backup_delegated": " · delegated to {count} device(s)",
+    "backup_progress": "Backing up: {name} {done}/{total} chunks",
+    "backup_progress_reading": "Preparing backup: {name} reading {done}/{total} chunks",
+    "backup_delegate_offline": " · delegation failed (offline): {devices}",
     "restore_done": "Restored: {ok} done / {failed} failed",
     # Immediate backup request (announce)
     "ctx_announce": "Back up now",

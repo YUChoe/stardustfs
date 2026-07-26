@@ -42,6 +42,9 @@ class P2PServer:
         self._server_url = server_url.rstrip("/")
         # 호스트 역할: 타 사용자 청크 암호문 보관소(없으면 replica op 비활성)
         self._parity_store = parity_store
+        # 같은 사용자의 다른 device가 보낸 백업 위임을 처리할 콜백.
+        # daemon이 스케줄러 기동 후 주입한다(미주입이면 backup_announce는 503).
+        self._backup_announcer = None
         self._app: web.Application | None = None
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
@@ -66,6 +69,9 @@ class P2PServer:
         self._app.router.add_post("/p2p/mkdir", self.handle_mkdir)
         self._app.router.add_post("/p2p/rmdir", self.handle_rmdir)
         self._app.router.add_post("/p2p/space", self.handle_space)
+        self._app.router.add_post(
+            "/p2p/backup_announce", self.handle_backup_announce
+        )
         # 패리티(타 사용자 청크 보관) 교차 사용자 op
         self._app.router.add_post("/p2p/replica_store", self.handle_replica_store)
         self._app.router.add_post("/p2p/replica_fetch", self.handle_replica_fetch)
@@ -185,6 +191,37 @@ class P2PServer:
         status, result = self._op_space(body)
         return web.json_response(result, status=status)
 
+    async def handle_backup_announce(self, request: web.Request) -> web.Response:
+        """POST /p2p/backup_announce: 같은 사용자 device의 백업 위임 요청."""
+        body = await self._parse_and_verify(request)
+        if isinstance(body, web.Response):
+            return body
+        status, result = self._op_backup_announce(body)
+        return web.json_response(result, status=status)
+
+    def set_backup_announcer(self, fn) -> None:
+        """백업 위임 수신 콜백을 주입한다. fn(virtual_path) -> None.
+
+        daemon이 리플리케이션 스케줄러 기동 후 주입한다. 스케줄러의 announce는
+        데몬 이벤트 루프에서 호출해야 하므로, 주입하는 쪽에서 루프 전달을 책임진다.
+        """
+        self._backup_announcer = fn
+
+    def _op_backup_announce(self, body: dict) -> tuple[int, dict]:
+        """청크를 보관한 이 device가 백업을 수행하도록 예약한다.
+
+        데이터를 갖지 않은 device가 원본을 릴레이로 당겨와 올리는 왕복 대신, 보관
+        기기에 위임하는 경로다. 실제 전송은 이 device의 백업 사이클이 수행한다.
+        """
+        if self._backup_announcer is None:
+            return 503, {"error": "Replication scheduler not enabled"}
+        virtual_path = body.get("virtual_path", "")
+        if not virtual_path:
+            return 400, {"error": "virtual_path required"}
+        self._backup_announcer(virtual_path)
+        logger.info("백업 위임 수신: %s", virtual_path)
+        return 200, {"status": "announced"}
+
     # --- 패리티(교차 사용자 청크 보관) 핸들러 ---
 
     async def handle_replica_store(self, request: web.Request) -> web.Response:
@@ -250,6 +287,7 @@ class P2PServer:
             "mkdir": self._op_mkdir,
             "rmdir": self._op_rmdir,
             "space": self._op_space,
+            "backup_announce": self._op_backup_announce,
         }
         handler = op_map.get(op)
         if handler is None:

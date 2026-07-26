@@ -2,7 +2,7 @@
 
 청크 표현 파일은 at-rest 청크를 재분할 없이 그대로 복제 청크로 쓰고, 복구도 청크를
 그대로 되돌려 기록한다. 그래야 복구 후 at-rest 바이트가 복제 시점과 동일해 등록된
-청크 해시가 계속 유효하다. 레거시 통짜 blob은 기존 고정 크기 분할 경로를 유지한다.
+청크 해시가 계속 유효하다. 백업은 이 device가 보관한 청크만 올린다.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import pytest
 from stardustlib import chunker
 from stardustlib.encryption_engine import EncryptionEngine
 from stardustlib.metadata_store import MetadataStore
+from stardustlib.models import ChunkRef
 from stardustlib.replication_manager import ReplicationManager
 from stardustlib.storage_pool import StoragePool
 from stardustlib.storage_source import DirectorySource
@@ -51,6 +52,8 @@ def _manager(pool_obj, chunk_size=4 * 1024 * 1024):
     mgr._storage_pool = pool_obj
     mgr._chunk_size = chunk_size
     mgr._engine = EncryptionEngine(_KEY)
+    mgr._progress = None      # 진행 추적 미주입(no-op)
+    mgr._meta = pool_obj.metadata_store
     return mgr
 
 
@@ -73,7 +76,7 @@ def test_read_chunks_returns_at_rest_boundaries(pool):
 
 
 def test_read_chunks_empty_for_legacy_blob(pool):
-    """레거시 통짜 blob은 빈 목록을 반환한다(호출자가 read_ciphertext로 처리)."""
+    """청크 레코드가 없는 파일은 빈 목록을 반환한다."""
     sp, store, src = pool
     engine = EncryptionEngine(_KEY)
     phys = "a" * 32 + "_legacy.bin"
@@ -102,22 +105,45 @@ def test_replicate_reuses_at_rest_chunks_without_resplit(pool):
         assert chunker.chunk_hash(blob) == chunk.hash
 
 
-def test_replicate_splits_legacy_blob(pool):
-    """레거시 blob은 고정 크기 분할 경로를 유지한다."""
+def test_replicate_skips_file_without_chunks(pool):
+    """청크 레코드가 없으면 올릴 로컬 데이터가 없으므로 빈 목록이다.
+
+    원격 전체 읽기(read_ciphertext 폴백)로 데이터를 당겨오지 않는다.
+    """
     sp, store, src = pool
     engine = EncryptionEngine(_KEY)
     plain = os.urandom(300)
-    phys = "b" * 32 + "_legacy.bin"
+    phys = "b" * 32 + "_nochunks.bin"
     src.write(phys, engine.encrypt(plain))
-    store.insert("/legacy.bin", "local-1", phys, len(plain), 1.0, 1.0,
+    store.insert("/nochunks.bin", "local-1", phys, len(plain), 1.0, 1.0,
                  device_id="dev-A")
 
     mgr = _manager(sp, chunk_size=128)
-    chunks = mgr._chunks_to_replicate("/legacy.bin")
+    assert mgr._chunks_to_replicate("/nochunks.bin") == []
 
-    # 암호문(300+38=338)이 128 단위로 나뉘어 3조각
-    assert [idx for idx, _d in chunks] == [0, 1, 2]
-    assert b"".join(d for _i, d in chunks) == sp.read_ciphertext("/legacy.bin")
+
+def test_read_chunks_local_only_skips_remote_chunks(pool):
+    """local_only=True면 다른 device가 보관한 청크는 읽지 않는다.
+
+    데이터를 갖지 않은 기기가 원본을 릴레이로 당겨오는 왕복을 막는 경로다.
+    """
+    sp, store, _src = pool
+    sp.write_file("/f.bin", os.urandom(SMALL_CHUNK * 3))
+    manifest = store.get_chunks("/f.bin")
+    assert len(manifest) == 3
+    # 가운데 청크만 다른 기기 보관으로 바꾼다
+    moved = [
+        ChunkRef(index=c.index, chunk_ref=c.chunk_ref, source_id=c.source_id,
+                 device_id=("dev-B" if c.index == 1 else None),
+                 size=c.size, hash=c.hash)
+        for c in manifest
+    ]
+    store.put_chunks("/f.bin", moved)
+
+    local = sp.read_chunks("/f.bin", local_only=True)
+    assert [idx for idx, _d in local] == [0, 2]
+    # local_only=False면 전부(원격 포함) 대상이다
+    assert len(store.get_chunks("/f.bin")) == 3
 
 
 def test_at_rest_chunks_differ_from_naive_resplit(pool):
@@ -201,3 +227,53 @@ def test_recover_legacy_blob_path(pool):
 
     assert sp.read_file("/restored.bin") == plain
     assert store.lookup("/restored.bin").file_size == len(plain)
+
+
+# ------------------------------------------------------------------
+# 백업 대상 선정: 로컬 청크 보유 기준 (소유는 사용자, device는 보관 위치)
+# ------------------------------------------------------------------
+
+def test_list_paths_with_local_chunks_selects_by_storage(pool):
+    """청크를 실제로 들고 있는 device만 그 파일을 백업 대상으로 삼는다."""
+    sp, store, _src = pool
+    sp.write_file("/mine.bin", os.urandom(SMALL_CHUNK))
+    sp.write_file("/theirs.bin", os.urandom(SMALL_CHUNK))
+    # /theirs.bin의 청크를 전부 다른 기기 보관으로 바꾼다
+    store.put_chunks("/theirs.bin", [
+        ChunkRef(index=c.index, chunk_ref=c.chunk_ref, source_id=c.source_id,
+                 device_id="dev-B", size=c.size, hash=c.hash)
+        for c in store.get_chunks("/theirs.bin")
+    ])
+
+    paths = store.list_paths_with_local_chunks(("none", "pending"), "dev-A")
+    assert "/mine.bin" in paths
+    assert "/theirs.bin" not in paths
+
+    # 그 기기에서 보면 반대다
+    other = store.list_paths_with_local_chunks(("none", "pending"), "dev-B")
+    assert other == ["/theirs.bin"]
+
+
+def test_list_paths_with_local_chunks_excludes_chunkless(pool):
+    """청크 레코드가 없는 파일은 올릴 물리 데이터가 없으므로 제외한다."""
+    sp, store, src = pool
+    engine = EncryptionEngine(_KEY)
+    phys = "c" * 32 + "_none.bin"
+    src.write(phys, engine.encrypt(b"payload"))
+    store.insert("/nochunk.bin", "local-1", phys, 7, 1.0, 1.0,
+                 device_id="dev-A")
+
+    paths = store.list_paths_with_local_chunks(("none", "pending"), "dev-A")
+    assert "/nochunk.bin" not in paths
+
+
+def test_list_paths_with_local_chunks_filters_status(pool):
+    """복제 상태 필터가 적용된다."""
+    sp, store, _src = pool
+    sp.write_file("/f.bin", os.urandom(SMALL_CHUNK))
+    store.set_replication_status("/f.bin", "replicated")
+
+    assert store.list_paths_with_local_chunks(("none",), "dev-A") == []
+    assert store.list_paths_with_local_chunks(
+        ("replicated",), "dev-A"
+    ) == ["/f.bin"]

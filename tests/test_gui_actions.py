@@ -239,3 +239,127 @@ def test_daemon_running_at_startup_does_not_reopen():
     StardustApp._on_daemon(stub, True, {"running": True, "pid": 7})
     assert stub.reopened == 0
     assert stub.ensured == 0
+
+
+# --- 수동 백업: 타 device 청크는 위임(데이터 왕복 없음) ---
+
+class _StubChunk:
+    def __init__(self, index: int, device_id: str | None) -> None:
+        self.index = index
+        self.device_id = device_id
+
+
+class _StubRemote:
+    def __init__(self, reachable: bool = True) -> None:
+        self.reachable = reachable
+        self.announced: list[str] = []
+
+    def announce_backup(self, virtual_path: str) -> bool:
+        self.announced.append(virtual_path)
+        return self.reachable
+
+
+class _StubSession:
+    def __init__(self, chunks: list, remotes: dict) -> None:
+        self.metadata = self
+        self._chunks = chunks
+        self.storage_pool = self
+        self.device_id = "self-dev"
+        self._remote_devices = remotes
+
+    def get_chunks(self, virtual_path: str) -> list:
+        return self._chunks
+
+
+def test_remote_chunk_devices_excludes_local():
+    """로컬 보관 청크(device_id 없음/자기 기기)는 위임 대상이 아니다."""
+    session = _StubSession(
+        [_StubChunk(0, None), _StubChunk(1, "self-dev"),
+         _StubChunk(2, "dev-B"), _StubChunk(3, "dev-B")],
+        {},
+    )
+    assert actions._remote_chunk_devices(session, "/f") == {"dev-B"}
+
+
+def test_delegate_backup_calls_each_remote_once():
+    """보관 기기마다 1회씩 위임한다(청크 수만큼 반복하지 않는다)."""
+    remote_b, remote_c = _StubRemote(), _StubRemote()
+    session = _StubSession([], {"dev-B": remote_b, "dev-C": remote_c})
+
+    failed = actions._delegate_backup(session, "/f", {"dev-B", "dev-C"})
+    assert failed == []
+    assert remote_b.announced == ["/f"]
+    assert remote_c.announced == ["/f"]
+
+
+def test_delegate_backup_reports_unreachable():
+    """도달 불가·미마운트 기기는 실패로 보고한다(로컬 전송 강행 없음)."""
+    session = _StubSession([], {"dev-B": _StubRemote(reachable=False)})
+
+    failed = actions._delegate_backup(session, "/f", {"dev-B", "dev-missing"})
+    assert sorted(failed) == ["dev-B", "dev-missing"]
+
+
+# --- 복제 진행 표시 (GUI 상태바) ---
+
+class _ProgressStub:
+    """StardustApp._show_progress만 떼어 검증하기 위한 최소 스텁."""
+
+    def __init__(self) -> None:
+        self.t = {
+            "ready": "준비됨",
+            "backup_progress": "백업 중: {name} {done}/{total} 청크",
+            "backup_progress_reading": "읽는 중: {name} {done}/{total}",
+        }
+        self._showing_progress = False
+        self.status_text = "이전 상태"
+
+    def _set_status(self, text: str) -> None:
+        self.status_text = text
+
+
+def test_progress_shown_in_status_bar():
+    from stardustlib.gui.app import StardustApp
+
+    stub = _ProgressStub()
+    StardustApp._show_progress(stub, True, {
+        "active": True, "path": "/movies/big.mp4", "stage": "storing",
+        "done": 42, "total": 188,
+    })
+    assert stub.status_text == "백업 중: big.mp4 42/188 청크"
+    assert stub._showing_progress is True
+
+
+def test_progress_reading_stage_has_own_message():
+    from stardustlib.gui.app import StardustApp
+
+    stub = _ProgressStub()
+    StardustApp._show_progress(stub, True, {
+        "active": True, "path": "/a/b.bin", "stage": "reading",
+        "done": 3, "total": 20,
+    })
+    assert stub.status_text == "읽는 중: b.bin 3/20"
+
+
+def test_progress_cleared_when_finished():
+    """진행이 끝나면 상태바를 기본 문구로 되돌린다."""
+    from stardustlib.gui.app import StardustApp
+
+    stub = _ProgressStub()
+    StardustApp._show_progress(stub, True, {
+        "active": True, "path": "/f", "stage": "storing",
+        "done": 1, "total": 2,
+    })
+    StardustApp._show_progress(stub, True, {"active": False})
+    assert stub.status_text == "준비됨"
+    assert stub._showing_progress is False
+
+
+def test_progress_poll_failure_keeps_status():
+    """데몬 미실행·조회 실패면 기존 상태바를 건드리지 않는다."""
+    from stardustlib.gui.app import StardustApp
+
+    stub = _ProgressStub()
+    StardustApp._show_progress(stub, False, None)
+    StardustApp._show_progress(stub, True, None)
+    assert stub.status_text == "이전 상태"

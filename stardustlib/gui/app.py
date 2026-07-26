@@ -54,6 +54,8 @@ class StardustApp:
         # 직전 폴링에서 본 daemon 생존 여부. 정지→실행 전이를 감지해 조회 세션을
         # 다시 연다(daemon이 FAT 이미지를 만들기 전에 열린 세션은 소스가 비활성이다).
         self._daemon_was_running: bool | None = None
+        # 상태바에 복제 진행을 표시 중인지(끝나면 기본 문구로 되돌리기 위함).
+        self._showing_progress = False
         self._last_meta_mtime = 0.0
         self.lang = i18n.detect_lang()
         self.t = i18n.get_text(self.lang)
@@ -405,7 +407,8 @@ class StardustApp:
         """daemon이 메타데이터를 갱신(동기화 등)하면 목록을 자동 새로고침한다.
 
         목록만 가볍게 갱신(counts=False)해 삭제/추가가 수동 새로고침 없이 반영된다.
-        백업 수(온라인 조회)는 수동 새로고침에서만 갱신한다.
+        백업 수(온라인 조회)는 수동 새로고침에서만 갱신한다. 같은 주기로 복제 진행
+        상태도 읽어 상태바에 표시한다(대용량 백업이 멈춘 것처럼 보이지 않게).
         """
         try:
             if self.config_path and self._logged_in():
@@ -413,9 +416,36 @@ class StardustApp:
                 if m > self._last_meta_mtime:
                     self._last_meta_mtime = m
                     self.refresh(counts=False)
+                cfg = self.config_path
+                self.worker.submit(
+                    lambda: actions.replication_progress(cfg),
+                    self._show_progress,
+                )
         except Exception:  # noqa: BLE001 — 폴링 실패는 무시
             pass
         self.root.after(3000, self._poll_meta)
+
+    def _show_progress(self, ok, payload) -> None:
+        """복제 진행 상태를 상태바에 표시한다(없으면 기존 표시 유지).
+
+        daemon 미실행·조회 실패(payload=None)면 아무것도 하지 않는다.
+        """
+        if not ok or not payload or not payload.get("active"):
+            # 진행이 끝났으면 상태바를 기본 문구로 되돌린다.
+            if self._showing_progress:
+                self._showing_progress = False
+                self._set_status(self.t["ready"])
+            return
+        name = payload.get("path", "").rsplit("/", 1)[-1]
+        key = (
+            "backup_progress_reading"
+            if payload.get("stage") == "reading" else "backup_progress"
+        )
+        self._showing_progress = True
+        self._set_status(self.t[key].format(
+            name=name, done=payload.get("done", 0),
+            total=payload.get("total", 0),
+        ))
 
     def _submit(self, fn, on_ok=None, busy: str | None = None) -> None:
         if not self.config_path:
@@ -833,7 +863,19 @@ class StardustApp:
     def _show_backup_result(self, results: list) -> None:
         ok = sum(1 for r in results if r.get("status") == "replicated")
         pending = sum(1 for r in results if r.get("status") != "replicated")
-        self._set_status(self.t["backup_done"].format(ok=ok, pending=pending))
+        text = self.t["backup_done"].format(ok=ok, pending=pending)
+        # 다른 기기가 보관한 청크는 그 기기에 위임했다(데이터 왕복 없음).
+        delegated = sum(r.get("delegated", 0) for r in results)
+        if delegated:
+            text += self.t["backup_delegated"].format(count=delegated)
+        unreachable = sorted({
+            d for r in results for d in r.get("unreachable", [])
+        })
+        if unreachable:
+            text += self.t["backup_delegate_offline"].format(
+                devices=", ".join(d[:8] for d in unreachable)
+            )
+        self._set_status(text)
         self.refresh()  # 상태 컬럼·요약 갱신
 
     def _restore_selected(self) -> None:

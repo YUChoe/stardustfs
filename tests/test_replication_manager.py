@@ -29,10 +29,38 @@ class _FakeAuth:
 class _FakeStoragePool:
     """실제 스토리지 풀처럼 at-rest 암호문을 보관하는 대역(암호화 엔진은 실제 구현)."""
 
-    def __init__(self, key: bytes) -> None:
+    def __init__(self, key: bytes, chunk_size: int = 64) -> None:
         self.encryption_engine = EncryptionEngine(key)
         # 실제 구현과 동일하게 암호문을 저장한다(평문 저장이 아님).
         self._files: dict[str, bytes] = {}
+        self.chunk_size = chunk_size
+        self.device_id: str | None = None
+        # chunk_index → 보관 device_id. 미지정이면 로컬 보관으로 본다.
+        self.chunk_devices: dict[int, str] = {}
+        # read_chunks가 실제로 읽은 청크 index(원격 읽기 없음 검증용).
+        self.read_indices: list[int] = []
+
+    def read_chunks(
+        self, virtual_path: str, local_only: bool = False, on_progress=None
+    ) -> list:
+        """at-rest 암호문을 청크 경계로 잘라 (idx, bytes)로 돌려준다.
+
+        local_only=True면 이 device 보관 청크만 반환한다(실제 StoragePool과 동일).
+        on_progress(done, total)는 청크마다 호출한다.
+        """
+        from stardustlib import chunker
+
+        parts = chunker.split(self._files[virtual_path], self.chunk_size)
+        if local_only and self.device_id:
+            parts = [
+                (i, d) for i, d in parts
+                if self.chunk_devices.get(i, self.device_id) == self.device_id
+            ]
+        self.read_indices.extend(i for i, _d in parts)
+        if on_progress is not None:
+            for done in range(1, len(parts) + 1):
+                on_progress(done, len(parts))
+        return parts
 
     def put(self, virtual_path: str, data: bytes) -> None:
         self._files[virtual_path] = self.encryption_engine.encrypt(data)
@@ -53,15 +81,22 @@ class _FakeStoragePool:
 
 
 class _FakeMeta:
-    def __init__(self, present: set[str]) -> None:
+    def __init__(
+        self, present: set[str], chunks: dict[str, list] | None = None
+    ) -> None:
         self._present = present
         self.status: dict[str, str] = {}
+        # virtual_path → [ChunkRef 유사 객체]. 청크 보관 device 판정용.
+        self._chunks = chunks or {}
 
     def lookup(self, virtual_path: str):
         return object() if virtual_path in self._present else None
 
     def set_replication_status(self, virtual_path: str, status: str) -> None:
         self.status[virtual_path] = status
+
+    def get_chunks(self, virtual_path: str) -> list:
+        return list(self._chunks.get(virtual_path, []))
 
 
 class _Cloud:
@@ -892,3 +927,337 @@ def test_replicate_needs_no_encryption_engine(key):
     finally:
         mgr.close()
     assert result.status == "replicated"
+
+
+# --- 원본 보관 device는 홀더 후보에서 제외 (Property 2) ---
+
+def _chunk_refs(count: int, device_id: str | None) -> list:
+    """ChunkRef 목록을 만든다(보관 device 지정)."""
+    from stardustlib.models import ChunkRef
+
+    return [
+        ChunkRef(index=i, chunk_ref=f"ref{i}", source_id="s1",
+                 device_id=device_id, size=64)
+        for i in range(count)
+    ]
+
+
+def test_origin_device_excluded_from_placement(key):
+    """청크 원본을 보관한 device는 그 청크의 홀더 후보에서 빠진다."""
+    storage_pool = _FakeStoragePool(key)
+    content = b"o" * 200
+    storage_pool.put("/f", content)
+    # 청크 원본이 h1에 있다고 알린다(스필오버 등)
+    meta = _FakeMeta({"/f"}, {"/f": _chunk_refs(10, "h1")})
+    mgr, cloud = _manager(storage_pool, meta, ["h1", "h2", "h3", "h4"])
+    seen_excludes: list[list[str]] = []
+    inner = mgr._placement
+
+    async def spy(token, size, exclude):
+        seen_excludes.append(list(exclude))
+        return await inner(token, size, exclude)
+
+    mgr._placement = spy
+    try:
+        mgr.replicate("/f")
+    finally:
+        mgr.close()
+
+    assert seen_excludes
+    assert all("h1" in e for e in seen_excludes)
+    # h1에는 사본을 만들지 않는다
+    assert "h1" not in cloud.holder_store
+
+
+def test_local_chunks_exclude_self_device(key):
+    """청크 device_id가 NULL(로컬)이면 자기 device를 원본으로 보고 제외한다."""
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", b"l" * 200)
+    storage_pool.device_id = "self-dev"
+    meta = _FakeMeta({"/f"}, {"/f": _chunk_refs(10, None)})
+    mgr, _cloud = _manager(storage_pool, meta, ["self-dev", "h2", "h3", "h4"])
+    seen: list[list[str]] = []
+    inner = mgr._placement
+
+    async def spy(token, size, exclude):
+        seen.append(list(exclude))
+        return await inner(token, size, exclude)
+
+    mgr._placement = spy
+    try:
+        mgr.replicate("/f")
+    finally:
+        mgr.close()
+
+    assert seen and all("self-dev" in e for e in seen)
+
+
+def test_no_holder_after_exclusion_is_pending_with_reason(key, caplog):
+    """제외 후 후보가 없으면 pending이고 사유를 경고로 남긴다(조용한 성공 금지)."""
+    import logging
+
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", b"n" * 200)
+    # 홀더가 h1 하나뿐인데 그 h1이 원본 보관처 → 후보 없음
+    meta = _FakeMeta({"/f"}, {"/f": _chunk_refs(10, "h1")})
+    mgr, cloud = _manager(storage_pool, meta, ["h1"])
+    with caplog.at_level(logging.WARNING,
+                         logger="stardustlib.replication_manager"):
+        try:
+            result = mgr.replicate("/f")
+        finally:
+            mgr.close()
+
+    assert result.status == "pending"
+    assert result.no_holder_chunks == result.chunk_count
+    assert not cloud.holder_store  # 어디에도 저장하지 않았다
+    assert any("배치 후보가 없는 청크" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_heal_excludes_origin_device(key):
+    """재복제에서도 원본 보관 device를 후보에서 뺀다."""
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", b"h" * 200)
+    meta = _FakeMeta({"/f"}, {"/f": _chunk_refs(10, "h1")})
+    mgr, cloud = _manager(storage_pool, meta, ["h2", "h3", "h4"])
+    try:
+        mgr.replicate("/f")
+        cloud.holders.append("h1")   # h1이 후보 목록에 들어와도
+        cloud.offline.update({"h2"})  # degraded 유발
+        seen: list[list[str]] = []
+        inner = mgr._placement
+
+        async def spy(token, size, exclude):
+            seen.append(list(exclude))
+            return await inner(token, size, exclude)
+
+        mgr._placement = spy
+        mgr.ensure_replicas("/f")
+    finally:
+        mgr.close()
+
+    assert seen and all("h1" in e for e in seen)
+
+
+def test_no_chunk_records_keeps_previous_behaviour(key):
+    """청크 레코드가 없으면(원본 위치 미상) 기존 배치 동작 그대로."""
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", b"p" * 200)
+    meta = _FakeMeta({"/f"})  # get_chunks → 빈 목록
+    mgr, _cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
+    try:
+        result = mgr.replicate("/f")
+    finally:
+        mgr.close()
+
+    assert result.status == "replicated"
+    assert result.no_holder_chunks == 0
+
+
+# --- 청크 단위 분담: 로컬 청크만 올리고 상태는 레지스트리로 판정 ---
+
+def test_replicate_skipped_when_no_local_chunks(key):
+    """청크가 전부 다른 device 보관이면 올리지 않고 skipped로 끝낸다."""
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", b"r" * 200)
+    storage_pool.device_id = "self-dev"
+    # 모든 청크를 원격 보관으로 지정
+    storage_pool.chunk_devices = {i: "other-dev" for i in range(10)}
+    meta = _FakeMeta({"/f"}, {"/f": _chunk_refs(10, "other-dev")})
+    mgr, cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
+    try:
+        result = mgr.replicate("/f")
+    finally:
+        mgr.close()
+
+    assert result.status == "skipped"
+    assert result.chunk_count == 0
+    assert not cloud.holder_store        # 아무것도 전송하지 않았다
+    assert "/f" not in meta.status       # 복제 상태를 바꾸지 않는다
+
+
+def test_replicate_uploads_only_local_chunks(key):
+    """청크가 두 device에 나뉘면 자기 몫만 올린다(원격 읽기 없음)."""
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", b"s" * 400)
+    storage_pool.device_id = "self-dev"
+    from stardustlib import chunker
+    from stardustlib.models import ChunkRef
+
+    # 짝수 index만 로컬, 홀수는 다른 기기 보관
+    all_parts = chunker.split(storage_pool.read_ciphertext("/f"), 64)
+    remote = {i: "other-dev" for i, _d in all_parts if i % 2}
+    storage_pool.chunk_devices = remote
+    refs = [
+        ChunkRef(index=i, chunk_ref=f"r{i}", source_id="s1",
+                 device_id=remote.get(i), size=64)
+        for i, _d in all_parts
+    ]
+    meta = _FakeMeta({"/f"}, {"/f": refs})
+    mgr, _cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
+    try:
+        mgr.replicate("/f")
+    finally:
+        mgr.close()
+
+    assert storage_pool.read_indices  # 로컬 청크만 읽었다
+    assert all(i % 2 == 0 for i in storage_pool.read_indices)
+
+
+def test_warns_once_when_self_device_unknown(key, caplog):
+    """자기 device_id를 모르면 1회 경고한다(배치에서 자기 기기 제외 불가)."""
+    import logging
+
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", b"w" * 200)
+    # device_id 미설정(단발 세션이 자기 device를 특정하지 못한 상황)
+    meta = _FakeMeta({"/f"})
+    mgr, _cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
+    with caplog.at_level(logging.WARNING,
+                         logger="stardustlib.replication_manager"):
+        try:
+            mgr.replicate("/f")
+            mgr.replicate("/f")  # 두 번째 호출에서 중복 경고 없음
+        finally:
+            mgr.close()
+
+    warnings = [
+        r for r in caplog.records if "자기 device_id" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+
+
+# --- 읽기 단계 진행 로그 / 지연 홀더 로그 ---
+
+def test_read_stage_logs_progress_for_large_file(key, caplog):
+    """읽기 구간도 진행 로그를 남긴다(전송 전 공백 방지)."""
+    import logging
+
+    from stardustlib import replication_manager as rm
+
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/big", b"R" * (64 * rm.PROGRESS_MIN_CHUNKS * 2))
+    meta = _FakeMeta({"/big"})
+    mgr, _cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
+    with caplog.at_level(logging.INFO, logger="stardustlib.replication_manager"):
+        try:
+            mgr.replicate("/big")
+        finally:
+            mgr.close()
+
+    assert [r for r in caplog.records if "복제 읽기" in r.getMessage()]
+
+
+def test_read_stage_quiet_for_small_file(key, caplog):
+    """청크가 적으면 읽기 진행 로그를 남기지 않는다."""
+    import logging
+
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/small", b"r" * 100)
+    meta = _FakeMeta({"/small"})
+    mgr, _cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
+    with caplog.at_level(logging.INFO, logger="stardustlib.replication_manager"):
+        try:
+            mgr.replicate("/small")
+        finally:
+            mgr.close()
+
+    assert not [r for r in caplog.records if "복제 읽기" in r.getMessage()]
+
+
+@pytest.mark.asyncio
+async def test_slow_holder_is_logged(key, caplog, monkeypatch):
+    """직접+릴레이 타임아웃을 소진한 홀더를 지연으로 남긴다."""
+    import logging
+
+    from stardustlib import replication_manager as rm
+
+    mgr = _bare_manager(key)
+    monkeypatch.setattr(rm, "SLOW_HOLDER_SECONDS", 0.0)  # 항상 지연으로 판정
+
+    async def boom(*a, **k):
+        raise httpx.ConnectError("unreachable")
+
+    async def slow_relay(device_id, op, payload):
+        raise OSError("Relay timeout: target device did not respond")
+
+    mgr._client.post = boom
+    mgr._relay_op = slow_relay
+    with caplog.at_level(logging.WARNING,
+                         logger="stardustlib.replication_manager"):
+        ok = await mgr._holder_store("devS", "1.2.3.4:9090", "c1", b"x", "tok")
+
+    assert ok is False
+    assert any("홀더 전송 지연" in r.getMessage() for r in caplog.records)
+
+
+def test_progress_tracked_and_cleared(key):
+    """복제 중 진행이 갱신되고 끝나면 비활성으로 정리된다(Property 4)."""
+    from stardustlib.replication_progress import ProgressTracker
+
+    tracker = ProgressTracker()
+    seen: list[tuple[str, int, int]] = []
+    real_advance = tracker.advance
+
+    def spy(done, secured=None):
+        real_advance(done, secured)
+        snap = tracker.snapshot()
+        if snap:
+            seen.append((snap.stage, snap.done, snap.total))
+
+    tracker.advance = spy
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", b"g" * 300)
+    meta = _FakeMeta({"/f"})
+    mgr = ReplicationManager(
+        _FakeAuth(), "http://server", meta, storage_pool,
+        chunk_size=64, min_replicas=3, progress=tracker,
+    )
+    _Cloud(["h1", "h2", "h3"]).attach(mgr)
+    try:
+        mgr.replicate("/f")
+    finally:
+        mgr.close()
+
+    assert seen  # 진행이 갱신됐다
+    assert any(stage == "storing" for stage, _d, _t in seen)
+    assert tracker.snapshot() is None  # 종료 후 정리
+
+
+def test_progress_cleared_on_failure(key):
+    """복제가 예외로 끝나도 진행 표시가 남지 않는다."""
+    from stardustlib.replication_progress import ProgressTracker
+
+    tracker = ProgressTracker()
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", b"x" * 100)
+    meta = _FakeMeta({"/f"})
+    mgr = ReplicationManager(
+        _FakeAuth(), "http://server", meta, storage_pool,
+        chunk_size=64, min_replicas=1, progress=tracker,
+    )
+
+    def boom(*_a, **_k):
+        raise OSError("read failed")
+
+    storage_pool.read_chunks = boom
+    try:
+        with pytest.raises(OSError):
+            mgr.replicate("/f")
+    finally:
+        mgr.close()
+
+    assert tracker.snapshot() is None
+
+
+def test_progress_optional(key):
+    """추적기를 주입하지 않아도 복제는 그대로 동작한다."""
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", b"n" * 200)
+    meta = _FakeMeta({"/f"})
+    mgr, _cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
+    try:
+        assert mgr.replicate("/f").status == "replicated"
+    finally:
+        mgr.close()

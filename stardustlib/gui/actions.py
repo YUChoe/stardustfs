@@ -696,10 +696,39 @@ def replica_counts(config_path: str, vpath: str, names: list[str]) -> dict:
         return {}
 
 
+def _remote_chunk_devices(session, virtual_path: str) -> set[str]:
+    """이 파일의 청크를 보관한 다른 device 집합(로컬 보관은 제외)."""
+    self_dev = getattr(session.storage_pool, "device_id", None)
+    devices = set()
+    for chunk in session.metadata.get_chunks(virtual_path):
+        if chunk.device_id and chunk.device_id != self_dev:
+            devices.add(chunk.device_id)
+    return devices
+
+
+def _delegate_backup(session, virtual_path: str, devices: set[str]) -> list[str]:
+    """청크를 보관한 다른 device들에 백업을 위임한다. 실패한 device 목록 반환.
+
+    데이터를 갖지 않은 기기가 원본을 릴레이로 당겨와 올리는 왕복 대신, 보관 기기가
+    자기 몫을 직접 올리게 한다.
+    """
+    failed = []
+    remotes = getattr(session.storage_pool, "_remote_devices", {})
+    for device_id in sorted(devices):
+        remote = remotes.get(device_id)
+        if remote is None or not remote.announce_backup(virtual_path):
+            failed.append(device_id)
+    return failed
+
+
 def backup_paths(config_path: str, vpaths: list[str]) -> list[dict]:
     """선택한 파일들을 지금 즉시 복제(백업)한다(온라인 세션 1회).
 
-    {path, status(replicated|pending), error?} 목록을 반환한다.
+    이 device가 보관한 청크만 직접 올리고, 다른 device가 보관한 청크는 그 기기에
+    위임한다(릴레이로 원본을 당겨오지 않는다).
+
+    {path, status(replicated|pending|skipped|error), delegated?, unreachable?,
+    error?} 목록을 반환한다.
     """
     norm = [_vpath(p) for p in vpaths]
 
@@ -709,8 +738,17 @@ def backup_paths(config_path: str, vpaths: list[str]) -> list[dict]:
         try:
             for vp in norm:
                 try:
+                    remote_devices = _remote_chunk_devices(s, vp)
                     result = await asyncio.to_thread(mgr.replicate, vp)
-                    out.append({"path": vp, "status": result.status})
+                    entry = {"path": vp, "status": result.status}
+                    if remote_devices:
+                        failed = await asyncio.to_thread(
+                            _delegate_backup, s, vp, remote_devices
+                        )
+                        entry["delegated"] = len(remote_devices) - len(failed)
+                        if failed:
+                            entry["unreachable"] = failed
+                    out.append(entry)
                 except Exception as e:  # noqa: BLE001 — 파일 단위 격리
                     out.append({"path": vp, "status": "error", "error": str(e)})
         finally:
@@ -794,6 +832,21 @@ def announce_paths(config_path: str, vpaths: list[str]) -> dict:
     if count is None:
         return {"announced": 0, "daemon": False}
     return {"announced": count, "daemon": True}
+
+
+def replication_progress(config_path: str) -> dict | None:
+    """데몬의 복제 진행 상태를 조회한다(GUI 폴링).
+
+    {"active": bool, "path", "stage", "done", "total", "secured", "elapsed"}
+    또는 데몬 미실행·조회 실패 시 None(호출자는 진행 표시를 생략한다).
+    """
+    from stardustlib import daemon_control
+
+    config = ConfigLoader(config_path).load()
+    db = config.get("metadata_db")
+    if not db:
+        return None
+    return daemon_control.progress_via_daemon(db)
 
 
 def _delegate(config_path: str, op: str, virtual_path: str, local_path: str):

@@ -774,6 +774,33 @@ class MetadataStore:
         rows = conn.execute(sql, tuple(params)).fetchall()
         return [row["virtual_path"] for row in rows]
 
+    def list_paths_with_local_chunks(
+        self, statuses: tuple[str, ...], device_id: str
+    ) -> list[str]:
+        """이 device에 청크가 하나라도 있는 파일 경로를 반환한다(자동 백업용).
+
+        소유는 사용자 단위이고 device는 보관 위치이므로, 백업 대상은 파일 레코드를
+        관리하는 기기(`files.device_id`)가 아니라 물리 청크를 실제로 들고 있는
+        기기가 정한다. 그래야 데이터가 없는 기기가 원본을 릴레이로 당겨오는 왕복이
+        생기지 않는다.
+
+        `file_chunks.device_id`가 NULL이면 로컬 보관이므로 포함한다. 청크 레코드가
+        없는 파일은 제외한다 — 올릴 물리 데이터가 이 기기에 없다.
+        """
+        if not statuses:
+            return []
+        conn = self._get_conn()
+        placeholders = ",".join("?" for _ in statuses)
+        rows = conn.execute(
+            "SELECT DISTINCT f.virtual_path FROM files f "
+            "JOIN file_chunks c ON c.virtual_path = f.virtual_path "
+            "WHERE f.deleted = 0 "
+            f"AND COALESCE(f.replication_status, 'none') IN ({placeholders}) "
+            "AND (c.device_id = ? OR c.device_id IS NULL)",
+            (*statuses, device_id),
+        ).fetchall()
+        return [row["virtual_path"] for row in rows]
+
     def get_pending_files(self) -> list[FileMetadata]:
         """sync_status가 "pending"인 모든 파일 목록을 반환한다.
 
