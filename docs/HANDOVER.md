@@ -6,9 +6,10 @@
 ## 1. 프로젝트 개요
 
 StardustFS는 분산 암호화 파일시스템이다. 사용자는 여러 디바이스(PC)에서 같은 계정으로
-WebDAV를 통해 단일 파일시스템에 접근한다. 파일은 클라이언트에서 AES-256-GCM으로
-암호화되어 로컬 스토리지에 저장되고, 메타데이터는 중앙 서버를 통해 디바이스 간
-동기화된다. 디바이스 간 파일 전송은 직접 TCP → 홀펀칭 UDP → 서버 릴레이의
+CLI와 GUI 파일탐색기를 통해 단일 가상 파일공간에 접근한다(WebDAV 실시간 마운트는
+MVP10에서 폐기했다). 파일은 클라이언트에서 4 MiB 암호문 청크로 나뉘어 청크별로
+AES-256-GCM 암호화되어 로컬 스토리지에 저장되고, 메타데이터는 중앙 서버를 통해
+디바이스 간 동기화된다. 디바이스 간 파일 전송은 직접 TCP → 홀펀칭 UDP → 서버 릴레이의
 캐스케이드로 이뤄진다(상세 [TRANSPORT.md](./TRANSPORT.md)).
 
 핵심 보안 원칙: zero-knowledge. 서버는 파일 내용과 메타데이터 내용을 보지 못한다.
@@ -17,7 +18,7 @@ WebDAV를 통해 단일 파일시스템에 접근한다. 파일은 클라이언�
 ## 2. 저장소 구조 (두 개의 별도 git 저장소)
 
 - 클라이언트: `c:\Users\yonguk.choe\src\stardustfs`
-  - `stardustfs.py`: 엔트리포인트(초기화 순서, WebDAV 서버 시작)
+  - `stardustfs.py`: 엔트리포인트(초기화 순서, daemon/CLI/GUI 서브커맨드)
   - `stardustlib/`: 핵심 라이브러리
   - `tests/`: pytest 테스트
   - `.kiro/specs/`: 기능별 스펙(requirements/design/tasks)
@@ -27,19 +28,31 @@ WebDAV를 통해 단일 파일시스템에 접근한다. 파일은 클라이언�
   - `tests/`: pytest 테스트
   - `data/DATABASE_SCHEMA.md`: DB 스키마 (반드시 최신 유지, 추측 금지)
 
-두 저장소 모두 현재 브랜치는 `dev-mvp5-share-demo`이다.
+두 저장소 모두 현재 브랜치는 `mvp13-partial-metadata-sync`이다.
 
 ## 3. 핵심 컴포넌트 (클라이언트 stardustlib/)
 
 - `storage_pool.py`: 스토리지 풀 통합. 파일 읽기/쓰기 라우팅의 중심.
-  - `read_file`: device_id로 로컬/원격 분기(`_read_local`/`_read_remote`)
-  - `write_file`: 로컬 소유는 덮어쓰기, 원격 소유는 `_takeover_write`(소유권 이전)
-  - `gc_orphan_files`/`gc_orphan_files_if_needed`: orphan 물리 파일 정리
+  - `write_file`: 평문을 4 MiB 청크로 나눠 청크별 암호화 → 청크마다 보관처 선택
+    (`_place_chunks`, 로컬 우선·부족하면 원격 스필오버) → 전부 성공 시 매니페스트 커밋
+  - `read_file`/`read_range`: 청크 매니페스트를 보고 청크의 device_id로 로컬/원격 분기해
+    결합. `read_range`는 범위를 덮는 청크만 가져온다
+  - `read_chunks`/`write_chunks`: at-rest 청크를 그대로 주고받는 복제용 경로
+  - `migrate_to_chunks`: 레거시 통짜 blob을 청크 표현으로 무손실 전환
+  - 원격 소유 파일 수정은 `_takeover_write`(소유권 이전)
+  - `gc_orphan_files`/`gc_orphan_files_if_needed`: orphan 물리 파일 정리(청크 경로 포함)
   - `select_source`/용량 집계: `is_remote` 소스는 제외(로컬 전용)
+- `chunker.py`: 청크 split/join/hash + `chunk_range`(범위→인덱스),
+  `shard_prefix`(해시 앞 2hex 하위 디렉터리), `shard_depth_for`(소스 용량별 샤딩 깊이).
 - `metadata_store.py`: SQLite 메타데이터(SQLCipher 가능 시 암호화, 아니면 평문 폴백).
-  files 테이블에 `deleted`(tombstone), `device_id`, `version`, `sync_status` 컬럼.
+  files 테이블에 `deleted`(tombstone), `device_id`, `version`, `sync_status`, `chunked`
+  컬럼. `file_chunks` 테이블이 파일별 청크 배치(chunk_index/chunk_ref/source_id/
+  device_id/size/hash)를 보관하며 청크 파일의 위치 정본이다(files의 source_id/
+  physical_path는 첫 청크를 가리키는 레거시 호환 컬럼).
 - `storage_source.py`: `StorageSource` 추상 + `DirectorySource`/`LoopbackSource`.
-  - LoopbackSource는 실제 파일을 `<path>.d/` 동반 디렉토리에 `<hex32>_<name>` 형식으로 저장
+  - LoopbackSource는 `<path>`를 고정 크기 FAT 이미지(pyfatfs)로 포맷해 파일을 이미지
+    내부에 저장한다(동반 디렉터리 폐지). 청크는 `<hh>/<hex32>_cNNNN` 경로에 둔다
+  - `list_physical_files`는 샤드 하위 디렉터리까지 재귀 스캔한다(orphan GC용)
   - `is_remote` 속성: 로컬은 False, RemoteSource는 True
 - `remote_source.py`: 원격 디바이스 프록시. 직접 TCP → 홀펀칭 UDP → 릴레이 캐스케이드.
   - `is_online=False`면 비활성 마운트, `refresh()`로 재네고시에이션(30초 throttle)
@@ -162,16 +175,25 @@ E2E 테스트는 롱폴/릴레이 미배포 서버에서는 자동 skip된다(�
 
 ## 10. 다음 단계 (미완료)
 
-### B: 파셜/증분 메타데이터 전송 (사용자가 A 다음으로 요청)
-현재 메타데이터 동기화는 SQLite DB 파일 전체를 매번 암호화해 주고받는다(파일 500개면
-1건 변경에도 전체 전송). 변경된 레코드만 전송하도록 최적화 필요.
+### B: 파셜/증분 메타데이터 전송 — 완료 (mvp13)
+B-1(레코드 단위 암호화)으로 결정·구현했다. zero-knowledge를 유지하기 위해 B-2(서버가
+평문 메타데이터를 봄)는 채택하지 않았다.
 
-핵심 설계 갈림길(미결정):
-- B-1: 레코드 단위 암호화. 각 파일 레코드를 개별 암호화해 (경로 해시, version, 암호문)로
-  서버 저장. zero-knowledge 유지하나 서버 저장 구조를 레코드 단위로 재설계(큰 변경)
-- B-2: 서버가 평문 메타데이터를 봄. 증분 쉬우나 zero-knowledge 포기(권장하지 않음)
+- 서버가 `metadata_records`(user_id+record_id PK) + `metadata_version`(글로벌 카운터)로
+  레코드 단위 암호문을 보관한다. 클라이언트는 `since` 필터로 변경분만 받고
+  base_version CAS로 올린다.
+- record_id = HMAC-SHA256(HKDF(master_key), virtual_path) — 서버에 경로 비노출.
+- 레코드 평문은 256B 배수로 패딩해 암호문 크기로 경로 길이를 추정하지 못하게 한다.
+- 구버전 서버(레코드 미지원, 404)는 전체 blob 경로로 자동 폴백.
+- 청크 네이티브 저장 도입 후에는 파일 레코드 페이로드에 청크 매니페스트(`chunks`)가
+  함께 실린다. 동기화 단위는 여전히 파일이므로 record_id·CAS·롱폴 프로토콜은 불변이고
+  서버 변경도 없었다.
 
-→ B 진행 전 사용자에게 B-1/B-2 방향을 먼저 확인할 것.
+스펙: `.kiro/specs/partial-metadata-sync/`, `.kiro/specs/chunk-native-storage/`.
+
+수용한 트레이드오프: 레코드 방식은 전체 blob 대비 서버가 레코드 개수(파일 수 근사),
+개별 암호문 크기(256B 패딩으로 완화), record_id별 변경 패턴을 추가 관측한다. 경로 평문과
+파일 내용은 여전히 보이지 않는다.
 
 ### MVP3: 암호화 리플리케이션 — 엔진 구현 완료 (2026-06)
 스펙 `.kiro/specs/replication-parity/`. Phase 1~7 완료.
@@ -181,6 +203,12 @@ E2E 테스트는 롱폴/릴레이 미배포 서버에서는 자동 skip된다(�
   토큰 검증, 소유자=요청자 인가는 ParityStore가 집행, 호스트 비가독).
 - `replication_manager.py`: replicate/recover/ensure_replicas, CLI `backup`/`restore`/
   `heal`. file_ref/chunk_id는 가상경로 SHA-256(경로 비노출).
+- 청크 네이티브 저장 도입 후: 저장 단위가 이미 청크이므로 복제가 재분할·재암호화 없이
+  at-rest 청크를 그대로 쓴다(`_chunks_to_replicate`). recover는 받은 조각이 청크
+  표현이면 청크별로 복호화 검증 후 그대로 되돌려 기록하고(`write_chunks`), 레거시
+  blob이면 이어붙여 단일 블록으로 기록한다. 어느 경우든 at-rest 바이트가 복제 시점과
+  같아 등록된 청크 해시가 계속 유효하다. 그전에는 청크 암호문 연결을 다시 4 MiB로
+  나눠 복제하고 복구 때 단일 GCM blob으로 복호화하려 해 다중 청크 파일에서 실패했다.
 - UDP 홀펀칭(`holepunch.py` + 서버 `rendezvous.py` 옵트인). E2E `test_replication_e2e.py`.
 - 운영 활성화(스펙 `.kiro/specs/replication-activation/`, Phase A1~A3): daemon이
   `replication.enabled` 시 제공 용량 신고(`report_hosting`) + ParityStore(provided*0.5)
@@ -198,6 +226,12 @@ E2E 테스트는 롱폴/릴레이 미배포 서버에서는 자동 skip된다(�
 ### 알려진 한계
 - 이중 NAT에서 직접 P2P는 상위 NAT 포트포워딩 없으면 불가 → 릴레이로 우회(구현됨)
 - 릴레이/롱폴링은 단일 워커 가정. 수평 확장 시 외부 pub/sub(Redis 등) 필요
+- 청크 네이티브 저장은 단위·통합 테스트만 통과했고 실환경 스모크(기존 metadata DB의
+  v7 마이그레이션, 2대 기기 간 매니페스트 동기화·청크별 라우팅)는 아직 수행하지 않았다.
+- 청크가 여러 기기에 흩어지면 그 기기들이 모두 도달 가능해야 파일 전체를 읽을 수 있다
+  (백업 사본이 이를 완화한다).
+- 부분 쓰기는 미구현(파일 일부 수정도 전체 재기록). 원격 청크의 부분 읽기는 청크 단위로
+  전량을 받는다. 남은 레거시 blob의 일괄 전환 스케줄러도 미구현.
 
 ## 11. 스펙 위치
 

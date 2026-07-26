@@ -44,11 +44,23 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
 ## 클라이언트 핵심 컴포넌트 (stardustlib/)
 
 - `storage_pool.py`: 스토리지 풀 통합. 파일 읽기/쓰기 라우팅의 중심.
-  `read_file`은 metadata의 device_id로 로컬/원격을 분기한다(원격은 P2P/릴레이 fetch
-  후 로컬 복호화). `write_file`은 로컬 소유는 덮어쓰기, 원격 소유는 소유권 이전
-  (takeover) + orphan GC.
+  `write_file`은 평문을 4 MiB 청크로 나눠 청크별로 암호화하고 청크마다 보관처를 정한다
+  (로컬 우선, 부족하면 원격 스필오버). 모든 청크 기록이 성공한 뒤에만 매니페스트를
+  커밋하므로 반쯤 저장된 상태가 남지 않는다. `read_file`은 청크 매니페스트를 보고
+  청크별 device_id로 로컬/원격을 분기해(원격은 P2P/릴레이 fetch) 결합·복호화하며,
+  `read_range`는 범위를 덮는 청크만 가져온다. 원격 소유 파일 수정은 소유권 이전
+  (takeover) + orphan GC. 통짜 blob 레거시 파일은 기존 단일 경로로 계속 읽히고,
+  수정하거나 `migrate_to_chunks`로 고르면 청크 표현으로 무손실 전환된다.
+  스펙: `.kiro/specs/chunk-native-storage/`.
+- `chunker.py`: 청크 분할/결합/해시 + 청크 경로 헬퍼. `chunk_range`(범위를 덮는 인덱스),
+  `shard_prefix`(청크 암호문 해시 앞 2hex로 하위 디렉터리), `shard_depth_for`(소스
+  용량에 맞는 샤딩 깊이). 샤딩은 FAT 디렉터리 엔트리 폭증을 피하기 위한 것으로 실측
+  근거가 design.md에 있다.
 - `metadata_store.py`: SQLite 메타데이터(SQLCipher 가능 시 암호화, 아니면 평문 폴백).
-  WAL 모드. files 테이블에 device_id/version/sync_status/deleted(tombstone).
+  WAL 모드. files 테이블에 device_id/version/sync_status/deleted(tombstone)/chunked,
+  `file_chunks` 테이블에 파일별 청크 배치(chunk_index/chunk_ref/source_id/device_id/
+  size/hash). 청크 파일의 위치 정본은 file_chunks이고 files의 source_id/physical_path는
+  첫 청크를 가리키는 레거시 호환 컬럼이다.
 - `storage_source.py`: `DirectorySource`/`LoopbackSource`(로컬) + `is_remote` 속성.
   LoopbackSource는 `<path>`를 고정 크기 FAT 이미지(pyfatfs)로 포맷해 파일을 이미지
   내부에 저장한다(`mount -o loop` 유사, 동반 디렉토리 폐지). size로 용량이 실제
@@ -121,14 +133,18 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
 
 ### 업로드 (put)
 1. CLI가 로컬 파일을 읽는다.
-2. `write_file` → AES-256-GCM 암호화 → 소스 선택 후 저장 → 메타데이터 등록(pending).
-3. `upload_metadata`로 암호화된 메타데이터 blob을 서버에 업로드(CAS).
+2. `write_file` → 4 MiB 청크 분할 → 청크별 AES-256-GCM 암호화(청크마다 독립 IV·태그)
+   → 청크별 보관처 선택(로컬 우선, 부족하면 원격 스필오버) → 소스에 기록 → 모든 청크가
+   성공하면 청크 매니페스트 + 파일 레코드 커밋(pending).
+3. `upload_metadata`로 암호화된 메타데이터를 서버에 업로드(CAS). 파일 레코드 페이로드에
+   청크 매니페스트가 함께 실려 다른 기기로 전파된다.
 
 ### 다운로드 (get)
-1. `read_file`가 metadata의 device_id로 소유 device 판정.
-2. 로컬 소유면 로컬 소스에서 읽고, 원격 소유면 remote_source가 P2P(실패 시 릴레이)로
-   암호문을 fetch.
-3. 로컬 encryption_engine으로 복호화(같은 계정 = 같은 master_key) 후 로컬 파일 저장.
+1. `read_file`이 청크 매니페스트를 조회한다(없으면 레거시 통짜 blob 경로).
+2. 청크마다 그 청크의 device_id로 판정해 로컬 소스에서 읽거나 remote_source가
+   P2P(실패 시 릴레이)로 fetch한다. 받은 청크는 저장 시점 해시와 대조한다.
+3. 청크별로 복호화(같은 계정 = 같은 master_key)해 순서대로 결합한 뒤 로컬 파일 저장.
+   범위만 필요하면 `read_range`가 그 범위를 덮는 청크만 가져온다.
 
 ### 동기화
 - daemon이 version 롱폴로 변경을 즉시 감지해 다운로드·병합하고, 주기 폴링을
@@ -140,7 +156,8 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
 암호문을 보관해 주고, 그 대가로 자신의 암호문이 타인 기기에 보관된다. 호스트는
 키가 없어 보관 중인 청크를 복호화할 수 없다.
 
-- backup: 평문을 AES-256-GCM으로 자체 포함 암호문 blob으로 암호화 → 4MiB 청크 분할
+- backup: 저장된 at-rest 청크를 재분할·재암호화 없이 그대로 복제 청크로 쓴다(저장 단위가
+  이미 청크이므로 경계가 일치한다). 통짜 blob 레거시 파일만 예전처럼 4 MiB로 분할한다.
   → 청크 등록 + 서버 배치(placement: 용량·온라인·호혜 균형, 소유자 자신 device는 제외)
   → 각 청크를 홀더의 ParityStore에 push → 레지스트리 확정. 모든 청크가 목표
   복제본 수(`min_replicas`, 기본 1=원본 외 1부)를 확보하면 replicated, 아니면
@@ -153,8 +170,10 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
   소유자 auth_token을 실어 홀더가 요청자=소유자를 도출(/auth/verify same_user=False)해
   ParityStore 인가에 사용한다. 파일 데이터 op는 같은 사용자 디바이스 간만 릴레이한다.
 - restore: 서버에서 청크 목록 조회 → 청크별 온라인·도달 가능한 홀더에서 fetch(스웜,
-  직접→릴레이) → 결합 → 복호화 → 로컬 복원. 도달 불가 청크가 있으면 누락 chunk_id
-  명시 에러.
+  직접→릴레이) → 받은 조각이 청크 표현이면 청크별로 복호화 검증 후 그대로 되돌려 기록,
+  레거시 blob이면 이어붙여 단일 블록으로 기록. 어느 경우든 재암호화하지 않으므로 at-rest
+  바이트가 복제 시점과 같고 등록된 청크 해시가 계속 유효하다. 도달 불가 청크가 있으면
+  누락 chunk_id 명시 에러.
 - heal: 청크별 online 복제 수가 부족하면 온라인 홀더에서 받아(불변 청크) 새 홀더로
   복사. 호스트는 키가 없어 청크를 복호화할 수 없다.
 - 운영 활성화(`replication.enabled`, 기본 활성): daemon이 시작 시 GET
