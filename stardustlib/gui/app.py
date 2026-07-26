@@ -325,6 +325,12 @@ class StardustApp:
         ttk.Button(pframe, text=t["refresh"], command=self.refresh).pack(side="left", padx=(6, 10))
         self._update_title()
 
+        # 하단 고정 바(상태바·액션 툴바)를 파일 목록보다 먼저 pack해 공간을 선점한다.
+        # pack은 선언 순서로 공간을 떼어 가므로, expand=True인 목록을 먼저 배치하면
+        # 창이 작거나 DPI 배율이 높을 때 마지막에 배치된 툴바가 화면 밖으로 밀린다
+        # (업로드 버튼이 사라지는 증상). 목록이 줄어드는 쪽이 옳다.
+        self._build_bottom_bars()
+
         # 파일 목록 + 하단 스토리지·디바이스 패널을 세로 분할(구분선 드래그로 조절).
         paned = ttk.PanedWindow(self.body, orient="vertical")
         paned.pack(fill="both", expand=True)
@@ -349,6 +355,15 @@ class StardustApp:
         self._build_mgmt_panel(mgmt_frame)
         paned.add(mgmt_frame, weight=1)
 
+        self._refresh_login_state()
+
+    def _build_bottom_bars(self) -> None:
+        """하단 상태바와 액션 툴바를 만든다(파일 목록보다 먼저 호출한다).
+
+        좁은 창·높은 DPI 배율에서도 업로드·백업 버튼이 잘리지 않도록 고정 높이
+        영역을 먼저 확보한다.
+        """
+        t = self.t
         # 하단 상태바(VSCode 풍): ● daemon · 스토리지 · 디바이스 · (전송 상태) · 백업
         statusbar = ttk.Frame(self.body, padding=(10, 4))
         statusbar.pack(fill="x", side="bottom")
@@ -374,7 +389,9 @@ class StardustApp:
             style = "Accent.TButton" if (accent and sv_ttk is not None) else "TButton"
             return ttk.Button(tb, text=text, command=cmd, style=style)
 
-        _btn(t["upload"], self._upload, accent=True).pack(side="left")
+        # 업로드 버튼은 잘림 회귀 테스트에서 참조하므로 인스턴스에 남긴다.
+        self.upload_btn = _btn(t["upload"], self._upload, accent=True)
+        self.upload_btn.pack(side="left")
         _btn(t["download"], self._download).pack(side="left", padx=(6, 0))
         ttk.Separator(tb, orient="vertical").pack(side="left", fill="y", padx=10)
         for text, cmd in ((t["mkdir"], self._mkdir), (t["delete"], self._delete),
@@ -384,8 +401,6 @@ class StardustApp:
         _btn(t["backup_now"], self._backup_selected, accent=True).pack(side="left")
         _btn(t["heal_now"], self._heal_selected).pack(side="left", padx=(6, 0))
         _btn(t["restore_now"], self._restore_selected).pack(side="left", padx=(6, 0))
-
-        self._refresh_login_state()
 
     # --- 워커 브리지 ---
 
