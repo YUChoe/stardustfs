@@ -308,19 +308,29 @@ class DirectorySource(StorageSource):
             raise
 
     def list_physical_files(self) -> list[str]:
-        """소스 루트 직속의 물리 파일명 목록을 반환한다 (orphan GC용)."""
+        """소스 루트의 물리 파일 상대 경로 목록을 반환한다 (orphan GC용).
+
+        청크는 샤드 서브디렉토리(`<hh>/<chunk_ref>`)에 저장되므로 루트 직속뿐 아니라
+        하위 디렉토리까지 재귀로 훑는다. 반환 경로는 소스 루트 기준 상대 POSIX 경로다.
+        """
         self._check_active()
+        names: list[str] = []
         try:
-            return [
-                name
-                for name in os.listdir(self._path)
-                if os.path.isfile(os.path.join(self._path, name))
-            ]
+            for root, _dirs, files in os.walk(self._path):
+                rel_dir = os.path.relpath(root, self._path)
+                for name in files:
+                    if rel_dir == ".":
+                        names.append(name)
+                    else:
+                        names.append(
+                            f"{rel_dir.replace(os.sep, '/')}/{name}"
+                        )
         except OSError as e:
             logger.warning(
                 "list_physical_files 실패 (%s): %s", self._source_id, e
             )
             return []
+        return names
 
     def get_available_space(self) -> int:
         """사용 가능한 디스크 공간(바이트)을 반환한다."""
@@ -641,13 +651,15 @@ class LoopbackSource(StorageSource):
             return []
 
     def list_physical_files(self) -> list[str]:
-        """이미지 루트 직속의 물리 파일명 목록을 반환한다 (orphan GC용)."""
+        """이미지 내 물리 파일 상대 경로 목록을 반환한다 (orphan GC용).
+
+        청크는 샤드 서브디렉토리(`<hh>/<chunk_ref>`)에 저장되므로 이미지 루트 직속뿐
+        아니라 하위 디렉토리까지 재귀로 훑는다(`walk.files()`). 반환 경로는 이미지
+        루트 기준 상대 경로다(선행 슬래시 없음).
+        """
         self._check_active()
         try:
-            return [
-                name for name in self._fs.listdir("/")
-                if self._fs.isfile("/" + name)
-            ]
+            return [p.lstrip("/") for p in self._fs.walk.files()]
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 "list_physical_files 실패 (%s): %s", self._source_id, e

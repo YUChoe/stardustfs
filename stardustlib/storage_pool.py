@@ -9,10 +9,11 @@ import re
 import time
 import uuid
 
+from stardustlib import chunker
 from stardustlib.encryption_engine import EncryptionEngine
 from stardustlib.exceptions import InsufficientStorageError
 from stardustlib.metadata_store import MetadataStore
-from stardustlib.models import EntryInfo, FileInfo
+from stardustlib.models import ChunkRef, EntryInfo, FileInfo
 from stardustlib.storage_source import StorageSource
 
 logger = logging.getLogger(__name__)
@@ -20,6 +21,9 @@ logger = logging.getLogger(__name__)
 # 물리 파일명 형식: <32자리 hex UUID>_<원본 파일명>. orphan GC는 이 형식의
 # 파일만 대상으로 하여 metadata DB 등 비관리 파일을 건드리지 않는다.
 _MANAGED_FILE_RE = re.compile(r"^[0-9a-f]{32}_")
+
+# 청크 네이티브 저장의 평문 청크 크기. 전송 계층 청크(4 MiB)와 맞춘다.
+CHUNK_SIZE = chunker.DEFAULT_CHUNK_SIZE
 
 
 class StoragePool:
@@ -182,6 +186,13 @@ class StoragePool:
             # 로컬 소유(또는 레거시 NULL)만 이동. 원격 소유는 그 디바이스가 보관.
             if meta.device_id is not None and meta.device_id != self.device_id:
                 continue
+            # 청크 표현은 청크 단위로 옮긴다(레거시 blob과 이동 단위가 다르다).
+            if self.metadata_store.get_chunks(meta.virtual_path):
+                if self._evacuate_chunks(meta, source_id):
+                    moved.append(meta.virtual_path)
+                else:
+                    unmoved.append(meta.virtual_path)
+                continue
             try:
                 target = self.select_source(
                     meta.file_size, exclude_ids=(source_id,)
@@ -212,6 +223,57 @@ class StoragePool:
                 logger.error("evacuate 실패: %s: %s", meta.virtual_path, e)
                 unmoved.append(meta.virtual_path)
         return {"ok": not unmoved, "moved": moved, "unmoved": unmoved}
+
+    def _evacuate_chunks(self, meta, source_id: str) -> bool:
+        """청크 표현 파일의 청크를 남은 로컬 소스로 옮긴다(무손실).
+
+        청크마다 대상 소스를 고르고, 기록에 성공한 뒤에만 원본 청크를 지우며
+        매니페스트를 갱신한다. 하나라도 옮길 수 없으면 이미 옮긴 청크는 그대로 두고
+        False를 반환한다(데이터는 온전하며 매니페스트가 실제 위치를 가리킨다).
+        """
+        src = self._get_source_by_id(source_id)
+        if src is None:
+            return False
+        for chunk in self.metadata_store.get_chunks(meta.virtual_path):
+            if chunk.source_id != source_id:
+                continue  # 이미 다른 소스에 있다
+            try:
+                target = self.select_source(
+                    chunk.size, exclude_ids=(source_id,)
+                )
+            except InsufficientStorageError:
+                logger.warning(
+                    "청크 evacuate 대상 없음: %s chunk_index=%d",
+                    meta.virtual_path, chunk.index,
+                )
+                return False
+            try:
+                blob = src.read(chunk.chunk_ref)
+                target.write(chunk.chunk_ref, blob)  # 대상 기록 먼저
+                self.metadata_store.update_chunk_location(
+                    meta.virtual_path, chunk.index,
+                    target.source_id, self.device_id,
+                )
+                try:
+                    src.delete(chunk.chunk_ref)  # 성공 후 원본 삭제
+                except OSError:
+                    pass
+            except Exception as e:  # noqa: BLE001 — 원본 보존
+                logger.error(
+                    "청크 evacuate 실패: %s chunk_index=%d: %s",
+                    meta.virtual_path, chunk.index, e,
+                )
+                return False
+        # files의 레거시 위치 컬럼도 첫 청크 기준으로 맞춘다.
+        chunks = self.metadata_store.get_chunks(meta.virtual_path)
+        if chunks:
+            self.metadata_store.update(
+                meta.virtual_path, file_size=meta.file_size,
+                modified_at=meta.modified_at, device_id=self.device_id,
+                source_id=chunks[0].source_id,
+                physical_path=chunks[0].chunk_ref,
+            )
+        return True
 
     @staticmethod
     def _ensure_remote_active(remote) -> bool:
@@ -346,8 +408,8 @@ class StoragePool:
             if not is_safe(meta.virtual_path):
                 continue  # 온라인 복제본 미달 → 보존(스테일 플래그 삭제 금지)
             try:
-                if source.exists(meta.physical_path):
-                    source.delete(meta.physical_path)
+                # 청크 표현이면 청크 전부, 레거시면 단일 블록을 비운다.
+                self._delete_local_blocks(meta)
                 self.metadata_store.mark_evicted(meta.virtual_path)
                 evicted.append(meta.virtual_path)
                 freed += meta.file_size
@@ -360,8 +422,30 @@ class StoragePool:
 
     # --- 파일 작업 ---
 
+    def _resolve_metadata(self, virtual_path: str):
+        """파일 메타데이터를 조회하고 축출된 파일은 재구체화한 뒤 반환한다.
+
+        Raises:
+            FileNotFoundError: 파일이 존재하지 않을 때.
+        """
+        metadata = self.metadata_store.lookup(virtual_path)
+        if metadata is None:
+            raise FileNotFoundError(f"파일을 찾을 수 없습니다: {virtual_path}")
+        # 축출된(복제본 전용) 파일: 복제 홀더에서 복구해 로컬에 재구체화한 뒤 읽는다.
+        if getattr(metadata, "evicted", False):
+            metadata = self._materialize_evicted(metadata)
+        return metadata
+
+    def _is_local_owner(self, metadata) -> bool:
+        """로컬 소유(또는 레거시 NULL) 파일인지 판정한다."""
+        owner = metadata.device_id
+        return owner is None or owner == self.device_id
+
     def read_file(self, virtual_path: str) -> bytes:
         """파일을 읽어 복호화된 데이터를 반환한다.
+
+        청크 표현(매니페스트 존재)이면 청크를 순서대로 가져와 각각 복호화한 뒤
+        이어붙인다. 레거시 통짜 blob은 기존 단일 경로로 읽는다.
 
         Args:
             virtual_path: 가상 파일 경로.
@@ -371,38 +455,299 @@ class StoragePool:
 
         Raises:
             FileNotFoundError: 파일이 존재하지 않을 때.
-            OSError: 소스가 비활성 상태일 때.
+            OSError: 소스가 비활성 상태이거나 청크가 누락됐을 때.
         """
-        encrypted_data = self.read_ciphertext(virtual_path)
+        metadata = self._resolve_metadata(virtual_path)
+        if self._is_local_owner(metadata):
+            chunks = self.metadata_store.get_chunks(virtual_path)
+            if chunks:
+                return b"".join(
+                    self._decrypt_chunk(virtual_path, c) for c in chunks
+                )
+        encrypted_data = self._read_resolved_ciphertext(metadata)
         if self.encryption_engine is not None:
             return self.encryption_engine.decrypt(encrypted_data)
         return encrypted_data
+
+    def read_range(
+        self, virtual_path: str, offset: int, length: int
+    ) -> bytes:
+        """파일의 [offset, offset+length) 범위만 읽어 반환한다(부분 읽기).
+
+        청크 표현이면 그 범위를 덮는 청크만 가져와 복호화한다. 레거시 통짜 blob은
+        전체를 읽은 뒤 잘라낸다(단일 blob은 부분 복호화가 불가능하다).
+
+        요청 범위가 파일 끝을 넘으면 존재하는 부분까지만 반환한다.
+
+        Raises:
+            FileNotFoundError: 파일이 존재하지 않을 때.
+            ValueError: offset/length가 음수일 때.
+            OSError: 소스가 비활성이거나 청크가 누락됐을 때.
+        """
+        if offset < 0 or length < 0:
+            raise ValueError("offset/length는 0 이상이어야 합니다")
+        if length == 0:
+            return b""
+
+        metadata = self._resolve_metadata(virtual_path)
+        chunks = (
+            self.metadata_store.get_chunks(virtual_path)
+            if self._is_local_owner(metadata) else []
+        )
+        if not chunks:
+            return self.read_file(virtual_path)[offset:offset + length]
+
+        by_index = {c.index: c for c in chunks}
+        wanted = chunker.chunk_range(offset, length, CHUNK_SIZE)
+        parts: list[bytes] = []
+        for idx in wanted:
+            chunk = by_index.get(idx)
+            if chunk is None:
+                break  # 파일 끝을 넘는 범위 — 존재하는 부분까지만 반환
+            parts.append(self._decrypt_chunk(virtual_path, chunk))
+        if not parts:
+            return b""
+        blob = b"".join(parts)
+        start = offset - wanted[0] * CHUNK_SIZE
+        return blob[start:start + length]
 
     def read_ciphertext(self, virtual_path: str) -> bytes:
         """복호화하지 않은 at-rest 암호문을 반환한다.
 
         복제(replicate)에서 사용한다. 저장된 암호문을 그대로 청크로 나눠 복제하므로
         백업 표현이 at-rest 표현과 동일해지고, 백업마다 복호화→재암호화하는 비용이
-        사라진다.
+        사라진다. 청크 표현이면 청크 암호문을 인덱스 순으로 이어붙인 것이 at-rest
+        표현이다.
 
         Raises:
             FileNotFoundError: 파일이 존재하지 않을 때.
             OSError: 소스가 비활성이거나 원격 디바이스에 도달할 수 없을 때.
         """
-        metadata = self.metadata_store.lookup(virtual_path)
-        if metadata is None:
-            raise FileNotFoundError(f"파일을 찾을 수 없습니다: {virtual_path}")
+        metadata = self._resolve_metadata(virtual_path)
+        if self._is_local_owner(metadata):
+            chunks = self.metadata_store.get_chunks(virtual_path)
+            if chunks:
+                return b"".join(
+                    self._read_chunk_bytes(virtual_path, c) for c in chunks
+                )
+        return self._read_resolved_ciphertext(metadata)
 
-        # 축출된(복제본 전용) 파일: 복제 홀더에서 복구해 로컬에 재구체화한 뒤 읽는다.
-        if getattr(metadata, "evicted", False):
-            metadata = self._materialize_evicted(metadata)
-
-        owner = metadata.device_id
-        # 로컬 소유 또는 레거시(NULL) → 로컬 읽기
-        if owner is None or owner == self.device_id:
+    def _read_resolved_ciphertext(self, metadata) -> bytes:
+        """이미 해석된 메타데이터로 레거시 단일 blob 암호문을 읽는다."""
+        if self._is_local_owner(metadata):
             return self._read_local_ciphertext(metadata)
         # 원격 소유 → 디바이스 프록시로 라우팅
         return self._read_remote_ciphertext(metadata)
+
+    # --- 청크 저장/조회 ---
+
+    def _cipher_overhead(self) -> int:
+        """청크 하나당 암호문 오버헤드(헤더+IV+태그). 암호화 비활성이면 0."""
+        if self.encryption_engine is None:
+            return 0
+        return EncryptionEngine.HEADER_SIZE
+
+    def _encrypt_chunk(self, plain: bytes) -> bytes:
+        """청크 하나를 독립적으로 암호화한다(청크별 IV·인증 태그)."""
+        if self.encryption_engine is None:
+            return plain
+        return self.encryption_engine.encrypt(plain)
+
+    def _read_chunk_bytes(self, virtual_path: str, chunk: ChunkRef) -> bytes:
+        """청크 암호문을 소스에서 읽고 해시를 검증한다."""
+        source = self._get_source_by_id(chunk.source_id)
+        if source is None or not source.is_active:
+            raise OSError(
+                f"청크가 위치한 소스가 비활성 상태입니다: {chunk.source_id} "
+                f"(file={virtual_path} chunk_index={chunk.index})"
+            )
+        try:
+            data = source.read(chunk.chunk_ref)
+        except FileNotFoundError as e:
+            raise OSError(
+                f"청크 누락: file={virtual_path} chunk_index={chunk.index} "
+                f"ref={chunk.chunk_ref}"
+            ) from e
+        if chunk.hash and chunker.chunk_hash(data) != chunk.hash:
+            raise OSError(
+                f"청크 해시 불일치: file={virtual_path} "
+                f"chunk_index={chunk.index} ref={chunk.chunk_ref}"
+            )
+        return data
+
+    def _decrypt_chunk(self, virtual_path: str, chunk: ChunkRef) -> bytes:
+        """청크 암호문을 읽어 단독 복호화한다."""
+        data = self._read_chunk_bytes(virtual_path, chunk)
+        if self.encryption_engine is None:
+            return data
+        return self.encryption_engine.decrypt(data)
+
+    def _store_chunks(
+        self, virtual_path: str, cipher_chunks: list, plain_size: int
+    ) -> None:
+        """암호문 청크들을 소스에 기록하고 매니페스트를 커밋한다(원자적).
+
+        모든 청크 기록이 성공한 뒤에만 메타데이터를 커밋하므로 파일이 반쯤 저장된
+        상태로 남지 않는다. 중간 실패 시 이미 기록한 청크를 정리하고 규격 에러를
+        올린다. 커밋 후에는 이전 표현(레거시 blob 또는 옛 청크)을 정리한다.
+
+        Raises:
+            InsufficientStorageError: 로컬·원격 어디에도 공간이 없을 때.
+        """
+        existing = self.metadata_store.lookup(virtual_path)
+        total = sum(len(c) for c in cipher_chunks)
+        # 원격 소유 파일 수정 → 로컬 소유권 이전(takeover). 원래 소유 디바이스의
+        # 물리 블록은 그 디바이스가 동기화 후 정리하므로 여기서 지우지 않는다.
+        takeover = existing is not None and not self._is_local_owner(existing)
+
+        try:
+            source = self._select_chunk_source(existing, takeover, total)
+        except InsufficientStorageError:
+            # 로컬 만석 → 온라인 리모트(같은 계정)로 스필오버. 청크 단위 원격 배치는
+            # 후속 단계이므로 지금은 at-rest 암호문을 한 블록으로 보낸다.
+            if existing is None and self._write_to_remote(
+                virtual_path, b"".join(cipher_chunks), plain_size
+            ):
+                return
+            raise
+
+        old_chunks = self.metadata_store.get_chunks(virtual_path)
+        refs: list[ChunkRef] = []
+        written: list[str] = []
+        try:
+            for index, cipher in enumerate(cipher_chunks):
+                digest = chunker.chunk_hash(cipher)
+                ref = (
+                    f"{chunker.shard_prefix(digest)}/"
+                    f"{chunker.chunk_ref(index)}"
+                )
+                source.write(ref, cipher)
+                written.append(ref)
+                refs.append(
+                    ChunkRef(
+                        index=index, chunk_ref=ref,
+                        source_id=source.source_id, device_id=self.device_id,
+                        size=len(cipher), hash=digest,
+                    )
+                )
+        except OSError as e:
+            self._cleanup_chunks(source, written)
+            if "insufficient space" in str(e).lower():
+                raise InsufficientStorageError(str(e)) from e
+            raise
+        except Exception:
+            self._cleanup_chunks(source, written)
+            raise
+
+        # 첫 청크 참조를 files의 물리 위치로 둔다(NOT NULL 충족). 청크 파일의
+        # 정본은 file_chunks이며, 이 값은 레거시 컬럼 호환용이다.
+        head_ref = refs[0].chunk_ref if refs else self._generate_physical_path(
+            virtual_path
+        )
+        now = time.time()
+        self.metadata_store.begin_transaction()
+        try:
+            if existing is None:
+                self.metadata_store.insert(
+                    virtual_path=virtual_path,
+                    source_id=source.source_id,
+                    physical_path=head_ref,
+                    file_size=plain_size,
+                    created_at=now,
+                    modified_at=now,
+                    device_id=self.device_id,
+                )
+            else:
+                self.metadata_store.update(
+                    virtual_path,
+                    file_size=plain_size,
+                    modified_at=now,
+                    device_id=self.device_id,
+                    source_id=source.source_id,
+                    physical_path=head_ref,
+                )
+            self.metadata_store.put_chunks(virtual_path, refs)
+            self.metadata_store.commit()
+        except Exception:
+            self.metadata_store.rollback()
+            self._cleanup_chunks(source, written)
+            raise
+
+        if takeover:
+            # 사이클당 1회 GC를 위해 플래그만 set (파일마다 스캔하지 않음)
+            self._gc_needed = True
+            logger.info(
+                "소유권 이전 완료: %s → device=%s source=%s",
+                virtual_path, self.device_id, source.source_id,
+            )
+        else:
+            self._discard_previous_representation(existing, old_chunks, written)
+
+    def _select_chunk_source(
+        self, existing, takeover: bool, total: int
+    ) -> StorageSource:
+        """청크를 기록할 로컬 소스를 고른다.
+
+        기존 로컬 파일을 덮어쓰는 경우에는 지금 있는 소스를 우선한다(여유가 있으면).
+        덮어쓰기가 파일을 다른 소스로 옮기지 않게 해 배치를 안정적으로 유지한다.
+        여유가 없거나 신규·소유권 이전이면 일반 배치 규칙(여유 최대)을 따른다.
+
+        Raises:
+            InsufficientStorageError: 조건을 만족하는 로컬 소스가 없을 때.
+        """
+        if existing is not None and not takeover:
+            current = self._get_source_by_id(existing.source_id)
+            if (
+                current is not None
+                and current.is_active
+                and not current.is_remote
+                and current.get_available_space() >= total
+            ):
+                return current
+        return self.select_source(total)
+
+    @staticmethod
+    def _cleanup_chunks(source, refs: list) -> None:
+        """기록에 실패한 청크 파일을 정리한다(베스트에포트)."""
+        for ref in refs:
+            try:
+                if source.exists(ref):
+                    source.delete(ref)
+            except Exception:  # noqa: BLE001 — 정리 실패는 orphan GC가 회수
+                pass
+
+    def _discard_previous_representation(
+        self, existing, old_chunks: list, new_refs: list
+    ) -> None:
+        """커밋 후 이전 표현(레거시 blob 또는 옛 청크)을 삭제한다.
+
+        실패해도 데이터 손실은 없다(고아 블록은 orphan GC가 회수).
+        """
+        if existing is None:
+            return
+        keep = set(new_refs)
+        if old_chunks:
+            for chunk in old_chunks:
+                if chunk.chunk_ref in keep:
+                    continue
+                src = self._get_source_by_id(chunk.source_id)
+                if src is None or not src.is_active:
+                    continue
+                try:
+                    src.delete(chunk.chunk_ref)
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+        # 이전엔 레거시 통짜 blob이었다.
+        if existing.physical_path in keep:
+            return
+        src = self._get_source_by_id(existing.source_id)
+        if src is None or not src.is_active:
+            return
+        try:
+            src.delete(existing.physical_path)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _read_local_ciphertext(self, metadata) -> bytes:
         """로컬 소스에서 at-rest 암호문을 읽는다(복호화하지 않음)."""
@@ -448,9 +793,10 @@ class StoragePool:
         )
 
     def write_file(self, virtual_path: str, data: bytes) -> None:
-        """파일을 암호화하여 저장하고 메타데이터를 기록한다.
+        """파일을 청크로 나눠 각각 암호화해 저장하고 메타데이터를 기록한다.
 
-        원자적 트랜잭션을 보장한다: 실패 시 부분 파일 삭제 + 메타데이터 롤백.
+        원자적 트랜잭션을 보장한다: 모든 청크 기록이 성공한 뒤에만 메타데이터를
+        커밋하고, 실패 시 기록한 청크를 정리한다.
 
         Args:
             virtual_path: 가상 파일 경로.
@@ -459,36 +805,88 @@ class StoragePool:
         Raises:
             InsufficientStorageError: 공간 부족 시.
         """
-        if self.encryption_engine is not None:
-            encrypted = self.encryption_engine.encrypt(data)
-        else:
-            encrypted = data
-        self._store_encrypted(virtual_path, encrypted, len(data))
+        existing = self.metadata_store.lookup(virtual_path)
+        if (
+            existing is not None
+            and self._is_local_owner(existing)
+            and not self.metadata_store.get_chunks(virtual_path)
+        ):
+            # 레거시 통짜 blob 파일의 덮어쓰기는 표현을 그대로 유지한다(같은 물리
+            # 위치에 덮어쓴다). blob→청크 전환은 별도 마이그레이션 단계에서 다룬다.
+            self._store_encrypted(
+                virtual_path, self._encrypt_chunk(data), len(data)
+            )
+            return
+
+        cipher_chunks = [
+            self._encrypt_chunk(part)
+            for _idx, part in chunker.split(data, CHUNK_SIZE)
+        ]
+        if not cipher_chunks:
+            # 빈 파일도 청크 1개(빈 평문)로 표현해 읽기 경로를 단일화한다.
+            cipher_chunks = [self._encrypt_chunk(b"")]
+        self._store_chunks(virtual_path, cipher_chunks, len(data))
 
     def write_ciphertext(
         self, virtual_path: str, encrypted: bytes, plain_size: int
     ) -> None:
-        """이미 암호화된 블록을 재암호화 없이 그대로 저장한다.
+        """이미 암호화된 at-rest 표현을 재암호화 없이 그대로 저장한다.
 
         복제본 복구(recover)에서 사용한다. 홀더가 보관한 암호문이 곧 at-rest 표현이므로
         복호화→재암호화를 거치지 않고 원본 바이트를 그대로 복원한다(등록된 청크 해시가
         복구 후에도 유효하게 유지된다).
 
+        at-rest 표현은 두 형태가 있다. 청크 표현은 청크 암호문을 이어붙인 것이고,
+        레거시는 파일 전체를 한 번 암호화한 단일 blob이다. 청크 크기와 청크당 오버헤드가
+        고정이라 총 길이로 두 형태를 구분할 수 있으므로, 받은 바이트를 원래 형태 그대로
+        복원한다(바이트 동일성 유지).
+
         Args:
             virtual_path: 가상 파일 경로.
-            encrypted: at-rest 암호문 블록.
+            encrypted: at-rest 암호문.
             plain_size: 메타데이터에 기록할 평문 크기.
         """
+        sizes = self._expected_chunk_cipher_sizes(plain_size)
+        if len(encrypted) == sum(sizes) and len(sizes) > 1:
+            parts: list[bytes] = []
+            pos = 0
+            for size in sizes:
+                parts.append(encrypted[pos:pos + size])
+                pos += size
+            self._store_chunks(virtual_path, parts, plain_size)
+            return
+        if len(encrypted) == plain_size + self._cipher_overhead():
+            # 레거시 단일 blob(또는 청크 1개 — 두 표현이 동일하다).
+            self._store_chunks(virtual_path, [encrypted], plain_size)
+            return
+        # 형태를 판정할 수 없는 암호문은 단일 블록으로 보존한다(무손실 우선).
         self._store_encrypted(virtual_path, encrypted, plain_size)
+
+    def _expected_chunk_cipher_sizes(self, plain_size: int) -> list:
+        """평문 크기로부터 청크 표현의 청크별 암호문 크기를 계산한다."""
+        overhead = self._cipher_overhead()
+        if plain_size <= 0:
+            return [overhead]
+        sizes = []
+        remaining = plain_size
+        while remaining > 0:
+            take = min(CHUNK_SIZE, remaining)
+            sizes.append(take + overhead)
+            remaining -= take
+        return sizes
 
     def _store_encrypted(
         self, virtual_path: str, encrypted: bytes, plain_size: int
     ) -> None:
         """암호문 블록을 소스에 저장하고 메타데이터를 기록한다(원자적).
 
-        write_file(평문 암호화 후)과 write_ciphertext(암호문 그대로)의 공통 경로.
+        레거시 단일 blob 표현으로 저장한다. 대상이 청크 표현이었다면 청크 블록과
+        매니페스트를 먼저 비워, 읽기 경로가 낡은 매니페스트를 집지 않게 한다.
         """
         existing = self.metadata_store.lookup(virtual_path)
+        if existing is not None and self._is_local_owner(existing):
+            if self.metadata_store.get_chunks(virtual_path):
+                self._delete_local_blocks(existing)
 
         if existing is not None:
             # 원격 디바이스 소유 파일 수정 → 로컬 소유권 이전(takeover, 3a)
@@ -627,6 +1025,11 @@ class StoragePool:
             return 0
 
         live = self.metadata_store.live_physical_paths_for_device(self.device_id)
+        # 청크 파일도 활성 참조다. 매니페스트가 가리키는 (source_id, chunk_ref)를
+        # 보존 집합에 합치지 않으면 청크가 전부 고아로 오인되어 삭제된다.
+        live = live | self.metadata_store.live_chunk_paths_for_device(
+            self.device_id
+        )
         removed = 0
         for source in self.sources:
             if not source.is_active or source.is_remote:
@@ -642,7 +1045,9 @@ class StoragePool:
             for name in names:
                 # 우리가 만든 관리 파일(<hex32>_...)만 GC 대상. metadata DB,
                 # 사용자 직접 파일 등 비관리 파일은 절대 건드리지 않는다.
-                if not _MANAGED_FILE_RE.match(name):
+                # 청크는 샤드 디렉토리 아래(`<hh>/<hex32>_cNNNN`)에 있으므로
+                # 마지막 경로 요소로 판정한다.
+                if not _MANAGED_FILE_RE.match(name.rsplit("/", 1)[-1]):
                     continue
                 if (source.source_id, name) in live:
                     continue
@@ -682,6 +1087,31 @@ class StoragePool:
             self.metadata_store.delete(virtual_path)
             return
 
+        self._delete_local_blocks(metadata)
+        self.metadata_store.delete(virtual_path)
+
+    def _delete_local_blocks(self, metadata) -> None:
+        """파일의 로컬 물리 블록을 삭제한다(청크 표현이면 청크 전부).
+
+        청크 표현이면 매니페스트도 함께 비운다(chunked=0으로 복귀).
+        """
+        chunks = self.metadata_store.get_chunks(metadata.virtual_path)
+        if chunks:
+            for chunk in chunks:
+                src = self._get_source_by_id(chunk.source_id)
+                if src is None or not src.is_active:
+                    continue
+                try:
+                    src.delete(chunk.chunk_ref)
+                except FileNotFoundError:
+                    logger.warning("청크가 이미 삭제됨: %s", chunk.chunk_ref)
+                except OSError as e:
+                    logger.warning(
+                        "청크 삭제 실패(%s): %s", chunk.chunk_ref, e
+                    )
+            self.metadata_store.delete_chunks(metadata.virtual_path)
+            return
+
         source = self._get_source_by_id(metadata.source_id)
         if source is not None and source.is_active:
             try:
@@ -690,8 +1120,6 @@ class StoragePool:
                 logger.warning(
                     "물리 파일이 이미 삭제됨: %s", metadata.physical_path
                 )
-
-        self.metadata_store.delete(virtual_path)
 
     def move_file(self, src_path: str, dst_path: str) -> None:
         """파일을 이동(이름 변경)한다.

@@ -13,7 +13,7 @@ import threading
 import time
 from typing import Any
 
-from stardustlib.models import EntryInfo, FileMetadata
+from stardustlib.models import ChunkRef, EntryInfo, FileMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,23 @@ CREATE TABLE IF NOT EXISTS directories (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_directories_virtual_path ON directories(virtual_path);
+"""
+
+# 청크 네이티브 저장(chunked=1) 파일의 청크 배치. 파일당 N행.
+# 레거시 통짜 blob(chunked=0)은 이 테이블에 행이 없고 files의
+# source_id/physical_path가 정본이다.
+_FILE_CHUNKS_SQL = """\
+CREATE TABLE IF NOT EXISTS file_chunks (
+    virtual_path  TEXT    NOT NULL,
+    chunk_index   INTEGER NOT NULL,
+    chunk_ref     TEXT    NOT NULL,
+    source_id     TEXT    NOT NULL,
+    device_id     TEXT,
+    size          INTEGER NOT NULL,
+    hash          TEXT,
+    PRIMARY KEY (virtual_path, chunk_index)
+);
+CREATE INDEX IF NOT EXISTS idx_file_chunks_source ON file_chunks(source_id);
 """
 
 
@@ -103,6 +120,7 @@ class MetadataStore:
         self._migrate_to_v4()
         self._migrate_to_v5()
         self._migrate_to_v6()
+        self._migrate_to_v7()
         self._initialized = True
         logger.info("Metadata Store 초기화 완료: %s", self._db_path)
 
@@ -328,6 +346,160 @@ class MetadataStore:
             conn.rollback()
             logger.error("v6 마이그레이션 실패, 롤백 수행: %s", e)
             raise
+
+    def _migrate_to_v7(self) -> None:
+        """v6 → v7: 청크 네이티브 저장 스키마.
+
+        - file_chunks 테이블 생성(파일별 청크 배치)
+        - files에 chunked 컬럼 추가(0=레거시 통짜 blob, 1=청크 표현)
+        - schema_version을 7로 갱신
+
+        기존 파일은 chunked=0이 되어 기존 단일 blob 경로로 계속 읽힌다.
+        멱등하다: 컬럼/테이블이 이미 있으면 해당 단계를 건너뛴다.
+        """
+        conn = self._get_conn()
+        cur = conn.execute("PRAGMA table_info(files)")
+        cols = [r["name"] for r in cur.fetchall()]
+        has_chunked = "chunked" in cols
+        row = conn.execute(
+            "SELECT version FROM schema_version WHERE id = 1"
+        ).fetchone()
+        if has_chunked and row is not None and row["version"] >= 7:
+            return
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.executescript(_FILE_CHUNKS_SQL)
+            if not has_chunked:
+                conn.execute(
+                    "ALTER TABLE files ADD COLUMN chunked "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_version (id, version, migrated_at) "
+                "VALUES (1, 7, ?)",
+                (time.time(),),
+            )
+            conn.commit()
+            logger.info(
+                "MetadataStore v7 스키마 마이그레이션 완료 (file_chunks, chunked)"
+            )
+        except Exception as e:
+            conn.rollback()
+            logger.error("v7 스키마 마이그레이션 실패, 롤백 수행: %s", e)
+            raise
+
+    # --- 청크 매니페스트 CRUD ---
+
+    def put_chunks(self, virtual_path: str, chunks: list) -> None:
+        """파일의 청크 매니페스트를 통째로 교체하고 chunked=1로 표시한다.
+
+        기존 행을 지우고 새로 넣는다. 호출자가 이미 트랜잭션을 열어둔 경우(write 경로)
+        그 트랜잭션에 편입되어 청크 기록과 메타데이터 커밋이 함께 성립한다.
+
+        Args:
+            virtual_path: 가상 파일 경로.
+            chunks: ChunkRef 목록(chunk_index 중복 불가).
+        """
+        conn = self._get_conn()
+        conn.execute(
+            "DELETE FROM file_chunks WHERE virtual_path = ?", (virtual_path,)
+        )
+        conn.executemany(
+            "INSERT INTO file_chunks "
+            "(virtual_path, chunk_index, chunk_ref, source_id, device_id, "
+            "size, hash) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    virtual_path, c.index, c.chunk_ref, c.source_id,
+                    c.device_id, c.size, c.hash,
+                )
+                for c in chunks
+            ],
+        )
+        conn.execute(
+            "UPDATE files SET chunked = 1 WHERE virtual_path = ?",
+            (virtual_path,),
+        )
+
+    def get_chunks(self, virtual_path: str) -> list:
+        """파일의 청크 매니페스트를 chunk_index 순으로 반환한다(없으면 빈 목록)."""
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "SELECT chunk_index, chunk_ref, source_id, device_id, size, hash "
+            "FROM file_chunks WHERE virtual_path = ? ORDER BY chunk_index",
+            (virtual_path,),
+        )
+        return [
+            ChunkRef(
+                index=row["chunk_index"],
+                chunk_ref=row["chunk_ref"],
+                source_id=row["source_id"],
+                device_id=row["device_id"],
+                size=row["size"],
+                hash=row["hash"],
+            )
+            for row in cursor.fetchall()
+        ]
+
+    def delete_chunks(self, virtual_path: str) -> None:
+        """파일의 청크 매니페스트를 삭제하고 chunked=0으로 되돌린다."""
+        conn = self._get_conn()
+        conn.execute(
+            "DELETE FROM file_chunks WHERE virtual_path = ?", (virtual_path,)
+        )
+        conn.execute(
+            "UPDATE files SET chunked = 0 WHERE virtual_path = ?",
+            (virtual_path,),
+        )
+
+    def update_chunk_location(
+        self,
+        virtual_path: str,
+        chunk_index: int,
+        source_id: str,
+        device_id: str | None,
+        chunk_ref: str | None = None,
+    ) -> None:
+        """청크 하나의 배치(소스/소유 기기/참조)를 갱신한다.
+
+        스필오버·evacuate·축출처럼 청크만 옮기는 경우에 쓴다. 파일 전체를 다시
+        기록하지 않는다.
+        """
+        conn = self._get_conn()
+        if chunk_ref is None:
+            conn.execute(
+                "UPDATE file_chunks SET source_id = ?, device_id = ? "
+                "WHERE virtual_path = ? AND chunk_index = ?",
+                (source_id, device_id, virtual_path, chunk_index),
+            )
+        else:
+            conn.execute(
+                "UPDATE file_chunks SET source_id = ?, device_id = ?, "
+                "chunk_ref = ? WHERE virtual_path = ? AND chunk_index = ?",
+                (source_id, device_id, chunk_ref, virtual_path, chunk_index),
+            )
+        conn.commit()
+
+    def live_chunk_paths_for_device(
+        self, device_id: str
+    ) -> set:
+        """활성 파일이 참조하는 (source_id, chunk_ref) 집합을 반환한다(orphan GC용).
+
+        삭제되지 않은(deleted=0) 파일의 청크 중 현재 디바이스 소유(device_id 일치)
+        이거나 소유자 미지정(NULL)인 것만 모은다. 이 집합의 청크 파일은 GC 대상에서
+        제외한다.
+        """
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "SELECT c.source_id, c.chunk_ref FROM file_chunks c "
+            "JOIN files f ON f.virtual_path = c.virtual_path "
+            "WHERE f.deleted = 0 AND (c.device_id = ? OR c.device_id IS NULL)",
+            (device_id,),
+        )
+        return {
+            (row["source_id"], row["chunk_ref"])
+            for row in cursor.fetchall()
+        }
 
     # --- 파일 메타데이터 CRUD ---
 
@@ -822,10 +994,17 @@ class MetadataStore:
         return list(results.values())
 
     def rename_path(self, old_path: str, new_path: str) -> None:
-        """파일의 가상 경로를 변경한다."""
+        """파일의 가상 경로를 변경한다.
+
+        file_chunks는 virtual_path로 키잉되므로 청크 매니페스트도 함께 옮긴다.
+        """
         conn = self._get_conn()
         conn.execute(
             "UPDATE files SET virtual_path = ? WHERE virtual_path = ?",
+            (new_path, old_path),
+        )
+        conn.execute(
+            "UPDATE file_chunks SET virtual_path = ? WHERE virtual_path = ?",
             (new_path, old_path),
         )
         conn.commit()
@@ -840,6 +1019,11 @@ class MetadataStore:
         )
         conn.execute(
             "UPDATE directories SET virtual_path = ? || SUBSTR(virtual_path, ?) "
+            "WHERE virtual_path LIKE ? || '%'",
+            (new_prefix, len(old_prefix) + 1, old_prefix),
+        )
+        conn.execute(
+            "UPDATE file_chunks SET virtual_path = ? || SUBSTR(virtual_path, ?) "
             "WHERE virtual_path LIKE ? || '%'",
             (new_prefix, len(old_prefix) + 1, old_prefix),
         )

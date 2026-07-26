@@ -8,8 +8,18 @@
 from __future__ import annotations
 
 import hashlib
+import uuid
 
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MiB
+
+# 청크 파일을 담을 서브디렉토리 이름 길이(hex 문자 수). 1단계 = 16^2 = 256개.
+#
+# 근거(실측): pyfatfs는 순수 파이썬이라 파일 생성 시 부모 디렉토리 엔트리를 선형
+# 스캔한다. 2 GiB FAT32 이미지에 파일을 평면으로 채우면 500개 배치마다 13s→24s→
+# 36s→50s로 느려져 O(n^2)이 된다. 앞 2 hex로 256개 서브디렉토리에 분산하면 배치당
+# ~12s로 평탄해진다(선형). 깊이를 더 늘리면 서브디렉토리마다 최소 1클러스터를
+# 점유해 큰 볼륨에서 낭비가 크고 작은 볼륨은 여유가 없으므로 1단계를 기본으로 둔다.
+SHARD_HEX_LEN = 2
 
 
 def chunk_hash(data: bytes) -> str:
@@ -45,3 +55,57 @@ def chunk_count(total_size: int, size: int = DEFAULT_CHUNK_SIZE) -> int:
     if size <= 0:
         raise ValueError("청크 크기는 1 이상이어야 합니다")
     return (total_size + size - 1) // size
+
+
+def chunk_range(
+    offset: int, length: int, size: int = DEFAULT_CHUNK_SIZE
+) -> list[int]:
+    """[offset, offset+length) 범위를 덮는 청크 인덱스 목록을 순서대로 반환한다.
+
+    부분 읽기에서 실제로 가져와야 할 청크만 고르는 데 쓴다. length가 0이면 빈 목록.
+
+    Raises:
+        ValueError: size가 1 미만이거나 offset/length가 음수일 때.
+    """
+    if size <= 0:
+        raise ValueError("청크 크기는 1 이상이어야 합니다")
+    if offset < 0 or length < 0:
+        raise ValueError("offset/length는 0 이상이어야 합니다")
+    if length == 0:
+        return []
+    first = offset // size
+    last = (offset + length - 1) // size
+    return list(range(first, last + 1))
+
+
+def shard_prefix(chunk_hash: str, hex_len: int = SHARD_HEX_LEN) -> str:
+    """청크 암호문 해시에서 서브디렉토리 이름(앞 hex_len자)을 뽑는다.
+
+    샤드 키로 파일 단위 식별자(uuid 접두사)를 쓰면 한 파일의 모든 청크가 같은
+    디렉토리로 몰려 디렉토리 엔트리 폭증이 재현된다. 청크마다 달라지는 암호문 해시를
+    써야 균등하게 분산된다.
+
+    Raises:
+        ValueError: hex_len이 1 미만이거나 해시가 그보다 짧을 때.
+    """
+    if hex_len <= 0:
+        raise ValueError("hex_len은 1 이상이어야 합니다")
+    if len(chunk_hash) < hex_len:
+        raise ValueError(
+            f"청크 해시가 너무 짧습니다: {len(chunk_hash)} < {hex_len}"
+        )
+    return chunk_hash[:hex_len]
+
+
+def chunk_ref(index: int) -> str:
+    """청크의 저장 식별자 `<uuid32>_c<index:04d>`를 만든다.
+
+    uuid는 청크마다 새로 뽑는다(파일 단위로 공유하지 않는다). 앞 32자가 hex UUID라
+    orphan GC의 관리 파일 판정(`^[0-9a-f]{32}_`)과 호환된다.
+
+    Raises:
+        ValueError: index가 음수일 때.
+    """
+    if index < 0:
+        raise ValueError("청크 인덱스는 0 이상이어야 합니다")
+    return f"{uuid.uuid4().hex}_c{index:04d}"

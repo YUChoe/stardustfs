@@ -46,7 +46,12 @@ class TestTakeover:
             shutil.rmtree(d, ignore_errors=True)
 
     def test_local_owned_write_keeps_position(self):
-        """로컬 소유 파일은 기존 덮어쓰기(같은 위치) 동작 유지."""
+        """로컬 소유 파일 덮어쓰기는 같은 소스에 머문다(이전 아님).
+
+        청크 표현은 쓰기마다 청크 참조가 새로 생성되므로(청크마다 새 UUID, 샤드는
+        암호문 해시에서 파생) physical_path 동일성은 불변식이 아니다. 덮어쓰기가
+        파일을 다른 소스로 옮기지 않는다는 것이 지켜야 할 불변식이다.
+        """
         d = tempfile.mkdtemp()
         storage_pool, store, _src = _make_storage_pool(d, "dev-A")
         try:
@@ -54,8 +59,8 @@ class TestTakeover:
             rec1 = store.lookup("/local.txt")
             storage_pool.write_file("/local.txt", b"v2-longer")
             rec2 = store.lookup("/local.txt")
-            # 같은 물리 위치 유지
-            assert rec1.physical_path == rec2.physical_path
+            # 같은 소스 유지
+            assert rec1.source_id == rec2.source_id
             assert rec2.device_id == "dev-A"
             assert storage_pool.read_file("/local.txt") == b"v2-longer"
             # 로컬 수정은 GC 불필요

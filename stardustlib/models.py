@@ -111,6 +111,22 @@ class FileMetadata:
 
 
 @dataclass
+class ChunkRef:
+    """파일 청크 하나의 배치 정보(file_chunks 한 행).
+
+    청크 네이티브 저장에서 파일은 여러 청크로 나뉘고, 청크마다 보관 소스와 소유
+    기기가 다를 수 있다. 청크는 개별적으로 암호화되므로 단독 복호화가 가능하다.
+    """
+
+    index: int                      # 파일 내 청크 순서(0부터)
+    chunk_ref: str                  # 소스 내 물리 경로(<hh>/<uuid32>_cNNNN)
+    source_id: str                  # 청크를 보관한 소스
+    device_id: str | None = None    # 청크 보관 기기(None=로컬/레거시)
+    size: int = 0                   # 청크 암호문 크기(바이트)
+    hash: str | None = None         # 청크 암호문 SHA-256 hex(무결성 검증)
+
+
+@dataclass
 class EntryInfo:
     """디렉토리 엔트리 정보. 디렉토리 목록 조회 결과."""
 

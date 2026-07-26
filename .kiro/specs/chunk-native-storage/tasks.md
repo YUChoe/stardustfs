@@ -10,14 +10,14 @@ Phase 2~5는 진입 시 선행 단계의 실측·결정을 반영해 세부 태�
 
 ### Phase 1 — 저장 계층(로컬 단일 기기, 레거시 blob 공존, 부분 읽기)
 
-- [ ] 1. chunker에 청크 배치·샤딩 헬퍼 추가
+- [x] 1. chunker에 청크 배치·샤딩 헬퍼 추가
   - `chunk_range(offset, length, size) -> list[int]`: 바이트 범위를 덮는 chunk_index 목록
   - `shard_prefix(chunk_hash: str, hex_len: int = 2) -> str`: 청크 해시 앞 hex_len자 반환
   - `chunk_ref(index: int) -> str`: `<uuid32>_c<zero-padded index>` 생성(uuid는 청크마다 신규)
   - 기존 `split`/`join`/`chunk_hash`/`chunk_count`는 불변
   - _Requirements: 1.1, 4.1_
 
-- [ ] 2. metadata_store에 file_chunks 테이블과 chunked 컬럼 마이그레이션(v7) 추가
+- [x] 2. metadata_store에 file_chunks 테이블과 chunked 컬럼 마이그레이션(v7) 추가
   - `_SCHEMA_SQL`에 `file_chunks` 테이블 정의(PK: virtual_path+chunk_index,
     컬럼: chunk_ref, source_id, device_id, size, hash) + `idx_file_chunks_source`
   - `_migrate_to_v7()`: `PRAGMA table_info(files)`로 멱등 검사 후 `files`에
@@ -25,7 +25,7 @@ Phase 2~5는 진입 시 선행 단계의 실측·결정을 반영해 세부 태�
     schema_version을 7로 갱신. `initialize()`에서 호출
   - _Requirements: 2.1, 2.2, 5.1, 6.3_
 
-- [ ] 3. metadata_store에 청크 매니페스트 CRUD 추가
+- [x] 3. metadata_store에 청크 매니페스트 CRUD 추가
   - `put_chunks(virtual_path, chunks: list[ChunkRef])`: 파일 매니페스트 원자적 교체
     (기존 행 삭제 후 삽입, 단일 트랜잭션)
   - `get_chunks(virtual_path) -> list[ChunkRef]`: chunk_index 순 반환
@@ -34,7 +34,7 @@ Phase 2~5는 진입 시 선행 단계의 실측·결정을 반영해 세부 태�
   - `ChunkRef` 데이터클래스를 models.py에 정의
   - _Requirements: 2.1, 2.2, 2.3_
 
-- [ ] 4. storage_pool.write_file을 청크 분할 저장으로 전환
+- [x] 4. storage_pool.write_file을 청크 분할 저장으로 전환
   - 평문을 CHUNK_SIZE(4 MiB)로 split → 청크별 `EncryptionEngine.encrypt`
   - 청크별 `chunk_hash` 계산 → `shard_prefix`로 물리 경로 `<hh>/<chunk_ref>` 결정
   - 로컬 소스 선택 후 `source.write(physical_path, cipherchunk)`
@@ -43,25 +43,25 @@ Phase 2~5는 진입 시 선행 단계의 실측·결정을 반영해 세부 태�
     반쯤 저장 금지). "graceful 건너뛰기" 금지
   - _Requirements: 1.1, 1.2, 1.3, 6.2_
 
-- [ ] 5. storage_pool.read_file / read_ciphertext를 청크 결합으로 전환
+- [x] 5. storage_pool.read_file / read_ciphertext를 청크 결합으로 전환
   - `chunked=1`: `get_chunks`로 매니페스트 조회 → 청크별 로컬 라우팅으로 암호문 확보
     → 청크 해시 검증(chunk-integrity-hash 경로 재사용) → decrypt → 순서대로 join
   - `chunked=0`(레거시): 기존 단일 blob 경로 그대로
   - 청크 누락/불일치 시 어느 chunk_index인지 명시한 규격 에러
   - _Requirements: 1.4, 3.2, 5.1, 6.2_
 
-- [ ] 6. storage_pool.read_range(vpath, offset, length) 부분 읽기 추가
+- [x] 6. storage_pool.read_range(vpath, offset, length) 부분 읽기 추가
   - `chunk_range`로 범위를 덮는 chunk_index만 계산 → 해당 청크만 가져와 복호화
   - 경계 걸침·마지막 부분 청크 처리, 요청 범위로 정확히 잘라 반환
   - _Requirements: 4.1_
 
-- [ ] 7. orphan GC를 샤드 디렉토리 재귀 스캔으로 수정
+- [x] 7. orphan GC를 샤드 디렉토리 재귀 스캔으로 수정
   - `LoopbackSource.list_physical_files`가 루트만 훑던 것을 샤드 서브디렉토리까지
     재귀하도록 변경(`walk.files()` 활용), 청크 파일명 `<hh>/<hex32>_cNNNN`을
     관리 파일로 인식
   - _Requirements: 2.1_
 
-- [ ] 8. Phase 1 검증 테스트 작성
+- [x] 8. Phase 1 검증 테스트 작성
   - 청크 라운드트립: 경계 정렬·부분 청크·빈 파일에서 write→read 바이트 동일
     (Property 1)
   - 청크 독립 복호화: 각 청크가 단독 복호화(청크별 nonce/tag) (Property 2)
