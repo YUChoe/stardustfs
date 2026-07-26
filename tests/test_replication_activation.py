@@ -7,7 +7,7 @@ import pytest
 import pytest_asyncio
 from aiohttp import web
 
-from stardustfs import _RECIPROCITY_FRACTION, _build_parity_store
+from stardustfs import _build_parity_store
 from stardustlib.auth_client import AuthClient
 from stardustlib.replication_hosting import fetch_policy, report_hosting
 
@@ -20,14 +20,15 @@ def _free_port() -> int:
 
 # --- _build_parity_store ---
 
-def test_parity_max_is_half_of_provided(tmp_path):
+def test_parity_max_is_server_quota(tmp_path):
+    """보관 한도는 서버가 정한 호스팅 상한이다(제공 용량 비율 폐기)."""
     config = {
         "metadata_db": str(tmp_path / "m.db"),
-        "replication": {"enabled": True, "provided_bytes": 1000},
+        "replication": {"enabled": True},
     }
-    ps = _build_parity_store(config)
+    ps = _build_parity_store(config, 4096)
     assert ps is not None
-    assert ps._max_bytes == int(1000 * _RECIPROCITY_FRACTION)
+    assert ps._max_bytes == 4096
 
 
 def test_parity_disabled_returns_none(tmp_path):
@@ -36,38 +37,30 @@ def test_parity_disabled_returns_none(tmp_path):
     assert _build_parity_store(config) is None
 
 
-def test_parity_enabled_by_default_with_zero_host_capacity(tmp_path):
-    # replication 섹션이 없어도 기본 활성, provided 미설정 → max 0(타인 보관 안 함)
+def test_parity_without_quota_hosts_nothing(tmp_path):
+    """정책을 받지 못하면(quota=None) 타 사용자 청크를 받지 않는다(한도 0)."""
     ps = _build_parity_store({"metadata_db": str(tmp_path / "m.db")})
     assert ps is not None and ps._max_bytes == 0
 
 
-def test_parity_uses_policy_fraction(tmp_path):
+def test_parity_zero_quota_hosts_nothing(tmp_path):
+    """할당량 0(호스팅 금지)도 한도 0이다."""
+    ps = _build_parity_store(
+        {"metadata_db": str(tmp_path / "m.db"), "replication": {"enabled": True}},
+        0,
+    )
+    assert ps is not None and ps._max_bytes == 0
+
+
+def test_parity_ignores_legacy_config_keys(tmp_path):
+    """레거시 provided_bytes·p2p.parity_max_bytes는 더 이상 한도를 정하지 않는다."""
     config = {
         "metadata_db": str(tmp_path / "m.db"),
         "replication": {"enabled": True, "provided_bytes": 1000},
-    }
-    # 정책 비율 0.25를 주입 → max=250
-    ps = _build_parity_store(config, 0.25)
-    assert ps is not None and ps._max_bytes == 250
-
-
-def test_parity_provided_arg_overrides_config(tmp_path):
-    # 인자로 받은 provided(예: 로컬 총 용량 기본값)가 max = provided*fraction에 반영
-    ps = _build_parity_store(
-        {"metadata_db": str(tmp_path / "m.db"), "replication": {"enabled": True}},
-        0.5, 800,
-    )
-    assert ps is not None and ps._max_bytes == 400
-
-
-def test_parity_legacy_p2p_flag(tmp_path):
-    config = {
-        "metadata_db": str(tmp_path / "m.db"),
-        "p2p": {"parity_enabled": True, "parity_max_bytes": 123},
+        "p2p": {"parity_max_bytes": 123},
     }
     ps = _build_parity_store(config)
-    assert ps is not None and ps._max_bytes == 123
+    assert ps is not None and ps._max_bytes == 0
 
 
 # --- report_hosting ---
@@ -155,6 +148,8 @@ async def test_fetch_policy_success(hosting_server):
     assert policy == {
         "reciprocity_fraction": 0.5, "min_replicas": 3,
         "p2p_enabled": True, "hosting_enabled": True,
+        # 새 필드를 안 주는 서버 → 목표 카피 기본 3, 할당량은 None(미수신)
+        "target_copies": 3, "hosting_quota_bytes": None,
     }
 
 
@@ -191,3 +186,28 @@ async def test_report_hosting_unreachable_graceful():
         assert ok is False
     finally:
         await auth.close()
+
+
+# --- 호스팅 상한 프로비저닝 (스펙 chunk-copy-policy Phase 1) ---
+
+@pytest.mark.asyncio
+async def test_fetch_policy_reads_quota_and_target_copies(hosting_server):
+    """서버가 내려준 목표 카피 수와 호스팅 상한을 읽는다."""
+    hosting_server.policy_extra = {
+        "target_copies": 3, "hosting_quota_bytes": 8192,
+    }
+    auth = _FakeAuth(hosting_server.url)
+    policy = await fetch_policy(auth, hosting_server.url, device_id="dev-1")
+    await auth.close()
+    assert policy["target_copies"] == 3
+    assert policy["hosting_quota_bytes"] == 8192
+
+
+@pytest.mark.asyncio
+async def test_fetch_policy_zero_quota_is_not_none(hosting_server):
+    """할당량 0(호스팅 금지)과 미수신(None)을 구분한다."""
+    hosting_server.policy_extra = {"hosting_quota_bytes": 0}
+    auth = _FakeAuth(hosting_server.url)
+    policy = await fetch_policy(auth, hosting_server.url, device_id="dev-1")
+    await auth.close()
+    assert policy["hosting_quota_bytes"] == 0

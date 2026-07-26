@@ -170,38 +170,21 @@ def _daemon_stop(config_path: str) -> int:
     return 1
 
 
-# 무료 사용자는 제공 용량의 50%를 타 사용자 보관에 제공한다(서버 RECIPROCITY와 일치).
-_RECIPROCITY_FRACTION = 0.5
-
-
-def _build_parity_store(
-    config: dict,
-    fraction: float = _RECIPROCITY_FRACTION,
-    provided_bytes: int | None = None,
-):
+def _build_parity_store(config: dict, quota_bytes: int | None = None):
     """호스트 역할 패리티 스토어를 생성한다(replication.enabled 일 때만, 기본 활성).
 
-    보관 디렉토리는 {metadata_db}.parity. 최대 용량은 provided_bytes * fraction
-    (정책 상호 보관 비율). provided_bytes를 인자로 주면 그 값을, 없으면 config의
-    replication.provided_bytes를, 그것도 없으면 레거시 p2p.parity_max_bytes를,
-    모두 없으면 0(호스팅 안 함)을 사용한다. replication.enabled=false면 None.
+    보관 디렉토리는 {metadata_db}.parity. 최대 용량은 서버가 정한 호스팅 상한
+    (quota_bytes)이다 — 제공 용량의 비율을 예약하던 방식은 폐기됐다. quota_bytes가
+    None(정책 미수신)이면 0으로 두어 타 사용자 청크를 받지 않는다.
+    replication.enabled=false면 None.
     """
     repl = config.get("replication", {})
-    p2p_config = config.get("p2p", {})
     if not repl.get("enabled", True):  # 기본 활성
         return None
     from stardustlib.parity_store import ParityStore
 
     base_dir = config["metadata_db"] + ".parity"
-    if provided_bytes is None and "provided_bytes" in repl:
-        provided_bytes = int(repl["provided_bytes"])
-    if provided_bytes is not None:
-        max_bytes = int(provided_bytes * fraction)
-    elif "parity_max_bytes" in p2p_config:
-        max_bytes = p2p_config["parity_max_bytes"]
-    else:
-        max_bytes = 0
-    return ParityStore(base_dir, max_bytes)
+    return ParityStore(base_dir, quota_bytes or 0)
 
 
 async def startup_v2(config: dict, config_path: str) -> None:
@@ -391,49 +374,40 @@ async def startup_v2(config: dict, config_path: str) -> None:
     # 등록된 device_id를 스토리지 풀에 주입 (파일 변경 추적용)
     storage_pool.device_id = device_mgr.device_id
 
-    # (5-a) 리플리케이션 정책 다운로드(시작 1회) + 제공 용량 신고
-    # 기본 활성(replication.enabled 미지정 시 true), 상호 보관 비율 0.5.
+    # (5-a) 리플리케이션 정책 다운로드(시작 1회). 호스팅 상한은 서버가 정한다
+    # (프로비저닝) — 제공 용량의 비율을 예약하던 방식은 폐기됐다.
     repl_config = config.get("replication", {})  # type: ignore[attr-defined]
     repl_enabled = repl_config.get("enabled", True)
-    # 미설정 시 로컬 총 용량을 제공(상호 보관 0.5 → 타인 최대 50% 사용). 0이면 호스팅 안 함.
-    if "provided_bytes" in repl_config:
-        repl_provided = int(repl_config["provided_bytes"])
-    else:
-        repl_provided = int(storage_pool.get_total_space())
-    repl_fraction = float(repl_config.get("reciprocity_fraction", _RECIPROCITY_FRACTION))
     repl_min = int(repl_config.get("min_replicas", 1))
+    # 서버가 알려준 호스팅 상한(bytes). None이면 아직 받지 못한 상태 → 호스팅 안 함.
+    repl_quota: int | None = None
     # 서버 프로비저닝 스위치(기본 허용). 구버전 서버/도달 불가 시 로컬 설정만 적용.
     policy_p2p_allowed = True
     policy_hosting_allowed = True
 
-    from stardustlib.replication_hosting import fetch_policy, report_hosting
+    from stardustlib.replication_hosting import fetch_policy
 
     # 정책은 P2P 게이팅에도 쓰이므로 replication.enabled와 무관하게 조회한다.
-    policy = await fetch_policy(auth_client, server_url)
+    policy = await fetch_policy(
+        auth_client, server_url, device_id=device_mgr.device_id
+    )
     if policy:
         policy_p2p_allowed = policy["p2p_enabled"]
         policy_hosting_allowed = policy["hosting_enabled"]
         if repl_enabled:
-            repl_fraction = policy["reciprocity_fraction"]
             repl_min = policy["min_replicas"]
+            repl_quota = policy["hosting_quota_bytes"]
         logger.info(
-            "서버 정책 수신: 상호 보관 %.0f%%, 목표 복제본 %d, "
-            "p2p=%s, 호스팅=%s",
-            repl_fraction * 100, repl_min,
+            "서버 정책 수신: 목표 카피 %d, 호스팅 상한 %s, p2p=%s, 호스팅=%s",
+            policy["target_copies"],
+            "미지정" if repl_quota is None else f"{repl_quota} bytes",
             policy_p2p_allowed, policy_hosting_allowed,
         )
-    if repl_enabled:
-        if device_mgr.device_id:
-            # 제공 용량이 0이어도(스토리지 미초기화·호스팅 금지) 신고한다. 신고를
-            # 건너뛰면 서버에 남은 옛 값으로 배치가 계속돼 홀더가 507만 반환한다.
-            ok = await report_hosting(
-                auth_client, server_url, device_mgr.device_id, repl_provided
-            )
-            if ok:
-                logger.info("호스팅 용량 신고: %d bytes (상호 보관 %.0f%%)",
-                            repl_provided, repl_fraction * 100)
-        else:
-            logger.warning("device 미등록 — 호스팅 신고를 건너뜁니다")
+    elif repl_enabled:
+        logger.warning(
+            "정책 조회 실패 — 호스팅 상한을 받지 못해 타 사용자 청크를 "
+            "보관하지 않습니다(내 백업은 그대로 동작)"
+        )
 
     # 로컬 소스 인벤토리를 서버에 신고(리모트 디바이스 GUI의 스토리지 목록용).
     # 실패해도 시작을 막지 않는다.
@@ -535,7 +509,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
         # 타 사용자 청크 보관(호스팅)은 정책으로 별도 제어된다. 금지 시 패리티
         # 보관소를 만들지 않아 replica_* op가 503으로 규격 거부된다.
         if policy_hosting_allowed:
-            parity_store = _build_parity_store(config, repl_fraction, repl_provided)
+            parity_store = _build_parity_store(config, repl_quota)
         else:
             logger.info("서버 정책으로 호스팅 비활성 — 타 사용자 청크를 보관하지 않습니다")
         p2p_server = P2PServer(
@@ -622,43 +596,27 @@ async def startup_v2(config: dict, config_path: str) -> None:
             min_replicas=repl_min, progress=repl_progress,
         )
 
-        def _current_provided() -> int:
-            """지금 이 device가 제공하는 용량(bytes).
-
-            설정에 명시됐으면 그 값, 없으면 현재 스토리지 총량을 다시 읽는다(소스
-            추가·제거 반영). 패리티 보관을 하지 않는 상태(호스팅 금지·보관소 없음)면
-            0이다 — 서버가 이 device를 배치 후보에서 빼도록.
-            """
-            if parity_store is None:
-                return 0
-            if "provided_bytes" in repl_config:
-                return int(repl_config["provided_bytes"])
-            try:
-                return int(storage_pool.get_total_space())
-            except Exception as e:  # noqa: BLE001 — 신고 경로, 비치명
-                logger.warning("제공 용량 계산 실패, 0으로 신고: %s", e)
-                return 0
+        # 서버가 알려준 호스팅 상한을 기억한다. 정책 조회가 실패하면 직전 값을
+        # 유지해, 일시적 네트워크 문제로 보관을 멈추지 않는다.
+        hosting_quota = {"bytes": repl_quota}
 
         async def _apply_policy(policy: dict) -> None:
-            """주기적으로 내려받은 정책을 매니저/패리티에 반영하고 용량을 재신고한다.
+            """주기적으로 내려받은 정책을 매니저/패리티에 반영한다.
 
-            호스팅이 금지로 바뀌면 보관 한도를 0으로 내려 신규 청크 수용을 멈춘다
-            (이미 보관 중인 청크는 소유자가 회수할 수 있도록 유지).
-
-            보관 한도와 서버에 신고하는 제공 용량을 같은 값에서 파생시켜, 서버 배치
-            회계가 홀더의 실제 수용 한도보다 낙관적으로 남는 상태(507 반복)를 막는다.
+            호스팅 상한은 서버가 정한다(프로비저닝). 금지로 바뀌거나 상한이 0이면
+            신규 청크 수용을 멈춘다(이미 보관 중인 청크는 소유자가 회수할 수 있도록
+            유지). 상한 필드가 없으면(구버전 서버) 직전 값을 그대로 쓴다.
             """
             repl_mgr.set_min_replicas(policy["min_replicas"])
-            hosting_allowed = policy.get("hosting_enabled", True)
-            provided = _current_provided() if hosting_allowed else 0
+            if not policy.get("hosting_enabled", True):
+                if parity_store is not None:
+                    parity_store.set_max_bytes(0)
+                return
+            quota = policy.get("hosting_quota_bytes")
+            if quota is not None:
+                hosting_quota["bytes"] = int(quota)
             if parity_store is not None:
-                parity_store.set_max_bytes(
-                    int(provided * policy["reciprocity_fraction"])
-                )
-            if device_mgr.device_id:
-                await report_hosting(
-                    auth_client, server_url, device_mgr.device_id, provided
-                )
+                parity_store.set_max_bytes(hosting_quota["bytes"] or 0)
 
         repl_scheduler = ReplicationScheduler(
             repl_mgr, metadata_store, device_mgr.device_id,
@@ -667,7 +625,10 @@ async def startup_v2(config: dict, config_path: str) -> None:
             heal_grace_seconds=repl_config.get("heal_grace_seconds", 86400),
             max_files_per_cycle=repl_config.get("max_files_per_cycle", 20),
             backup_concurrency=repl_config.get("backup_concurrency", 4),
-            policy_fetcher=lambda: fetch_policy(auth_client, server_url),
+            # device_id를 넘겨 이 기기의 호스팅 상한을 함께 받는다.
+            policy_fetcher=lambda: fetch_policy(
+                auth_client, server_url, device_id=device_mgr.device_id
+            ),
             on_policy=_apply_policy,
             policy_interval=repl_config.get("policy_interval_seconds", 3600),
         )
