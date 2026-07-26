@@ -81,6 +81,8 @@ class _Cloud:
         self.chunk_meta: dict[str, list[dict]] = {}
         self.registry: dict[str, list[str]] = {}
         self.holder_store: dict[str, dict[str, bytes]] = {}
+        # 홀더로 실제 push한 횟수(재전송 생략 검증용)
+        self.store_calls = 0
 
     def attach(self, mgr: ReplicationManager) -> None:
         cloud = self
@@ -101,6 +103,7 @@ class _Cloud:
             return avail if cloud.cap is None else avail[: cloud.cap]
 
         async def holder_store(device_id, address, chunk_id, data, token):
+            cloud.store_calls += 1
             if address in cloud.store_fail:
                 return False
             cloud.holder_store.setdefault(address, {})[chunk_id] = data
@@ -419,6 +422,105 @@ async def test_holder_fetch_udp_before_relay(key):
     mgr._relay_op = fake_relay
     data = await mgr._holder_fetch("devX", "1.2.3.4:9090", "c1", "tok")
     assert data == b"cipher" and relayed["called"] is False
+
+
+# --- pending 재시도 시 확보된 청크 재전송 생략 ---
+
+def test_replicate_skips_already_secured_chunks(key):
+    """같은 내용을 다시 복제하면 이미 목표를 채운 청크는 push하지 않는다."""
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", b"resume" * 100)
+    meta = _FakeMeta({"/f"})
+    mgr, cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
+    try:
+        first = mgr.replicate("/f")
+        calls_after_first = cloud.store_calls
+        second = mgr.replicate("/f")
+    finally:
+        mgr.close()
+
+    assert first.status == "replicated"
+    assert calls_after_first > 0
+    assert second.status == "replicated"
+    assert cloud.store_calls == calls_after_first  # 재전송 없음
+    assert second.replicas_per_chunk == first.replicas_per_chunk
+
+
+def test_replicate_resends_when_content_changed(key):
+    """파일이 바뀌면(청크 해시 불일치) 낡은 사본을 두지 않고 다시 올린다."""
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", b"before" * 100)
+    meta = _FakeMeta({"/f"})
+    mgr, cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
+    try:
+        mgr.replicate("/f")
+        calls_after_first = cloud.store_calls
+        storage_pool.put("/f", b"after!" * 100)  # 내용 변경 → 해시 변경
+        result = mgr.replicate("/f")
+    finally:
+        mgr.close()
+
+    assert result.status == "replicated"
+    assert cloud.store_calls > calls_after_first  # 변경분은 재전송
+
+
+def test_replicate_resends_when_replicas_lost(key):
+    """등록은 남았지만 홀더가 모두 오프라인이면 다시 올린다."""
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/f", b"lost" * 100)
+    meta = _FakeMeta({"/f"})
+    mgr, cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
+    try:
+        mgr.replicate("/f")
+        calls_after_first = cloud.store_calls
+        cloud.offline = {"h1", "h2", "h3"}  # online 복제 0 → 목표 미달
+        cloud.holders = ["h4", "h5", "h6"]  # 새 홀더로 다시 확보
+        result = mgr.replicate("/f")
+    finally:
+        mgr.close()
+
+    assert cloud.store_calls > calls_after_first
+    assert result.status == "replicated"
+
+
+def test_replicate_logs_progress_for_large_file(key, caplog):
+    """청크가 많은 파일은 진행 로그를 남긴다(무응답 오인 방지)."""
+    import logging
+
+    from stardustlib import replication_manager as rm
+
+    storage_pool = _FakeStoragePool(key)
+    # chunk_size=64 → PROGRESS_MIN_CHUNKS(20) 이상이 되도록 충분히 크게
+    storage_pool.put("/big", b"p" * (64 * rm.PROGRESS_MIN_CHUNKS * 2))
+    meta = _FakeMeta({"/big"})
+    mgr, _cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
+    with caplog.at_level(logging.INFO, logger="stardustlib.replication_manager"):
+        try:
+            mgr.replicate("/big")
+        finally:
+            mgr.close()
+
+    progress = [r for r in caplog.records if "복제 진행" in r.getMessage()]
+    assert progress, "대용량 파일인데 진행 로그가 없다"
+    # 마지막 로그는 전체 청크를 처리한 시점을 알린다
+    assert progress[-1].getMessage().split("/")[1].split()[0].isdigit()
+
+
+def test_replicate_small_file_has_no_progress_noise(key, caplog):
+    """청크가 적은 파일은 진행 로그로 로그를 오염시키지 않는다."""
+    import logging
+
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/small", b"s" * 100)  # chunk_size=64 → 2청크
+    meta = _FakeMeta({"/small"})
+    mgr, _cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
+    with caplog.at_level(logging.INFO, logger="stardustlib.replication_manager"):
+        try:
+            mgr.replicate("/small")
+        finally:
+            mgr.close()
+
+    assert not [r for r in caplog.records if "복제 진행" in r.getMessage()]
 
 
 # --- 보관 한도 초과(507) 홀더 배제 ---

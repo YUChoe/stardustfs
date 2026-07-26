@@ -46,6 +46,10 @@ QUOTA_BLOCK_SECONDS = 1800.0
 PLACEMENT_SPARE = 2
 # 홀더 보관 한도 초과 상태 코드(p2p replica_store).
 _QUOTA_STATUS = 507
+# 청크가 이 수 이상인 파일은 복제 진행 로그를 남긴다(대용량 파일 무응답 오인 방지).
+PROGRESS_MIN_CHUNKS = 20
+# 한 파일 복제 중 남길 진행 로그 횟수(진행률 대략 1/N 단위).
+PROGRESS_REPORTS = 10
 
 
 class ReplicationError(Exception):
@@ -317,12 +321,34 @@ class ReplicationManager:
         # 소유자 자신의 device는 홀더에서 제외한다(자기 기기에 백업은 무의미·헤어핀 실패).
         self_dev = getattr(self._storage_pool, "device_id", None)
         base_exclude = [self_dev] if self_dev else []
+        # pending 재시도에서 이미 확보한 청크를 다시 올리지 않기 위한 기존 등록 정보.
+        registered = await self._registered_by_idx(token, file_ref)
         replicas_per_chunk: list[int] = []
-        for idx, data in chunks:
+        skipped = 0
+        total = len(chunks)
+        # 큰 파일은 한 사이클이 수 분 걸리므로 진행 상황을 주기적으로 남긴다
+        # (요청은 받았는데 아무 로그도 없어 멈춘 것처럼 보이는 것을 막는다).
+        report_every = max(1, total // PROGRESS_REPORTS) if total >= (
+            PROGRESS_MIN_CHUNKS
+        ) else 0
+        for done, (idx, data) in enumerate(chunks, start=1):
             chunk_id = self._chunk_id(file_ref, idx)
+            digest = chunker.chunk_hash(data)
+            # 같은 내용으로 이미 목표 복제본을 확보한 청크는 재전송하지 않는다.
+            # 해시가 다르면(파일 수정) 등록된 사본은 낡은 것이므로 다시 올린다.
+            prior = registered.get(idx)
+            if prior is not None and prior.get("hash") == digest:
+                online = await self._online_replicas(token, chunk_id)
+                if online >= self._min_replicas:
+                    replicas_per_chunk.append(online)
+                    skipped += 1
+                    self._log_progress(
+                        done, total, report_every, replicas_per_chunk
+                    )
+                    continue
             await self._register_chunk(
                 token, chunk_id, file_ref, idx, len(data),
-                chunk_hash=chunker.chunk_hash(data),
+                chunk_hash=digest,
             )
             # 한도 초과로 배제 중인 홀더는 매 청크마다 다시 걸러낸다(같은 파일의
             # 첫 청크에서 507이 나면 나머지 청크는 그 홀더를 요청하지 않는다).
@@ -342,7 +368,13 @@ class ReplicationManager:
                     if await self._record_replica(token, chunk_id, device_id):
                         placed += 1
             replicas_per_chunk.append(placed)
+            self._log_progress(done, total, report_every, replicas_per_chunk)
 
+        if skipped:
+            logger.info(
+                "복제 재개: 이미 확보된 청크 %d/%d개 재전송 생략",
+                skipped, total,
+            )
         ok = bool(replicas_per_chunk) and all(
             n >= self._min_replicas for n in replicas_per_chunk
         )
@@ -352,6 +384,44 @@ class ReplicationManager:
             min_replicas=self._min_replicas,
             replicas_per_chunk=replicas_per_chunk,
         )
+
+    def _log_progress(
+        self, done: int, total: int, report_every: int,
+        replicas_per_chunk: list[int],
+    ) -> None:
+        """대용량 파일 복제의 진행 상황을 주기적으로 남긴다(report_every=0이면 무음)."""
+        if not report_every:
+            return
+        if done % report_every and done != total:
+            return
+        ok = sum(1 for n in replicas_per_chunk if n >= self._min_replicas)
+        logger.info("복제 진행: %d/%d 청크 (목표 확보 %d)", done, total, ok)
+
+    async def _registered_by_idx(
+        self, token: str, file_ref: str
+    ) -> dict[int, dict]:
+        """서버에 등록된 이 파일의 청크를 idx로 색인한다(재개 판정용).
+
+        조회 실패(오프라인·구버전 서버)는 비치명이다. 빈 dict를 돌려주면 모든 청크를
+        다시 올리는 기존 동작이 된다.
+        """
+        try:
+            infos = await self._list_chunks(token, file_ref)
+        except Exception as e:  # noqa: BLE001 — 재개 최적화 실패는 비치명
+            logger.debug("기존 청크 조회 실패, 전체 재전송: %s", e)
+            return {}
+        return {
+            info["idx"]: info for info in infos if info.get("idx") is not None
+        }
+
+    async def _online_replicas(self, token: str, chunk_id: str) -> int:
+        """청크의 온라인 복제본 수. 조회 실패 시 0(안전 측 — 다시 올린다)."""
+        try:
+            holders = await self._list_replicas(token, chunk_id)
+        except Exception as e:  # noqa: BLE001 — 비치명
+            logger.debug("복제본 조회 실패(%s): %s", chunk_id[:16], e)
+            return 0
+        return sum(1 for h in holders if h.get("is_online") is not False)
 
     async def _recover_chunks(self, file_ref: str) -> list:
         token = await self._token()
