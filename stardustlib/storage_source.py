@@ -426,18 +426,19 @@ class LoopbackSource(StorageSource):
         """pyfatfs import 실패 원인을 구분해 실행 가능한 메시지로 만든다.
 
         pyfatfs 자체가 없는 것과 그 의존성이 없는 것은 조치가 다르다. 특히
-        `fs`(pyfilesystem2)는 pkg_resources(setuptools 제공)를 import하는데, Python
-        3.12+ venv는 setuptools를 기본 포함하지 않아 pyfatfs가 설치돼 있어도 import가
-        실패한다. 이때 "pyfatfs 미설치"라고만 알리면 이미 설치된 패키지를 다시 확인하게
-        되므로 실제 누락 모듈을 밝힌다.
+        `fs`(pyfilesystem2)는 pkg_resources(setuptools 제공)를 import하는데, pkg_resources는
+        두 가지 이유로 없을 수 있다. (1) Python 3.12+ venv가 setuptools를 기본 포함하지
+        않아 아예 없음. (2) setuptools 81+가 pkg_resources를 제거함(82.0.0에서 완전 삭제,
+        2026-02) — 이 경우 setuptools는 설치돼 있어도 pkg_resources만 사라진다. 어느
+        쪽이든 setuptools<81 설치로 해결되므로 그렇게 안내한다.
         """
         missing = getattr(exc, "name", None)
         if missing == "pkg_resources":
             return (
-                "루프백 사용 불가: pkg_resources 없음(setuptools 미설치). "
-                "pyfatfs가 설치돼 있어도 의존 패키지 fs가 pkg_resources를 "
-                "import하므로 실패한다. 해결: pip install setuptools "
-                "(또는 pip install -r requirements.txt)"
+                "루프백 사용 불가: pkg_resources 없음. 의존 패키지 fs가 이를 "
+                "import하지만 setuptools 81+는 pkg_resources를 제거했고(또는 venv에 "
+                "setuptools가 없음), pyfatfs가 설치돼 있어도 import가 실패한다. "
+                "해결: pip install \"setuptools<81\" (또는 pip install -r requirements.txt)"
             )
         if missing in ("pyfatfs", "fs", "appdirs"):
             return (

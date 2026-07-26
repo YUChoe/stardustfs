@@ -145,17 +145,18 @@ def test_read_only_blocks_write(tmp_path):
 # import 실패 진단 메시지
 #
 # 실환경(다른 PC)에서 "pyfatfs 미설치로 루프백 사용 불가: No module named
-# 'pkg_resources'"가 났는데 pyfatfs는 설치돼 있었다. 실제 원인은 setuptools 부재였고
-# (fs 2.4.16이 pkg_resources를 import한다) 메시지가 오진을 유도했다.
+# 'pkg_resources'"가 났는데 pyfatfs는 설치돼 있었다. 실제 원인은 pkg_resources 부재였다
+# (fs 2.4.16이 이를 import한다). 두 경로로 없어진다: setuptools 미설치, 또는 setuptools
+# 81+가 pkg_resources를 제거(82.0.0 완전 삭제). 어느 쪽이든 setuptools<81로 해결된다.
 # ------------------------------------------------------------------
 
 def test_import_failure_names_setuptools_for_pkg_resources():
-    """pkg_resources 누락은 setuptools 문제로 안내한다(pyfatfs 미설치로 오인 금지)."""
+    """pkg_resources 누락은 setuptools<81 설치로 안내한다(pyfatfs 미설치로 오인 금지)."""
     reason = LoopbackSource._import_failure_reason(
         ModuleNotFoundError("No module named 'pkg_resources'",
                             name="pkg_resources")
     )
-    assert "setuptools" in reason
+    assert "setuptools<81" in reason
     assert "pkg_resources" in reason
     assert "미설치" not in reason.split("pkg_resources")[0]  # pyfatfs 미설치라 안 함
 
