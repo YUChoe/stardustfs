@@ -403,7 +403,7 @@ class LoopbackSource(StorageSource):
         try:
             from pyfatfs.PyFatFS import PyFatFS  # noqa: F401
         except Exception as e:  # noqa: BLE001
-            self._deactivate(f"pyfatfs 미설치로 루프백 사용 불가: {e}")
+            self._deactivate(self._import_failure_reason(e))
             return
         try:
             if not self._is_fat_image():
@@ -420,6 +420,31 @@ class LoopbackSource(StorageSource):
                 self._source_id, e,
             )
             self._active = False
+
+    @staticmethod
+    def _import_failure_reason(exc: Exception) -> str:
+        """pyfatfs import 실패 원인을 구분해 실행 가능한 메시지로 만든다.
+
+        pyfatfs 자체가 없는 것과 그 의존성이 없는 것은 조치가 다르다. 특히
+        `fs`(pyfilesystem2)는 pkg_resources(setuptools 제공)를 import하는데, Python
+        3.12+ venv는 setuptools를 기본 포함하지 않아 pyfatfs가 설치돼 있어도 import가
+        실패한다. 이때 "pyfatfs 미설치"라고만 알리면 이미 설치된 패키지를 다시 확인하게
+        되므로 실제 누락 모듈을 밝힌다.
+        """
+        missing = getattr(exc, "name", None)
+        if missing == "pkg_resources":
+            return (
+                "루프백 사용 불가: pkg_resources 없음(setuptools 미설치). "
+                "pyfatfs가 설치돼 있어도 의존 패키지 fs가 pkg_resources를 "
+                "import하므로 실패한다. 해결: pip install setuptools "
+                "(또는 pip install -r requirements.txt)"
+            )
+        if missing in ("pyfatfs", "fs", "appdirs"):
+            return (
+                f"루프백 사용 불가: {missing} 미설치. "
+                f"해결: pip install -r requirements.txt"
+            )
+        return f"루프백 사용 불가: pyfatfs import 실패: {exc!r}"
 
     def _is_fat_image(self) -> bool:
         """`<path>`가 열리는 FAT 이미지인지 확인한다(read_only 프로브)."""

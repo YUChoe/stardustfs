@@ -28,6 +28,10 @@ sv-ttk==2.6.1
 pyfatfs==1.1.0
 fs==2.4.16
 appdirs==1.4.4
+# fs 2.4.16이 pkg_resources(setuptools 제공)를 import한다. Python 3.12+ venv는
+# setuptools를 기본 포함하지 않으므로 명시해야 한다. 빠지면 pyfatfs import가
+# "No module named 'pkg_resources'"로 실패하고 루프백 소스가 비활성된다.
+setuptools>=68.0.0
 
 # 테스트
 hypothesis==6.152.9

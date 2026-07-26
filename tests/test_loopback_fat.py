@@ -139,3 +139,38 @@ def test_read_only_blocks_write(tmp_path):
     with pytest.raises(Exception):
         ro.write("b.bin", b"nope")
     ro.close()
+
+
+# ------------------------------------------------------------------
+# import 실패 진단 메시지
+#
+# 실환경(다른 PC)에서 "pyfatfs 미설치로 루프백 사용 불가: No module named
+# 'pkg_resources'"가 났는데 pyfatfs는 설치돼 있었다. 실제 원인은 setuptools 부재였고
+# (fs 2.4.16이 pkg_resources를 import한다) 메시지가 오진을 유도했다.
+# ------------------------------------------------------------------
+
+def test_import_failure_names_setuptools_for_pkg_resources():
+    """pkg_resources 누락은 setuptools 문제로 안내한다(pyfatfs 미설치로 오인 금지)."""
+    reason = LoopbackSource._import_failure_reason(
+        ModuleNotFoundError("No module named 'pkg_resources'",
+                            name="pkg_resources")
+    )
+    assert "setuptools" in reason
+    assert "pkg_resources" in reason
+    assert "미설치" not in reason.split("pkg_resources")[0]  # pyfatfs 미설치라 안 함
+
+
+def test_import_failure_names_missing_package():
+    """pyfatfs/fs/appdirs 자체가 없으면 그 패키지 이름을 밝힌다."""
+    for name in ("pyfatfs", "fs", "appdirs"):
+        reason = LoopbackSource._import_failure_reason(
+            ModuleNotFoundError(f"No module named '{name}'", name=name)
+        )
+        assert name in reason
+        assert "requirements.txt" in reason
+
+
+def test_import_failure_unknown_error_is_reported_verbatim():
+    """알 수 없는 실패는 원래 예외를 그대로 담는다(원인 은폐 금지)."""
+    reason = LoopbackSource._import_failure_reason(RuntimeError("boom"))
+    assert "boom" in reason
