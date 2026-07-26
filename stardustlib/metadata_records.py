@@ -11,7 +11,7 @@ import hmac
 import json
 import struct
 
-from stardustlib.models import FileMetadata
+from stardustlib.models import ChunkRef, FileMetadata
 
 # record_id용 subkey 파생 정보 문자열
 _RECORD_ID_INFO = b"stardustfs-record-id"
@@ -77,12 +77,55 @@ def unpad_plaintext(padded: bytes) -> bytes:
     return padded[4:4 + length]
 
 
-def serialize_metadata(fm: FileMetadata) -> bytes:
-    """FileMetadata를 동기화 필드만 담은 JSON bytes로 직렬화한다(패딩 전)."""
+def serialize_metadata(
+    fm: FileMetadata, chunks: list | None = None
+) -> bytes:
+    """FileMetadata를 동기화 필드만 담은 JSON bytes로 직렬화한다(패딩 전).
+
+    청크 표현 파일이면 청크 매니페스트를 `chunks` 배열로 함께 담는다. 동기화 단위는
+    여전히 파일이므로 record_id·CAS·롱폴 프로토콜은 바뀌지 않는다. 레거시 통짜 blob
+    파일은 `chunks`를 생략한다.
+
+    Args:
+        fm: 파일 메타데이터.
+        chunks: ChunkRef 목록(비었거나 None이면 생략).
+    """
     data = {field: getattr(fm, field) for field in _SYNC_FIELDS}
+    if chunks:
+        data["chunks"] = [
+            {
+                "index": c.index,
+                "chunk_ref": c.chunk_ref,
+                "source_id": c.source_id,
+                "device_id": c.device_id,
+                "size": c.size,
+                "hash": c.hash,
+            }
+            for c in sorted(chunks, key=lambda c: c.index)
+        ]
     return json.dumps(
         data, separators=(",", ":"), sort_keys=True
     ).encode("utf-8")
+
+
+def deserialize_chunks(data: bytes) -> list:
+    """레코드 JSON에서 청크 매니페스트를 복원한다.
+
+    `chunks`가 없으면(레거시 레코드 또는 통짜 blob 파일) 빈 목록을 반환한다.
+    """
+    obj = json.loads(data.decode("utf-8"))
+    entries = obj.get("chunks") or []
+    return [
+        ChunkRef(
+            index=e["index"],
+            chunk_ref=e["chunk_ref"],
+            source_id=e["source_id"],
+            device_id=e.get("device_id"),
+            size=e.get("size", 0),
+            hash=e.get("hash"),
+        )
+        for e in sorted(entries, key=lambda e: e["index"])
+    ]
 
 
 def deserialize_metadata(data: bytes) -> FileMetadata:

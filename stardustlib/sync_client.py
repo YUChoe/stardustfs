@@ -661,8 +661,13 @@ class SyncClient:
             except OSError:
                 pass
 
-    def _merge_record(self, server_rec: FileMetadata) -> None:
+    def _merge_record(
+        self, server_rec: FileMetadata, chunks: list | None = None
+    ) -> None:
         """단일 레코드의 version 비교 기반 병합 로직 (tombstone 포함).
+
+        서버 레코드를 채택할 때는 청크 매니페스트도 통째로 채택한다. chunks가 None
+        이면(전체 blob 폴백 경로) 로컬 매니페스트를 그대로 둔다.
 
         병합 규칙:
         1. server_version > local_base_version AND local_version > local_base_version
@@ -681,7 +686,7 @@ class SyncClient:
                 # 로컬에 없는 삭제 레코드 — 전파할 대상 없음
                 return
             # 로컬에 없는 파일 — 서버에서 새로 추가된 파일
-            self._insert_from_server(server_rec)
+            self._insert_from_server(server_rec, chunks)
             logger.info(
                 "Merge: inserted from server: %s (version=%d)",
                 server_rec.virtual_path, server_rec.version,
@@ -708,7 +713,7 @@ class SyncClient:
                 "Merge: CONFLICT %s (server_v=%d, local_v=%d, base_v=%d)",
                 server_rec.virtual_path, server_version, local_version, local_base_version,
             )
-            self._handle_conflict(server_rec, local_rec)
+            self._handle_conflict(server_rec, local_rec, chunks)
         elif server_version > local_version:
             # 서버가 더 최신 → 서버 메타데이터로 갱신 (tombstone 전파 포함)
             if server_rec.deleted:
@@ -724,7 +729,7 @@ class SyncClient:
             # 소유권 이전 감지: 내가 소유하던 레코드가 다른 디바이스 소유로 바뀌면
             # 내 로컬 물리 파일이 orphan이 된다 → 다음 사이클에 GC 필요.
             self._detect_ownership_loss(local_rec, server_rec)
-            self._update_from_server(server_rec)
+            self._update_from_server(server_rec, chunks)
         elif local_version > server_version:
             # 로컬이 더 최신 → 다음 업로드 시 반영 (아무 작업 안 함)
             pass
@@ -754,15 +759,16 @@ class SyncClient:
             storage_pool.mark_gc_needed()
 
     def _handle_conflict(
-        self, server_rec: FileMetadata, local_rec: FileMetadata
+        self, server_rec: FileMetadata, local_rec: FileMetadata,
+        chunks: list | None = None,
     ) -> None:
         """충돌 처리: conflict copy 생성 후 서버 메타데이터를 원본에 적용."""
         try:
             conflict_path = self._conflict_resolver.resolve_conflict(
                 server_rec.virtual_path, server_rec.version
             )
-            # 서버 메타데이터를 원본 경로에 삽입
-            self._insert_from_server(server_rec)
+            # 서버 메타데이터를 원본 경로에 삽입(청크 매니페스트도 함께 채택)
+            self._insert_from_server(server_rec, chunks)
             logger.info(
                 "Conflict resolved: %s → conflict copy: %s",
                 server_rec.virtual_path, conflict_path,
@@ -773,7 +779,33 @@ class SyncClient:
                 server_rec.virtual_path, e,
             )
 
-    def _insert_from_server(self, server_rec: FileMetadata) -> None:
+    def _adopt_chunks(
+        self, virtual_path: str, chunks: list | None, deleted: bool = False
+    ) -> None:
+        """서버 레코드의 청크 매니페스트를 통째로 채택한다.
+
+        chunks가 None이면(전체 blob 폴백 경로) 로컬 매니페스트를 건드리지 않는다.
+        빈 목록이면 서버 표현이 레거시 통짜 blob이라는 뜻이므로 로컬 매니페스트를
+        비운다(표현 불일치 방지).
+
+        tombstone(deleted) 레코드는 매니페스트를 복원하지 않고 비운다. 물리 블록이
+        이미 삭제됐으므로 지워진 청크를 가리키는 매니페스트가 남으면 안 된다.
+        """
+        if chunks is None:
+            return
+        if deleted:
+            self._metadata_store.delete_chunks(virtual_path)
+            self._metadata_store.commit()
+            return
+        if chunks:
+            self._metadata_store.put_chunks(virtual_path, chunks)
+        else:
+            self._metadata_store.delete_chunks(virtual_path)
+        self._metadata_store.commit()
+
+    def _insert_from_server(
+        self, server_rec: FileMetadata, chunks: list | None = None
+    ) -> None:
         """서버 레코드를 로컬 DB에 삽입 (이미 존재하면 갱신). tombstone 포함."""
         existing = self._metadata_store.lookup_any(server_rec.virtual_path)
         deleted_val = 1 if server_rec.deleted else 0
@@ -823,8 +855,13 @@ class SyncClient:
                 ),
             )
             conn.commit()
+        self._adopt_chunks(
+            server_rec.virtual_path, chunks, server_rec.deleted
+        )
 
-    def _update_from_server(self, server_rec: FileMetadata) -> None:
+    def _update_from_server(
+        self, server_rec: FileMetadata, chunks: list | None = None
+    ) -> None:
         """서버 메타데이터로 로컬 레코드를 갱신. tombstone(deleted) 전파 포함.
 
         서버 레코드가 tombstone이면 로컬 물리 파일도 삭제한다.
@@ -834,11 +871,8 @@ class SyncClient:
             local_rec = self._metadata_store.lookup(server_rec.virtual_path)
             if local_rec is not None:
                 try:
-                    source = self._storage_pool._get_source_by_id(
-                        local_rec.source_id
-                    )
-                    if source is not None and source.is_active:
-                        source.delete(local_rec.physical_path)
+                    # 청크 표현이면 청크 전부를, 레거시면 단일 블록을 지운다.
+                    self._storage_pool._delete_local_blocks(local_rec)
                 except FileNotFoundError:
                     pass
                 except Exception as e:
@@ -867,6 +901,9 @@ class SyncClient:
             ),
         )
         conn.commit()
+        self._adopt_chunks(
+            server_rec.virtual_path, chunks, server_rec.deleted
+        )
 
     async def _force_upload(self) -> None:
         """pending 여부와 관계없이 로컬 metadata_db를 서버에 강제 업로드한다."""
@@ -938,6 +975,7 @@ class SyncClient:
             return True
 
         from stardustlib.metadata_records import (
+            deserialize_chunks,
             deserialize_metadata,
             unpad_plaintext,
         )
@@ -949,7 +987,10 @@ class SyncClient:
             padded = self._decrypt_blob(encrypted)
             plaintext = unpad_plaintext(padded)
             server_rec = deserialize_metadata(plaintext)
-            self._merge_record(server_rec)
+            # 청크 매니페스트는 파일 레코드에 함께 실려 온다(없으면 레거시 blob).
+            self._merge_record(
+                server_rec, chunks=deserialize_chunks(plaintext)
+            )
 
         server_version = int(
             data.get("current_version", self._last_synced_version)
@@ -992,7 +1033,9 @@ class SyncClient:
 
             records_payload = []
             for fm in pending:
-                padded = pad_plaintext(serialize_metadata(fm))
+                # 청크 표현이면 매니페스트를 레코드 페이로드에 함께 싣는다.
+                chunks = self._metadata_store.get_chunks(fm.virtual_path)
+                padded = pad_plaintext(serialize_metadata(fm, chunks))
                 encrypted = self._encrypt_blob(padded)
                 records_payload.append({
                     "record_id": record_id_for(subkey, fm.virtual_path),
