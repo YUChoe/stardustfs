@@ -82,10 +82,28 @@ def _reset_local(config: dict, apply: bool) -> None:
             shutil.rmtree(path, ignore_errors=True)
 
 
-def _empty_metadata_blob(config: dict) -> bytes:
-    """빈 메타데이터 DB를 만들어 master.key로 암호화한 blob을 돌려준다.
+def _db_key(master_key: bytes) -> bytes:
+    """master.key에서 메타데이터 DB 키를 파생한다.
 
-    sync_client._encrypt_blob과 같은 형식(iv 12B + tag 16B + ciphertext)이다.
+    stardustfs._build_core와 같은 HKDF 파라미터를 써야 한다. 원본 master.key로
+    암호화하면 클라이언트가 복호화하지 못한다(KeyMismatchError).
+    """
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b"stardustfs-metadata-db",
+        info=b"db-encryption-key",
+    ).derive(master_key)
+
+
+def _empty_metadata_blob(config: dict) -> bytes:
+    """빈 메타데이터 DB를 만들어 db_key로 암호화한 blob을 돌려준다.
+
+    sync_client._encrypt_blob과 같은 형식(iv 12B + tag 16B + ciphertext)이고,
+    키도 같은 HKDF 파생 키를 쓴다.
     """
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -95,7 +113,10 @@ def _empty_metadata_blob(config: dict) -> bytes:
     key = b""
     if key_file and os.path.exists(key_file):
         with open(key_file, "rb") as f:
-            key = f.read()
+            master = f.read()
+        if len(master) != 32:
+            print(f"경고: master.key 길이가 32바이트가 아닙니다({len(master)})")
+        key = _db_key(master) if len(master) == 32 else master
 
     tmp = config["metadata_db"] + ".reset-empty.tmp"
     for leftover in (tmp, tmp + "-wal", tmp + "-shm"):
@@ -222,6 +243,9 @@ def main() -> int:
                         help="master.key도 삭제한다(기본 보존)")
     parser.add_argument("--force-local", action="store_true",
                         help="서버 초기화가 실패해도 로컬을 지운다")
+    parser.add_argument("--server-only", action="store_true",
+                        help="로컬은 건드리지 않고 서버 조치만 수행한다 "
+                             "(잘못된 키로 올린 메타데이터 재업로드 등)")
     args = parser.parse_args()
 
     from stardustlib.config_loader import ConfigLoader
@@ -239,13 +263,21 @@ def main() -> int:
             return 1
         print(f"[주의] {msg}\n")  # 미리보기는 그대로 진행
 
-    if args.server:
-        server_ok = _reset_server(config, args.yes, args.device_id)
+    if args.server or args.server_only:
+        # --server-only는 device 등록을 유지한다(재업로드만 하는 용도).
+        server_ok = _reset_server(
+            config, args.yes,
+            None if args.server_only else args.device_id,
+        )
         if args.yes and not server_ok and not args.force_local:
             print("\n서버 초기화가 실패해 로컬 삭제를 중단했습니다. "
                   "서버가 옛 메타데이터를 들고 있으면 로컬만 지워도 다음 "
                   "동기화에서 되살아납니다. 그래도 지우려면 --force-local.")
             return 1
+
+    if args.server_only:
+        print("\n서버 조치만 수행했습니다(로컬 유지).")
+        return 0
 
     _reset_local(config, args.yes)
 
