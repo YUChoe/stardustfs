@@ -27,6 +27,7 @@ import httpx
 
 from stardustlib import chunker
 from stardustlib.auth_client import AuthClient
+from stardustlib.encryption_engine import EncryptionEngine
 from stardustlib.exceptions import AuthenticationError
 from stardustlib.remote_source import _EventLoopThread, direct_tcp_viable
 
@@ -157,11 +158,8 @@ class ReplicationManager:
         if meta is None:
             raise FileNotFoundError(virtual_path)
 
-        # at-rest 암호문을 그대로 청킹한다(복호화→재암호화 없음). 백업 표현이 저장
-        # 표현과 동일해져 복구 후에도 바이트가 일치하고, 백업 비용이 크게 줄어든다.
-        blob = self._storage_pool.read_ciphertext(virtual_path)
         file_ref = self._file_ref(virtual_path)
-        chunks = chunker.split(blob, self._chunk_size)
+        chunks = self._chunks_to_replicate(virtual_path)
 
         result = self._io.run_coroutine(
             self._replicate_chunks(file_ref, chunks)
@@ -174,20 +172,61 @@ class ReplicationManager:
             )
         return result
 
+    def _chunks_to_replicate(self, virtual_path: str) -> list:
+        """복제할 청크 목록 (idx, 암호문)을 만든다.
+
+        청크 표현 파일은 at-rest 청크를 그대로 복제 청크로 쓴다(재분할 없음). 저장·
+        전송·복제가 같은 경계를 공유하므로 복구 후 바이트가 그대로 일치하고, 청크
+        해시도 재계산 없이 유효하다. 레거시 통짜 blob은 지금처럼 고정 크기로 나눈다.
+        """
+        read_chunks = getattr(self._storage_pool, "read_chunks", None)
+        if callable(read_chunks):
+            parts = read_chunks(virtual_path)
+            if parts:
+                return sorted(parts, key=lambda p: p[0])
+        blob = self._storage_pool.read_ciphertext(virtual_path)
+        return chunker.split(blob, self._chunk_size)
+
     def recover(self, virtual_path: str) -> int:
         """복제본에서 파일을 복구해 로컬에 기록한다. 기록 바이트 수를 반환한다.
+
+        받은 청크가 at-rest 청크 표현이면 청크 그대로 되돌려 기록하고, 레거시 통짜
+        blob이면 이어붙여 단일 블록으로 기록한다. 어느 경우든 재암호화하지 않으므로
+        at-rest 바이트가 복제 시점과 동일하게 유지된다.
 
         도달 가능한 홀더가 없는 청크가 있으면 RecoveryError(누락 chunk_id 명시).
         """
         if self._engine is None:
             raise ReplicationError("암호화 엔진이 없어 복구할 수 없습니다")
         file_ref = self._file_ref(virtual_path)
-        blob = self._io.run_coroutine(self._recover_chunks(file_ref))
-        # 복호화는 검증(GCM 인증 태그)과 평문 크기 확인용이고, 저장은 받은 암호문을
-        # 그대로 한다 — at-rest 바이트가 복제 시점과 동일하게 유지된다.
+        parts = self._io.run_coroutine(self._recover_chunks(file_ref))
+
+        if self._is_chunked_set(parts):
+            # 청크별로 복호화해 검증하고 평문 크기를 합산한다(청크는 단독 복호화 가능).
+            ciphers = [data for _idx, data in parts]
+            plain_size = sum(len(self._engine.decrypt(c)) for c in ciphers)
+            self._storage_pool.write_chunks(virtual_path, ciphers, plain_size)
+            return plain_size
+
+        # 레거시 통짜 blob: 이어붙인 뒤 한 번 복호화해 검증한다.
+        blob = chunker.join(parts)
         plaintext = self._engine.decrypt(blob)
         self._storage_pool.write_ciphertext(virtual_path, blob, len(plaintext))
         return len(plaintext)
+
+    @staticmethod
+    def _is_chunked_set(parts: list) -> bool:
+        """받은 청크들이 at-rest 청크 표현인지 판정한다.
+
+        청크 표현이면 청크마다 독립 암호화되어 각각 암호문 헤더(매직)로 시작한다.
+        레거시 blob을 고정 크기로 나눈 조각은 첫 조각만 매직으로 시작한다.
+        조각이 하나뿐이면 두 표현이 동일하므로 단일 blob 경로로 처리한다.
+        """
+        if len(parts) < 2:
+            return False
+        return all(
+            data[:4] == EncryptionEngine.MAGIC for _idx, data in parts
+        )
 
     def ensure_replicas(self, virtual_path: str) -> HealReport:
         """건강성을 점검해 부족한 청크의 복제본을 채운다(재복제).
@@ -264,7 +303,7 @@ class ReplicationManager:
             replicas_per_chunk=replicas_per_chunk,
         )
 
-    async def _recover_chunks(self, file_ref: str) -> bytes:
+    async def _recover_chunks(self, file_ref: str) -> list:
         token = await self._token()
         chunk_infos = await self._list_chunks(token, file_ref)
         if not chunk_infos:
@@ -289,7 +328,9 @@ class ReplicationManager:
             raise RecoveryError(
                 f"도달 가능한 홀더가 없는 청크 {len(missing)}개", missing
             )
-        return chunker.join(parts)
+        # 이어붙이지 않고 (idx, 암호문) 목록을 그대로 돌려준다. 호출자가 청크 표현
+        # 여부를 판정해 청크로 되돌리거나 단일 블록으로 합친다.
+        return sorted(parts, key=lambda p: p[0])
 
     async def _ensure_chunks(self, file_ref: str) -> HealReport:
         token = await self._token()

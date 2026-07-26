@@ -133,3 +133,42 @@ def test_chunk_ref_rejects_negative_index():
     """음수 인덱스는 규격 에러."""
     with pytest.raises(ValueError):
         chunker.chunk_ref(-1)
+
+
+# ------------------------------------------------------------------
+# 샤딩 깊이
+# ------------------------------------------------------------------
+
+def test_shard_prefix_depth_two_makes_hierarchy():
+    """depth=2면 단계마다 hex_len자씩 잘라 계층 경로를 만든다."""
+    digest = "abcdef" + "0" * 58
+    assert chunker.shard_prefix(digest, depth=1) == "ab"
+    assert chunker.shard_prefix(digest, depth=2) == "ab/cd"
+    assert chunker.shard_prefix(digest, depth=3) == "ab/cd/ef"
+
+
+def test_shard_prefix_rejects_bad_depth():
+    """depth가 0 이하이거나 해시가 짧으면 규격 에러."""
+    with pytest.raises(ValueError):
+        chunker.shard_prefix("ab" * 32, depth=0)
+    with pytest.raises(ValueError):
+        chunker.shard_prefix("abc", depth=2)
+
+
+def test_shard_depth_stays_one_for_small_volumes():
+    """작은 볼륨은 1단계(256 샤드)로 충분하다."""
+    # 10 MiB 최소 루프백부터 256 GiB까지 1단계
+    assert chunker.shard_depth_for(10 * 1024 * 1024) == 1
+    assert chunker.shard_depth_for(256 * 1024 ** 3) == 1
+
+
+def test_shard_depth_deepens_for_large_volumes():
+    """디렉토리당 청크 수가 임계치를 넘을 만큼 크면 한 단계 깊어진다."""
+    # 1단계 수용량 = 256 샤드 x 512 청크 x 4 MiB = 512 GiB
+    assert chunker.shard_depth_for(512 * 1024 ** 3) == 1
+    assert chunker.shard_depth_for(2 * 1024 ** 4) == 2      # 2 TiB
+
+
+def test_shard_depth_rejects_bad_chunk_size():
+    with pytest.raises(ValueError):
+        chunker.shard_depth_for(1024, chunk_size=0)

@@ -21,6 +21,11 @@ DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MiB
 # 점유해 큰 볼륨에서 낭비가 크고 작은 볼륨은 여유가 없으므로 1단계를 기본으로 둔다.
 SHARD_HEX_LEN = 2
 
+# 한 디렉토리가 감당할 청크 수 상한. 실측에서 평면 배치는 500개까지는 기준선 속도를
+# 유지했고 1000개 시점에 배치 시간이 2배가 됐다. 이 경계 아래로 유지하도록 샤딩 깊이를
+# 정한다(초과가 예상되면 한 단계 더 깊게 나눈다).
+MAX_CHUNKS_PER_SHARD = 512
+
 
 def chunk_hash(data: bytes) -> str:
     """청크 암호문의 SHA-256 hex(64자)를 반환한다.
@@ -78,23 +83,58 @@ def chunk_range(
     return list(range(first, last + 1))
 
 
-def shard_prefix(chunk_hash: str, hex_len: int = SHARD_HEX_LEN) -> str:
-    """청크 암호문 해시에서 서브디렉토리 이름(앞 hex_len자)을 뽑는다.
+def shard_prefix(
+    chunk_hash: str, hex_len: int = SHARD_HEX_LEN, depth: int = 1
+) -> str:
+    """청크 암호문 해시에서 서브디렉토리 경로를 만든다.
 
     샤드 키로 파일 단위 식별자(uuid 접두사)를 쓰면 한 파일의 모든 청크가 같은
     디렉토리로 몰려 디렉토리 엔트리 폭증이 재현된다. 청크마다 달라지는 암호문 해시를
     써야 균등하게 분산된다.
 
+    depth가 2 이상이면 `ab/cd`처럼 단계마다 hex_len자씩 잘라 계층을 만든다.
+
     Raises:
-        ValueError: hex_len이 1 미만이거나 해시가 그보다 짧을 때.
+        ValueError: hex_len/depth가 1 미만이거나 해시가 필요한 길이보다 짧을 때.
     """
     if hex_len <= 0:
         raise ValueError("hex_len은 1 이상이어야 합니다")
-    if len(chunk_hash) < hex_len:
+    if depth <= 0:
+        raise ValueError("depth는 1 이상이어야 합니다")
+    need = hex_len * depth
+    if len(chunk_hash) < need:
         raise ValueError(
-            f"청크 해시가 너무 짧습니다: {len(chunk_hash)} < {hex_len}"
+            f"청크 해시가 너무 짧습니다: {len(chunk_hash)} < {need}"
         )
-    return chunk_hash[:hex_len]
+    return "/".join(
+        chunk_hash[i * hex_len:(i + 1) * hex_len] for i in range(depth)
+    )
+
+
+def shard_depth_for(
+    capacity_bytes: int, chunk_size: int = DEFAULT_CHUNK_SIZE,
+    hex_len: int = SHARD_HEX_LEN,
+) -> int:
+    """소스 용량에 맞는 샤딩 깊이를 정한다.
+
+    예상 청크 수(capacity/chunk_size)를 샤드 수(16^(hex_len*depth))로 나눈 값이
+    MAX_CHUNKS_PER_SHARD를 넘지 않는 최소 깊이를 고른다. 각 서브디렉토리가 최소
+    1클러스터를 점유하므로 필요 이상으로 깊게 나누지 않는다(작은 볼륨에서는 낭비,
+    큰 볼륨에서만 한 단계 더 깊어진다).
+
+    Raises:
+        ValueError: chunk_size가 1 미만일 때.
+    """
+    if chunk_size <= 0:
+        raise ValueError("청크 크기는 1 이상이어야 합니다")
+    expected = max(0, capacity_bytes) // chunk_size
+    depth = 1
+    while depth < 4:
+        shards = (16 ** hex_len) ** depth
+        if expected <= shards * MAX_CHUNKS_PER_SHARD:
+            return depth
+        depth += 1
+    return depth
 
 
 def chunk_ref(index: int) -> str:

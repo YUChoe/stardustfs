@@ -557,6 +557,83 @@ class StoragePool:
             )
         return self._read_resolved_ciphertext(metadata)
 
+    def read_chunks(self, virtual_path: str) -> list:
+        """at-rest 청크 암호문을 (chunk_index, bytes) 목록으로 반환한다.
+
+        복제(replicate)에서 재분할 없이 그대로 복제 청크로 쓰기 위한 경로다. 저장된
+        청크 경계를 그대로 넘겨주므로 at-rest·복제 표현이 완전히 일치한다.
+        레거시 통짜 blob 파일은 빈 목록을 반환한다(호출자가 read_ciphertext로 처리).
+
+        Raises:
+            FileNotFoundError: 파일이 존재하지 않을 때.
+            OSError: 청크가 누락됐거나 보관처에 도달할 수 없을 때.
+        """
+        self._resolve_metadata(virtual_path)
+        chunks = self.metadata_store.get_chunks(virtual_path)
+        return [
+            (c.index, self._read_chunk_bytes(virtual_path, c)) for c in chunks
+        ]
+
+    def migrate_to_chunks(self, virtual_path: str) -> bool:
+        """레거시 통짜 blob 파일을 청크 표현으로 전환한다(무손실).
+
+        전환 순서가 무손실을 보장한다: 원본 blob을 읽어 평문을 확보하고, 청크를 모두
+        기록·커밋한 뒤에야 원본 blob을 지운다. 중간에 실패하면 원본 blob과 메타데이터가
+        그대로 남아 파일을 계속 읽을 수 있다(청크 쪽 잔여물은 orphan GC가 회수).
+
+        Args:
+            virtual_path: 전환할 파일의 가상 경로.
+
+        Returns:
+            전환했으면 True. 이미 청크 표현이면 False(할 일 없음).
+
+        Raises:
+            FileNotFoundError: 파일이 존재하지 않을 때.
+            OSError: 원격 소유 파일이거나 소스가 비활성일 때.
+            InsufficientStorageError: 청크를 놓을 공간이 없을 때(원본은 보존).
+        """
+        metadata = self._resolve_metadata(virtual_path)
+        if self.metadata_store.get_chunks(virtual_path):
+            return False  # 이미 청크 표현
+        if not self._is_local_owner(metadata):
+            raise OSError(
+                f"원격 소유 파일은 그 기기가 전환합니다: {virtual_path}"
+            )
+
+        # 평문을 먼저 확보한다(원본 blob은 아직 그대로 둔다).
+        data = self.read_file(virtual_path)
+        self._store_chunks(virtual_path, self._encrypt_to_chunks(data), len(data))
+        # 원본 blob 삭제는 _store_chunks가 커밋 후에 수행한다
+        # (_discard_previous_representation). 실패해도 고아 블록은 orphan GC가 회수한다.
+        logger.info("blob→청크 전환 완료: %s", virtual_path)
+        return True
+
+    def _encrypt_to_chunks(self, data: bytes) -> list:
+        """평문을 CHUNK_SIZE로 나눠 청크별로 암호화한다.
+
+        빈 파일도 청크 1개(빈 평문)로 표현해 읽기 경로를 단일화한다.
+        """
+        cipher_chunks = [
+            self._encrypt_chunk(part)
+            for _idx, part in chunker.split(data, CHUNK_SIZE)
+        ]
+        return cipher_chunks or [self._encrypt_chunk(b"")]
+
+    def write_chunks(
+        self, virtual_path: str, cipher_chunks: list, plain_size: int
+    ) -> None:
+        """at-rest 청크 암호문들을 재암호화 없이 그대로 저장한다.
+
+        복제본 복구(recover)에서 사용한다. 홀더가 보관한 청크 바이트가 곧 at-rest
+        표현이므로 그대로 기록하면 등록된 청크 해시가 복구 후에도 유효하다.
+
+        Args:
+            virtual_path: 가상 파일 경로.
+            cipher_chunks: 인덱스 순으로 정렬된 청크 암호문 목록.
+            plain_size: 메타데이터에 기록할 평문 크기.
+        """
+        self._store_chunks(virtual_path, cipher_chunks, plain_size)
+
     def _read_resolved_ciphertext(self, metadata) -> bytes:
         """이미 해석된 메타데이터로 레거시 단일 blob 암호문을 읽는다."""
         if self._is_local_owner(metadata):
@@ -733,10 +810,7 @@ class StoragePool:
         try:
             for index, cipher in enumerate(cipher_chunks):
                 digest = chunker.chunk_hash(cipher)
-                ref = (
-                    f"{chunker.shard_prefix(digest)}/"
-                    f"{chunker.chunk_ref(index)}"
-                )
+                ref = self._chunk_path(preferred, digest, index)
                 placed = self._place_one_chunk(
                     ref, cipher, preferred, index, len(cipher_chunks)
                 )
@@ -757,6 +831,28 @@ class StoragePool:
             self._cleanup_chunks(written)
             raise
         return refs, written
+
+    @staticmethod
+    def _chunk_path(source, digest: str, index: int) -> str:
+        """청크의 소스 내 물리 경로 `<샤드…>/<chunk_ref>`를 만든다.
+
+        샤딩 깊이는 소스 용량에서 정한다. 큰 볼륨은 한 단계 더 깊게 나눠 디렉토리당
+        엔트리 수를 실측 임계치 아래로 유지하고, 작은 볼륨은 1단계로 둬 서브디렉토리
+        클러스터 낭비를 피한다. 경로는 매니페스트에 그대로 저장되므로 깊이가 소스마다
+        달라도(또는 나중에 바뀌어도) 읽기에는 영향이 없다.
+        """
+        depth = 1
+        if source is not None:
+            try:
+                depth = chunker.shard_depth_for(
+                    source.get_total_space(), CHUNK_SIZE
+                )
+            except Exception:  # noqa: BLE001 — 용량을 모르면 기본 깊이
+                depth = 1
+        return (
+            f"{chunker.shard_prefix(digest, depth=depth)}/"
+            f"{chunker.chunk_ref(index)}"
+        )
 
     def _place_one_chunk(
         self, ref: str, cipher: bytes, preferred, index: int, count: int
@@ -931,27 +1027,11 @@ class StoragePool:
         Raises:
             InsufficientStorageError: 공간 부족 시.
         """
-        existing = self.metadata_store.lookup(virtual_path)
-        if (
-            existing is not None
-            and self._is_local_owner(existing)
-            and not self.metadata_store.get_chunks(virtual_path)
-        ):
-            # 레거시 통짜 blob 파일의 덮어쓰기는 표현을 그대로 유지한다(같은 물리
-            # 위치에 덮어쓴다). blob→청크 전환은 별도 마이그레이션 단계에서 다룬다.
-            self._store_encrypted(
-                virtual_path, self._encrypt_chunk(data), len(data)
-            )
-            return
-
-        cipher_chunks = [
-            self._encrypt_chunk(part)
-            for _idx, part in chunker.split(data, CHUNK_SIZE)
-        ]
-        if not cipher_chunks:
-            # 빈 파일도 청크 1개(빈 평문)로 표현해 읽기 경로를 단일화한다.
-            cipher_chunks = [self._encrypt_chunk(b"")]
-        self._store_chunks(virtual_path, cipher_chunks, len(data))
+        # 레거시 통짜 blob 파일을 수정하면 청크 표현으로 전환된다. 원본 blob은 청크
+        # 커밋이 성공한 뒤에 정리되므로 중간 실패에도 데이터를 잃지 않는다.
+        self._store_chunks(
+            virtual_path, self._encrypt_to_chunks(data), len(data)
+        )
 
     def write_ciphertext(
         self, virtual_path: str, encrypted: bytes, plain_size: int

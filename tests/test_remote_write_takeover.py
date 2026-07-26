@@ -69,8 +69,12 @@ class TestTakeover:
             store.close()
             shutil.rmtree(d, ignore_errors=True)
 
-    def test_legacy_null_owner_write_overwrites(self):
-        """device_id NULL 레거시 레코드 수정은 덮어쓰기(이전 아님)."""
+    def test_legacy_null_owner_write_is_not_takeover(self):
+        """device_id NULL 레거시 레코드 수정은 소유권 이전이 아니다.
+
+        수정 시 청크 표현으로 전환되므로 물리 위치는 바뀐다(마이그레이션). 여기서
+        지켜야 할 것은 소유권 이전 취급을 받지 않는다는 점이다.
+        """
         d = tempfile.mkdtemp()
         storage_pool, store, _src = _make_storage_pool(d, "dev-A")
         try:
@@ -83,8 +87,10 @@ class TestTakeover:
             storage_pool.write_file("/legacy.txt", b"new")
 
             rec = store.lookup("/legacy.txt")
-            # 같은 위치 덮어쓰기 (takeover 아님)
-            assert rec.physical_path == "legacy_phys.txt"
+            # takeover가 아니므로 로컬 소유로 남고 GC 플래그도 서지 않는다.
+            assert rec.device_id == "dev-A"
+            assert storage_pool._gc_needed is False
+            assert store.get_chunks("/legacy.txt")   # 청크 표현으로 전환
             assert storage_pool.read_file("/legacy.txt") == b"new"
         finally:
             store.close()

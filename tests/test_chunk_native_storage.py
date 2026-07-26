@@ -237,8 +237,8 @@ def test_legacy_blob_still_readable(pool):
     assert sp.read_range("/legacy.bin", 10, 50) == plain[10:60]
 
 
-def test_legacy_overwrite_keeps_blob_representation(pool):
-    """레거시 blob 덮어쓰기는 표현을 유지한다(전환은 마이그레이션 단계)."""
+def test_legacy_overwrite_converts_to_chunks(pool):
+    """레거시 blob을 수정하면 청크 표현으로 전환된다 (Requirement 5.2)."""
     sp, store, src = pool
     engine = EncryptionEngine(b"\x02" * 32)
     phys = "b" * 32 + "_legacy.bin"
@@ -247,9 +247,8 @@ def test_legacy_overwrite_keeps_blob_representation(pool):
 
     sp.write_file("/legacy.bin", b"new content")
 
-    rec = store.lookup("/legacy.bin")
-    assert rec.physical_path == phys          # 같은 물리 위치
-    assert not store.get_chunks("/legacy.bin")  # 여전히 레거시
+    assert store.get_chunks("/legacy.bin")      # 청크 표현으로 전환됨
+    assert not src.exists(phys)                 # 원본 blob은 커밋 후 정리됨
     assert sp.read_file("/legacy.bin") == b"new content"
 
 
@@ -508,3 +507,94 @@ def test_live_chunk_paths_scopes_to_device():
         store.close()
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+# ------------------------------------------------------------------
+# 레거시 blob → 청크 마이그레이션 (Requirement 5.2, 5.3 / Property 6)
+# ------------------------------------------------------------------
+
+def _seed_legacy(sp, store, src, vpath, plain, name="legacy"):
+    """레거시 통짜 blob 파일을 심는다."""
+    engine = EncryptionEngine(b"\x02" * 32)
+    phys = "d" * 32 + f"_{name}.bin"
+    src.write(phys, engine.encrypt(plain))
+    store.insert(vpath, "src-1", phys, len(plain), 1.0, 1.0, device_id="dev-A")
+    return phys
+
+
+def test_migrate_converts_blob_to_chunks(pool):
+    """마이그레이션으로 선택된 레거시 파일이 청크 표현이 된다."""
+    sp, store, src = pool
+    plain = os.urandom(SMALL_CHUNK * 2 + 13)
+    phys = _seed_legacy(sp, store, src, "/legacy.bin", plain)
+
+    assert sp.migrate_to_chunks("/legacy.bin") is True
+
+    chunks = store.get_chunks("/legacy.bin")
+    assert len(chunks) == 3                      # 1 KiB 청크 기준
+    assert not src.exists(phys)                  # 원본 blob 정리됨
+    assert sp.read_file("/legacy.bin") == plain   # 평문 동일
+    assert store.lookup("/legacy.bin").file_size == len(plain)
+
+
+def test_migrate_is_noop_for_chunked_file(pool):
+    """이미 청크 표현이면 아무 것도 하지 않는다."""
+    sp, store, _src = pool
+    sp.write_file("/f.bin", os.urandom(SMALL_CHUNK))
+    before = store.get_chunks("/f.bin")
+
+    assert sp.migrate_to_chunks("/f.bin") is False
+    assert [c.chunk_ref for c in store.get_chunks("/f.bin")] == [
+        c.chunk_ref for c in before
+    ]
+
+
+def test_migrate_missing_file_raises(pool):
+    """없는 파일은 규격 에러."""
+    sp, _store, _src = pool
+    with pytest.raises(FileNotFoundError):
+        sp.migrate_to_chunks("/nope.bin")
+
+
+def test_migrate_preserves_original_on_failure(pool, monkeypatch):
+    """전환 중 실패해도 원본 blob과 메타데이터가 온전하다 (Property 6).
+
+    청크 기록이 실패하면 매니페스트를 커밋하지 않으므로 파일은 여전히 레거시 blob으로
+    읽힌다(무손실).
+    """
+    sp, store, src = pool
+    plain = os.urandom(SMALL_CHUNK * 2)
+    phys = _seed_legacy(sp, store, src, "/keep.bin", plain, name="keep")
+
+    # 두 번째 청크 기록에서 실패를 주입한다.
+    calls = {"n": 0}
+    original_write = src.write
+
+    def flaky_write(path, blob):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("injected write failure")
+        original_write(path, blob)
+
+    monkeypatch.setattr(src, "write", flaky_write)
+
+    with pytest.raises(OSError):
+        sp.migrate_to_chunks("/keep.bin")
+
+    monkeypatch.setattr(src, "write", original_write)
+    # 원본이 그대로 남아 계속 읽힌다.
+    assert src.exists(phys)
+    assert store.get_chunks("/keep.bin") == []   # 매니페스트 미커밋
+    assert sp.read_file("/keep.bin") == plain
+
+
+def test_migrate_then_replication_hashes_valid(pool):
+    """전환 후 청크 해시가 실제 저장 바이트와 일치한다."""
+    sp, store, src = pool
+    plain = os.urandom(SMALL_CHUNK * 2 + 1)
+    _seed_legacy(sp, store, src, "/m.bin", plain, name="m")
+
+    sp.migrate_to_chunks("/m.bin")
+
+    for chunk in store.get_chunks("/m.bin"):
+        assert chunker.chunk_hash(src.read(chunk.chunk_ref)) == chunk.hash
