@@ -121,21 +121,65 @@ def _empty_metadata_blob(config: dict) -> bytes:
     return iv + ct_with_tag[-16:] + ct_with_tag[:-16]
 
 
+def _valid_token(config: dict, server_url: str) -> str | None:
+    """저장된 자격증명으로 유효한 access token을 얻는다(만료 시 refresh).
+
+    저장된 access_token을 그대로 쓰면 만료된 경우 401이 나므로, AuthClient의
+    갱신 경로를 그대로 탄다.
+    """
+    import asyncio
+
+    from stardustlib.auth_client import AuthClient
+    from stardustlib.credential_store import CredentialStore
+
+    store = CredentialStore(config["metadata_db"])
+    auth = AuthClient(server_url, credential_store=store)
+    if not auth.load_from_store():
+        print("자격증명을 불러오지 못했습니다")
+        return None
+
+    async def run() -> str | None:
+        try:
+            return await auth.get_valid_token()
+        except Exception as e:  # noqa: BLE001 — 만료·네트워크 실패
+            print(f"토큰 갱신 실패: {e}")
+            return None
+        finally:
+            await auth.close()
+
+    return asyncio.run(run())
+
+
 def _reset_server(
     config: dict, apply: bool, device_id: str | None = None
-) -> None:
-    """서버의 이 계정 메타데이터를 빈 DB로 덮어쓰고 이 device 등록을 삭제한다."""
+) -> bool:
+    """서버의 이 계정 메타데이터를 빈 DB로 덮어쓰고 이 device 등록을 삭제한다.
+
+    성공하면 True. 실패(토큰 만료·네트워크·비-2xx)면 False — 호출자는 로컬 삭제를
+    멈춰야 한다. 서버가 옛 메타데이터를 들고 있는 채로 로컬만 지우면 다음 동기화에서
+    그대로 되살아난다.
+    """
     import httpx
 
     cred_path = config["metadata_db"] + ".credentials.json"
     if not os.path.exists(cred_path):
         print(f"자격 파일 없음, 서버 초기화 건너뜀: {cred_path}")
-        return
+        return False
     with open(cred_path, encoding="utf-8") as f:
         cred = json.load(f)
     url = cred["server_url"].rstrip("/")
-    headers = {"Authorization": f"Bearer {cred['access_token']}"}
 
+    token = cred["access_token"]
+    if apply:
+        fresh = _valid_token(config, url)
+        if not fresh:
+            print("유효한 토큰을 얻지 못해 서버 초기화를 건너뜁니다 "
+                  "(로그인 후 다시 --server로 실행하세요)")
+            return False
+        token = fresh
+    headers = {"Authorization": f"Bearer {token}"}
+
+    ok = True
     blob = _empty_metadata_blob(config)
     print(f"{'업로드' if apply else '업로드 예정'}: 빈 메타데이터 "
           f"{len(blob):,} bytes → PUT {url}/sync/metadata (강제 덮어쓰기)")
@@ -145,6 +189,7 @@ def _reset_server(
                 f"{url}/sync/metadata", headers=headers, content=blob,
             )
             print(f"  → HTTP {resp.status_code} {resp.text[:200]}")
+            ok = ok and resp.status_code == 200
 
     # 이 device 등록 삭제 → hosting/replicas가 CASCADE로 정리된다.
     if not device_id:
@@ -155,12 +200,15 @@ def _reset_server(
     if not device_id:
         print("device_id를 알 수 없어 device 삭제를 건너뜁니다 "
               "(--device-id로 지정하세요. 서버 chunks 행은 어느 경우에도 남습니다)")
-        return
+        return ok
     print(f"{'삭제' if apply else '삭제 예정'}: DELETE {url}/devices/{device_id}")
     if apply:
         with httpx.Client(timeout=30.0) as client:
             resp = client.delete(f"{url}/devices/{device_id}", headers=headers)
             print(f"  → HTTP {resp.status_code}")
+            # 204=삭제됨, 404=이미 없음(멱등적으로 성공 취급)
+            ok = ok and resp.status_code in (200, 204, 404)
+    return ok
 
 
 def main() -> int:
@@ -172,6 +220,8 @@ def main() -> int:
     parser.add_argument("--device-id", help="서버에서 삭제할 device_id 직접 지정")
     parser.add_argument("--reset-key", action="store_true",
                         help="master.key도 삭제한다(기본 보존)")
+    parser.add_argument("--force-local", action="store_true",
+                        help="서버 초기화가 실패해도 로컬을 지운다")
     args = parser.parse_args()
 
     from stardustlib.config_loader import ConfigLoader
@@ -190,7 +240,12 @@ def main() -> int:
         print(f"[주의] {msg}\n")  # 미리보기는 그대로 진행
 
     if args.server:
-        _reset_server(config, args.yes, args.device_id)
+        server_ok = _reset_server(config, args.yes, args.device_id)
+        if args.yes and not server_ok and not args.force_local:
+            print("\n서버 초기화가 실패해 로컬 삭제를 중단했습니다. "
+                  "서버가 옛 메타데이터를 들고 있으면 로컬만 지워도 다음 "
+                  "동기화에서 되살아납니다. 그래도 지우려면 --force-local.")
+            return 1
 
     _reset_local(config, args.yes)
 
