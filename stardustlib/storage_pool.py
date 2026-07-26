@@ -182,7 +182,7 @@ class StoragePool:
             return {"ok": False, "moved": [], "unmoved": [], "error": "no source"}
         moved: list[str] = []
         unmoved: list[str] = []
-        for meta in self.metadata_store.list_files_in_source(source_id):
+        for meta in self._files_to_evacuate(source_id):
             # 로컬 소유(또는 레거시 NULL)만 이동. 원격 소유는 그 디바이스가 보관.
             if meta.device_id is not None and meta.device_id != self.device_id:
                 continue
@@ -224,6 +224,24 @@ class StoragePool:
                 unmoved.append(meta.virtual_path)
         return {"ok": not unmoved, "moved": moved, "unmoved": unmoved}
 
+    def _files_to_evacuate(self, source_id: str) -> list:
+        """소스를 비우기 위해 옮겨야 할 활성 파일 목록을 모은다.
+
+        files.source_id로 잡히는 파일(레거시 blob·첫 청크 기준)과, 첫 청크는 다른
+        소스에 있지만 이 소스에 청크를 남긴 파일을 합친다. 후자를 빠뜨리면 detach 시
+        청크가 소스에 남아 사라진다.
+        """
+        metas = list(self.metadata_store.list_files_in_source(source_id))
+        seen = {m.virtual_path for m in metas}
+        for vpath in self.metadata_store.list_chunked_paths_in_source(source_id):
+            if vpath in seen:
+                continue
+            meta = self.metadata_store.lookup(vpath)
+            if meta is not None:
+                metas.append(meta)
+                seen.add(vpath)
+        return metas
+
     def _evacuate_chunks(self, meta, source_id: str) -> bool:
         """청크 표현 파일의 청크를 남은 로컬 소스로 옮긴다(무손실).
 
@@ -242,17 +260,26 @@ class StoragePool:
                     chunk.size, exclude_ids=(source_id,)
                 )
             except InsufficientStorageError:
-                logger.warning(
-                    "청크 evacuate 대상 없음: %s chunk_index=%d",
-                    meta.virtual_path, chunk.index,
-                )
-                return False
+                target = None
             try:
                 blob = src.read(chunk.chunk_ref)
-                target.write(chunk.chunk_ref, blob)  # 대상 기록 먼저
+                if target is not None:
+                    target.write(chunk.chunk_ref, blob)  # 대상 기록 먼저
+                    new_source_id = target.source_id
+                    new_device_id = self.device_id
+                else:
+                    # 남은 로컬 소스가 없다 → 온라인 원격 기기로 청크를 옮긴다.
+                    placed = self._push_chunk_to_remote(chunk.chunk_ref, blob)
+                    if placed is None:
+                        logger.warning(
+                            "청크 evacuate 대상 없음(로컬·원격): %s chunk_index=%d",
+                            meta.virtual_path, chunk.index,
+                        )
+                        return False
+                    _remote, new_source_id, new_device_id = placed
                 self.metadata_store.update_chunk_location(
                     meta.virtual_path, chunk.index,
-                    target.source_id, self.device_id,
+                    new_source_id, new_device_id,
                 )
                 try:
                     src.delete(chunk.chunk_ref)  # 성공 후 원본 삭제
@@ -269,7 +296,8 @@ class StoragePool:
         if chunks:
             self.metadata_store.update(
                 meta.virtual_path, file_size=meta.file_size,
-                modified_at=meta.modified_at, device_id=self.device_id,
+                modified_at=meta.modified_at,
+                device_id=self.device_id,   # 파일 레코드 소유자는 그대로
                 source_id=chunks[0].source_id,
                 physical_path=chunks[0].chunk_ref,
             )
@@ -458,12 +486,13 @@ class StoragePool:
             OSError: 소스가 비활성 상태이거나 청크가 누락됐을 때.
         """
         metadata = self._resolve_metadata(virtual_path)
-        if self._is_local_owner(metadata):
-            chunks = self.metadata_store.get_chunks(virtual_path)
-            if chunks:
-                return b"".join(
-                    self._decrypt_chunk(virtual_path, c) for c in chunks
-                )
+        # 매니페스트가 있으면 청크별로 라우팅한다(청크가 여러 기기에 흩어져 있어도
+        # 각각 제 보관처에서 가져온다). 파일 단위 device_id는 참고값일 뿐이다.
+        chunks = self.metadata_store.get_chunks(virtual_path)
+        if chunks:
+            return b"".join(
+                self._decrypt_chunk(virtual_path, c) for c in chunks
+            )
         encrypted_data = self._read_resolved_ciphertext(metadata)
         if self.encryption_engine is not None:
             return self.encryption_engine.decrypt(encrypted_data)
@@ -489,11 +518,8 @@ class StoragePool:
         if length == 0:
             return b""
 
-        metadata = self._resolve_metadata(virtual_path)
-        chunks = (
-            self.metadata_store.get_chunks(virtual_path)
-            if self._is_local_owner(metadata) else []
-        )
+        self._resolve_metadata(virtual_path)
+        chunks = self.metadata_store.get_chunks(virtual_path)
         if not chunks:
             return self.read_file(virtual_path)[offset:offset + length]
 
@@ -524,12 +550,11 @@ class StoragePool:
             OSError: 소스가 비활성이거나 원격 디바이스에 도달할 수 없을 때.
         """
         metadata = self._resolve_metadata(virtual_path)
-        if self._is_local_owner(metadata):
-            chunks = self.metadata_store.get_chunks(virtual_path)
-            if chunks:
-                return b"".join(
-                    self._read_chunk_bytes(virtual_path, c) for c in chunks
-                )
+        chunks = self.metadata_store.get_chunks(virtual_path)
+        if chunks:
+            return b"".join(
+                self._read_chunk_bytes(virtual_path, c) for c in chunks
+            )
         return self._read_resolved_ciphertext(metadata)
 
     def _read_resolved_ciphertext(self, metadata) -> bytes:
@@ -554,7 +579,24 @@ class StoragePool:
         return self.encryption_engine.encrypt(plain)
 
     def _read_chunk_bytes(self, virtual_path: str, chunk: ChunkRef) -> bytes:
-        """청크 암호문을 소스에서 읽고 해시를 검증한다."""
+        """청크 암호문을 확보하고 해시를 검증한다(청크별 로컬/원격 라우팅).
+
+        청크마다 보관 기기가 다를 수 있으므로 파일 단위 소유자가 아니라 청크의
+        device_id로 라우팅한다.
+        """
+        if chunk.device_id is not None and chunk.device_id != self.device_id:
+            data = self._read_remote_chunk(virtual_path, chunk)
+        else:
+            data = self._read_local_chunk(virtual_path, chunk)
+        if chunk.hash and chunker.chunk_hash(data) != chunk.hash:
+            raise OSError(
+                f"청크 해시 불일치: file={virtual_path} "
+                f"chunk_index={chunk.index} ref={chunk.chunk_ref}"
+            )
+        return data
+
+    def _read_local_chunk(self, virtual_path: str, chunk: ChunkRef) -> bytes:
+        """로컬 소스에서 청크 암호문을 읽는다."""
         source = self._get_source_by_id(chunk.source_id)
         if source is None or not source.is_active:
             raise OSError(
@@ -562,18 +604,38 @@ class StoragePool:
                 f"(file={virtual_path} chunk_index={chunk.index})"
             )
         try:
-            data = source.read(chunk.chunk_ref)
+            return source.read(chunk.chunk_ref)
         except FileNotFoundError as e:
             raise OSError(
                 f"청크 누락: file={virtual_path} chunk_index={chunk.index} "
                 f"ref={chunk.chunk_ref}"
             ) from e
-        if chunk.hash and chunker.chunk_hash(data) != chunk.hash:
+
+    def _read_remote_chunk(self, virtual_path: str, chunk: ChunkRef) -> bytes:
+        """청크를 보관한 원격 기기에서 암호문을 읽는다.
+
+        같은 계정이면 master_key가 동일하므로 호출자가 로컬 엔진으로 복호화할 수 있다.
+        비활성(오프라인) 프록시는 재라우팅을 1회 시도한다.
+        """
+        remote = self._remote_devices.get(chunk.device_id)
+        if remote is None:
             raise OSError(
-                f"청크 해시 불일치: file={virtual_path} "
-                f"chunk_index={chunk.index} ref={chunk.chunk_ref}"
+                f"청크 보관 기기 미마운트: device={chunk.device_id} "
+                f"(file={virtual_path} chunk_index={chunk.index})"
             )
-        return data
+        if not self._ensure_remote_active(remote):
+            raise OSError(
+                f"청크 보관 기기 오프라인: device={chunk.device_id} "
+                f"(file={virtual_path} chunk_index={chunk.index})"
+            )
+        try:
+            # 청크 암호문은 전송 청크 한계 안에 들어오므로 단일 read로 받는다.
+            return remote.read_from_source(chunk.chunk_ref, chunk.source_id)
+        except FileNotFoundError as e:
+            raise OSError(
+                f"청크 누락(원격): file={virtual_path} "
+                f"chunk_index={chunk.index} device={chunk.device_id}"
+            ) from e
 
     def _decrypt_chunk(self, virtual_path: str, chunk: ChunkRef) -> bytes:
         """청크 암호문을 읽어 단독 복호화한다."""
@@ -595,63 +657,27 @@ class StoragePool:
             InsufficientStorageError: 로컬·원격 어디에도 공간이 없을 때.
         """
         existing = self.metadata_store.lookup(virtual_path)
-        total = sum(len(c) for c in cipher_chunks)
         # 원격 소유 파일 수정 → 로컬 소유권 이전(takeover). 원래 소유 디바이스의
         # 물리 블록은 그 디바이스가 동기화 후 정리하므로 여기서 지우지 않는다.
         takeover = existing is not None and not self._is_local_owner(existing)
 
-        try:
-            source = self._select_chunk_source(existing, takeover, total)
-        except InsufficientStorageError:
-            # 로컬 만석 → 온라인 리모트(같은 계정)로 스필오버. 청크 단위 원격 배치는
-            # 후속 단계이므로 지금은 at-rest 암호문을 한 블록으로 보낸다.
-            if existing is None and self._write_to_remote(
-                virtual_path, b"".join(cipher_chunks), plain_size
-            ):
-                return
-            raise
-
         old_chunks = self.metadata_store.get_chunks(virtual_path)
-        refs: list[ChunkRef] = []
-        written: list[str] = []
-        try:
-            for index, cipher in enumerate(cipher_chunks):
-                digest = chunker.chunk_hash(cipher)
-                ref = (
-                    f"{chunker.shard_prefix(digest)}/"
-                    f"{chunker.chunk_ref(index)}"
-                )
-                source.write(ref, cipher)
-                written.append(ref)
-                refs.append(
-                    ChunkRef(
-                        index=index, chunk_ref=ref,
-                        source_id=source.source_id, device_id=self.device_id,
-                        size=len(cipher), hash=digest,
-                    )
-                )
-        except OSError as e:
-            self._cleanup_chunks(source, written)
-            if "insufficient space" in str(e).lower():
-                raise InsufficientStorageError(str(e)) from e
-            raise
-        except Exception:
-            self._cleanup_chunks(source, written)
-            raise
+        refs, written = self._place_chunks(cipher_chunks, existing, takeover)
 
         # 첫 청크 참조를 files의 물리 위치로 둔다(NOT NULL 충족). 청크 파일의
         # 정본은 file_chunks이며, 이 값은 레거시 컬럼 호환용이다.
-        head_ref = refs[0].chunk_ref if refs else self._generate_physical_path(
-            virtual_path
-        )
+        # files.device_id는 파일 레코드의 소유자(이 파일을 관리하는 기기)이고,
+        # 청크의 보관 기기는 청크마다 따로 기록된다. 청크가 원격에 놓였다고 해서
+        # 파일 소유권이 넘어가는 것은 아니다.
+        head = refs[0]
         now = time.time()
         self.metadata_store.begin_transaction()
         try:
             if existing is None:
                 self.metadata_store.insert(
                     virtual_path=virtual_path,
-                    source_id=source.source_id,
-                    physical_path=head_ref,
+                    source_id=head.source_id,
+                    physical_path=head.chunk_ref,
                     file_size=plain_size,
                     created_at=now,
                     modified_at=now,
@@ -663,14 +689,14 @@ class StoragePool:
                     file_size=plain_size,
                     modified_at=now,
                     device_id=self.device_id,
-                    source_id=source.source_id,
-                    physical_path=head_ref,
+                    source_id=head.source_id,
+                    physical_path=head.chunk_ref,
                 )
             self.metadata_store.put_chunks(virtual_path, refs)
             self.metadata_store.commit()
         except Exception:
             self.metadata_store.rollback()
-            self._cleanup_chunks(source, written)
+            self._cleanup_chunks(written)
             raise
 
         if takeover:
@@ -678,10 +704,113 @@ class StoragePool:
             self._gc_needed = True
             logger.info(
                 "소유권 이전 완료: %s → device=%s source=%s",
-                virtual_path, self.device_id, source.source_id,
+                virtual_path, self.device_id, head.source_id,
             )
         else:
             self._discard_previous_representation(existing, old_chunks, written)
+
+    def _place_chunks(self, cipher_chunks: list, existing, takeover: bool):
+        """청크를 로컬 우선으로 배치하고, 로컬이 부족하면 원격으로 스필오버한다.
+
+        청크마다 보관처를 따로 정하므로 한 파일의 청크가 여러 소스·기기에 분산될 수
+        있다. 하나라도 놓을 곳이 없으면 이미 기록한 청크를 정리하고 규격 에러를 낸다
+        (반쯤 저장된 상태로 남기지 않는다).
+
+        Returns:
+            (ChunkRef 목록, 정리 대상 (target, ref) 목록).
+
+        Raises:
+            InsufficientStorageError: 로컬·원격 어디에도 놓을 수 없을 때.
+        """
+        total = sum(len(c) for c in cipher_chunks)
+        try:
+            preferred = self._select_chunk_source(existing, takeover, total)
+        except InsufficientStorageError:
+            preferred = None  # 전체를 한 소스에 담을 수는 없다 → 청크별로 배치
+
+        refs: list[ChunkRef] = []
+        written: list = []
+        try:
+            for index, cipher in enumerate(cipher_chunks):
+                digest = chunker.chunk_hash(cipher)
+                ref = (
+                    f"{chunker.shard_prefix(digest)}/"
+                    f"{chunker.chunk_ref(index)}"
+                )
+                placed = self._place_one_chunk(
+                    ref, cipher, preferred, index, len(cipher_chunks)
+                )
+                target, source_id, device_id = placed
+                written.append((target, ref))
+                refs.append(
+                    ChunkRef(
+                        index=index, chunk_ref=ref, source_id=source_id,
+                        device_id=device_id, size=len(cipher), hash=digest,
+                    )
+                )
+        except OSError as e:
+            self._cleanup_chunks(written)
+            if "insufficient space" in str(e).lower():
+                raise InsufficientStorageError(str(e)) from e
+            raise
+        except Exception:
+            self._cleanup_chunks(written)
+            raise
+        return refs, written
+
+    def _place_one_chunk(
+        self, ref: str, cipher: bytes, preferred, index: int, count: int
+    ):
+        """청크 하나를 로컬(우선) 또는 원격에 기록하고 배치 정보를 반환한다.
+
+        Returns:
+            (기록한 대상 객체, source_id, device_id).
+
+        Raises:
+            InsufficientStorageError: 로컬·원격 어디에도 놓을 수 없을 때.
+        """
+        target = preferred
+        if target is None or target.get_available_space() < len(cipher):
+            try:
+                target = self.select_source(len(cipher))
+            except InsufficientStorageError:
+                target = None
+        if target is not None:
+            target.write(ref, cipher)
+            return target, target.source_id, self.device_id
+
+        # 로컬에 놓을 수 없다 → 온라인 원격 기기(같은 계정)로 청크 스필오버
+        placed = self._push_chunk_to_remote(ref, cipher)
+        if placed is None:
+            raise InsufficientStorageError(
+                f"청크를 놓을 로컬·원격 공간이 없습니다 "
+                f"(chunk_index={index}/{count}, size={len(cipher)})"
+            )
+        remote, source_id, device_id = placed
+        logger.info(
+            "청크 스필오버→리모트: chunk_index=%d device=%s source=%s",
+            index, device_id, source_id,
+        )
+        return remote, source_id, device_id
+
+    def _push_chunk_to_remote(self, ref: str, cipher: bytes):
+        """청크 암호문을 도달 가능한 원격 기기에 기록한다.
+
+        Returns:
+            (RemoteSource, 원격 source_id, device_id) 또는 실패 시 None.
+        """
+        for device_id, remote in self._remote_devices.items():
+            if not self._ensure_remote_active(remote):
+                continue
+            try:
+                remote_src_id = remote.push_blob(ref, cipher)
+                if not remote_src_id:
+                    continue
+                return remote, remote_src_id, device_id
+            except Exception as e:  # noqa: BLE001 — 다음 원격 기기 시도
+                logger.warning("청크 원격 배치 실패(%s): %s", device_id, e)
+                continue
+        return None
 
     def _select_chunk_source(
         self, existing, takeover: bool, total: int
@@ -707,17 +836,20 @@ class StoragePool:
         return self.select_source(total)
 
     @staticmethod
-    def _cleanup_chunks(source, refs: list) -> None:
-        """기록에 실패한 청크 파일을 정리한다(베스트에포트)."""
-        for ref in refs:
+    def _cleanup_chunks(written: list) -> None:
+        """기록에 실패한 청크 파일을 정리한다(베스트에포트).
+
+        written은 (대상, ref) 목록이며 대상은 로컬 소스 또는 원격 프록시다.
+        정리에 실패해도 데이터 손실은 없다(고아 블록은 orphan GC가 회수).
+        """
+        for target, ref in written:
             try:
-                if source.exists(ref):
-                    source.delete(ref)
+                target.delete(ref)
             except Exception:  # noqa: BLE001 — 정리 실패는 orphan GC가 회수
                 pass
 
     def _discard_previous_representation(
-        self, existing, old_chunks: list, new_refs: list
+        self, existing, old_chunks: list, written: list
     ) -> None:
         """커밋 후 이전 표현(레거시 blob 또는 옛 청크)을 삭제한다.
 
@@ -725,18 +857,12 @@ class StoragePool:
         """
         if existing is None:
             return
-        keep = set(new_refs)
+        keep = {ref for _target, ref in written}
         if old_chunks:
             for chunk in old_chunks:
                 if chunk.chunk_ref in keep:
                     continue
-                src = self._get_source_by_id(chunk.source_id)
-                if src is None or not src.is_active:
-                    continue
-                try:
-                    src.delete(chunk.chunk_ref)
-                except Exception:  # noqa: BLE001
-                    pass
+                self._delete_chunk_block(chunk, best_effort=True)
             return
         # 이전엔 레거시 통짜 blob이었다.
         if existing.physical_path in keep:
@@ -1090,25 +1216,47 @@ class StoragePool:
         self._delete_local_blocks(metadata)
         self.metadata_store.delete(virtual_path)
 
+    def _delete_chunk_block(self, chunk: ChunkRef, best_effort: bool = False) -> None:
+        """청크 하나의 물리 블록을 삭제한다(로컬·원격 공통).
+
+        원격 보관 청크는 그 기기의 프록시로 삭제 요청을 보낸다. 도달할 수 없으면
+        블록이 고아로 남으며 그 기기의 orphan GC가 회수한다.
+        """
+        if chunk.device_id is not None and chunk.device_id != self.device_id:
+            remote = self._remote_devices.get(chunk.device_id)
+            if remote is None or not self._ensure_remote_active(remote):
+                return
+            try:
+                remote.delete(chunk.chunk_ref)
+            except Exception as e:  # noqa: BLE001 — 도달 불가 시 고아로 남김
+                if not best_effort:
+                    logger.warning(
+                        "원격 청크 삭제 실패(device=%s ref=%s): %s",
+                        chunk.device_id, chunk.chunk_ref, e,
+                    )
+            return
+
+        src = self._get_source_by_id(chunk.source_id)
+        if src is None or not src.is_active:
+            return
+        try:
+            src.delete(chunk.chunk_ref)
+        except FileNotFoundError:
+            if not best_effort:
+                logger.warning("청크가 이미 삭제됨: %s", chunk.chunk_ref)
+        except OSError as e:
+            if not best_effort:
+                logger.warning("청크 삭제 실패(%s): %s", chunk.chunk_ref, e)
+
     def _delete_local_blocks(self, metadata) -> None:
-        """파일의 로컬 물리 블록을 삭제한다(청크 표현이면 청크 전부).
+        """파일의 물리 블록을 삭제한다(청크 표현이면 청크 전부, 원격 청크 포함).
 
         청크 표현이면 매니페스트도 함께 비운다(chunked=0으로 복귀).
         """
         chunks = self.metadata_store.get_chunks(metadata.virtual_path)
         if chunks:
             for chunk in chunks:
-                src = self._get_source_by_id(chunk.source_id)
-                if src is None or not src.is_active:
-                    continue
-                try:
-                    src.delete(chunk.chunk_ref)
-                except FileNotFoundError:
-                    logger.warning("청크가 이미 삭제됨: %s", chunk.chunk_ref)
-                except OSError as e:
-                    logger.warning(
-                        "청크 삭제 실패(%s): %s", chunk.chunk_ref, e
-                    )
+                self._delete_chunk_block(chunk)
             self.metadata_store.delete_chunks(metadata.virtual_path)
             return
 

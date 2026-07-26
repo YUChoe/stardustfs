@@ -126,13 +126,19 @@ def test_replace_local_sources_keeps_remote_and_recover(tmp_path):
 
 def test_write_spills_over_to_remote_when_local_full(tmp_path):
     # 로컬 소스가 없으면(만석 등가) 신규 쓰기는 온라인 리모트로 스필오버된다.
+    #
+    # 청크 네이티브 저장에서는 청크마다 보관처를 정하므로 원격에 놓이는 것은 청크이고,
+    # 파일 레코드 소유자는 쓴 기기로 남는다(소유자가 넘어가면 그 파일을 삭제·수정할
+    # 주체가 사라져 삭제가 물리 블록을 정리하지 못한다).
     storage_pool, store = _storage_pool(tmp_path, [])
     remote = _FakeRemote(source_id="dev-b-src")
     storage_pool.register_remote_device("dev-b", remote)
     storage_pool.write_file("/big", b"hello-remote")
     meta = store.lookup("/big")
-    assert meta.device_id == "dev-b"       # 리모트 소유로 기록
-    assert meta.source_id == "dev-b-src"
+    assert meta.device_id == "devA"        # 파일 레코드 소유자는 로컬 유지
+    assert meta.source_id == "dev-b-src"   # 물리 위치는 원격 소스
+    chunks = store.get_chunks("/big")
+    assert [c.device_id for c in chunks] == ["dev-b"]   # 청크는 리모트 보관
     assert b"hello-remote" in remote.stored.values()
     store.close()
 
@@ -162,7 +168,9 @@ def test_write_to_remote_refreshes_inactive_remote(tmp_path):
     storage_pool.write_file("/f", b"reactivated")
     assert rem.refreshed is True              # 재라우팅 시도됨
     meta = store.lookup("/f")
-    assert meta.device_id == "dev-b"          # 재활성 리모트로 기록
+    assert meta.source_id == "dev-b-src"      # 재활성 리모트에 배치됨
+    chunks = store.get_chunks("/f")
+    assert [c.device_id for c in chunks] == ["dev-b"]
     assert b"reactivated" in rem.stored.values()
     store.close()
 

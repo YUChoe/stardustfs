@@ -73,7 +73,7 @@ Phase 2~5는 진입 시 선행 단계의 실측·결정을 반영해 세부 태�
 
 ### Phase 2 — 동기화(파일 레코드에 청크 매니페스트 실기)
 
-- [ ] 9. metadata_records 페이로드에 chunks 매니페스트 포함·병합
+- [x] 9. metadata_records 페이로드에 chunks 매니페스트 포함·병합
   - 파일 레코드 JSON에 `chunks: [{index, chunk_ref, source_id, device_id, size,
     hash}]` 추가(chunked=0이면 생략). record_id·CAS·롱폴 프로토콜 불변
   - 병합 시 매니페스트를 통째로 채택, 레거시(chunks 없음) 레코드 호환
@@ -82,11 +82,11 @@ Phase 2~5는 진입 시 선행 단계의 실측·결정을 반영해 세부 태�
 
 ### Phase 3 — 분산(청크 단위 스필오버·축출·원격 라우팅)
 
-- [ ] 10. 스필오버/evacuate/detach/evict를 청크 단위로 수행
+- [x] 10. 스필오버/evacuate/detach/evict를 청크 단위로 수행
   - 이동 단위를 파일에서 청크로, `update_chunk_location`으로 청크별 위치 갱신
   - _Requirements: 1.3, 2.2, 2.3_
 
-- [ ] 11. read 경로의 청크별 원격 라우팅
+- [x] 11. read 경로의 청크별 원격 라우팅
   - 청크가 여러 기기에 분산됐을 때 청크별 로컬/원격 소스 선택 후 결합
   - _Requirements: 1.3, 3.1, 3.3_
 

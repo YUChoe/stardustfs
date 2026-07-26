@@ -480,6 +480,22 @@ class MetadataStore:
             )
         conn.commit()
 
+    def list_chunked_paths_in_source(self, source_id: str) -> list:
+        """해당 소스에 청크를 하나라도 둔 활성 파일의 가상 경로 목록을 반환한다.
+
+        청크 파일은 files.source_id가 첫 청크 기준이라, 그 값만 보면 다른 소스에
+        첫 청크가 있는 파일의 청크를 놓친다. evacuate/detach가 소스에 남은 청크를
+        빠뜨리지 않도록 file_chunks를 직접 조회한다.
+        """
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "SELECT DISTINCT c.virtual_path FROM file_chunks c "
+            "JOIN files f ON f.virtual_path = c.virtual_path "
+            "WHERE c.source_id = ? AND f.deleted = 0",
+            (source_id,),
+        )
+        return [row["virtual_path"] for row in cursor.fetchall()]
+
     def live_chunk_paths_for_device(
         self, device_id: str
     ) -> set:
