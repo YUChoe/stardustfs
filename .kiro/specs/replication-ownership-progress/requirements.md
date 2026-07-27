@@ -32,7 +32,8 @@ inclusion: manual
 3. WHEN 한 파일의 청크가 여러 device에 흩어져 있으면 THE 각 device SHALL 자기
    로컬 청크만 홀더에 올리고, 다른 device의 청크를 릴레이로 당겨오지 않는다.
 4. THE 파일 단위 복제 상태(`replication_status`) SHALL 서버 레지스트리 기준으로
-   판정한다 — 모든 청크가 `min_replicas` 이상이면 replicated, 아니면 pending.
+   판정한다 — 모든 청크가 목표 카피 수를 채웠으면 replicated, 아니면 pending.
+   (목표 카피 수는 `chunk-copy-policy` 스펙의 `target_copies`로 대체됐다.)
 5. IF 파일에 로컬 청크가 하나도 없으면 THE device SHALL 그 파일을 백업 대상에서
    제외하고 원격 읽기를 시도하지 않는다.
 
@@ -66,7 +67,8 @@ inclusion: manual
    WARNING을 남긴다(어떤 name/os로 조회했는지 포함).
 2. IF 자기 device_id가 없는 상태에서 복제를 수행하면 THE ReplicationManager SHALL
    Requirement 2의 원본 보관 device 제외에만 의존하고, 그 사실을 로그로 알린다.
-3. THE `make_replication_manager` SHALL 서버 정책의 `min_replicas`를 전달한다
+3. THE `make_replication_manager` SHALL 서버 정책의 목표 카피 수를 전달한다
+   (`chunk-copy-policy`의 `target_copies`)
    (현재 기본값 1로 고정돼 정책이 반영되지 않는다).
 
 ## Requirement 4: 수동 백업 요청은 청크 보관 device가 수행

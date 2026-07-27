@@ -82,29 +82,41 @@ class _FakeManager:
         # 기본: 모든 파일 degraded(테스트에서 healthy_paths로 일부 건강 처리)
         return _Health(degraded=vpath not in self.healthy_paths)
 
-    def set_min_replicas(self, n: int) -> None:
-        self.min_replicas = n
+    def set_target_copies(self, n: int) -> None:
+        self.target_copies = n
 
     def close(self) -> None:
         self.closed = True
 
 
 class _Health:
-    def __init__(self, degraded: bool, min_online: int = 0) -> None:
+    def __init__(
+        self, degraded: bool, min_copies: int = 0,
+        min_devices: int | None = None,
+    ) -> None:
         self.degraded = degraded
-        self.min_online = min_online
+        self.min_copies = min_copies
+        # 지정하지 않으면 카피가 모두 다른 기기에 있다고 본다(이전 불필요).
+        self.min_devices = min_copies if min_devices is None else min_devices
 
 
 class _FakeMeta:
     def __init__(
         self, none_paths: list[str] | None = None,
         heal_paths: list[str] | None = None,
+        pending_paths: list[str] | None = None,
     ) -> None:
         self._none = none_paths or []
         self._heal = heal_paths or []
+        # 목표 카피 미달(pending) 파일. heal 루프가 유예 없이 보충한다.
+        self._pending = pending_paths or []
 
     def list_virtual_paths_for_replication(self, statuses, owner_device_id=None):
-        return list(self._none) if "none" in statuses else list(self._heal)
+        if "none" in statuses:
+            return list(self._none)
+        if tuple(statuses) == ("pending",):
+            return list(self._pending)
+        return list(self._heal)
 
 
 @pytest.mark.asyncio
@@ -162,13 +174,12 @@ async def test_backup_cycle_skips_missing_local_file_and_caches():
 
 
 @pytest.mark.asyncio
-async def test_pending_triggers_short_retry_backoff():
-    """복제 미완료(pending)가 남으면 전체 주기 대신 짧은 백오프로 재시도한다."""
-    from stardustlib.replication_scheduler import (
-        _BACKLOG_DRAIN_DELAY,
-        _RETRY_MIN_DELAY,
-    )
+async def test_pending_does_not_shorten_backup_interval():
+    """목표 카피 미달(pending)이어도 백업 주기를 앞당기지 않는다(heal이 맡는다).
 
+    위치가 부족한 상황은 몇 초 뒤에 달라지지 않는다. 카피 채우기는 heal 주기로
+    옮겼다(스펙 chunk-copy-policy 3.4).
+    """
     class _PendingMgr(_FakeManager):
         def replicate(self, vpath: str):
             self.replicated.append(vpath)
@@ -180,12 +191,7 @@ async def test_pending_triggers_short_retry_backoff():
     )
     processed = await sched.run_backup_cycle()
     assert processed == 1 and sched._last_pending == 1
-    # 첫 재시도: 짧은 최소 지연
-    d1 = sched._next_delay(processed)
-    assert d1 == _RETRY_MIN_DELAY
-    # 지속 pending → 지수 백오프(2배), backup_interval 상한
-    d2 = sched._next_delay(processed)
-    assert d2 == _RETRY_MIN_DELAY * 2
+    assert sched._next_delay(processed) == 300.0
 
 
 @pytest.mark.asyncio
@@ -198,7 +204,6 @@ async def test_all_replicated_uses_full_interval():
     processed = await sched.run_backup_cycle()
     assert sched._last_pending == 0
     assert sched._next_delay(processed) == 300.0
-    assert sched._retry_delay is None
 
 
 @pytest.mark.asyncio
@@ -446,3 +451,36 @@ async def test_announce_wakes_backup_loop_before_interval():
     finally:
         mod._ANNOUNCE_COALESCE_DELAY = original
         await sched.stop()
+
+
+@pytest.mark.asyncio
+async def test_heal_cycle_fills_pending_without_grace():
+    """목표 카피 미달(pending) 파일은 유예 없이 매 heal 주기에 보충한다."""
+    mgr = _FakeManager()
+    sched = ReplicationScheduler(
+        mgr, _FakeMeta(pending_paths=["/p"]), "devA",
+        heal_grace_seconds=10_000,
+    )
+    n = await sched.run_heal_cycle()
+    assert n == 1
+    assert mgr.healed == ["/p"]
+
+
+@pytest.mark.asyncio
+async def test_heal_cycle_relocates_concentrated_copies():
+    """카피 수는 채웠지만 한 기기에 몰려 있으면 유예 없이 이전을 시도한다."""
+    mgr = _FakeManager()
+    mgr.target_copies = 3
+    mgr.healthy_paths = {"/a"}  # degraded 아님
+
+    def _health(vpath: str):
+        # 카피 3개가 모두 한 기기에 있다(기기 수 1 < 목표 3)
+        return _Health(degraded=False, min_copies=3, min_devices=1)
+
+    mgr.replication_health = _health
+    sched = ReplicationScheduler(
+        mgr, _FakeMeta(heal_paths=["/a"]), "devA", heal_grace_seconds=10_000,
+    )
+    n = await sched.run_heal_cycle()
+    assert n == 1
+    assert mgr.healed == ["/a"]

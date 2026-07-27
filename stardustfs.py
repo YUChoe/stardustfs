@@ -170,21 +170,35 @@ def _daemon_stop(config_path: str) -> int:
     return 1
 
 
-def _build_parity_store(config: dict, quota_bytes: int | None = None):
+def _build_parity_store(
+    config: dict, storage_pool, metadata_store, quota_bytes: int | None = None
+):
     """호스트 역할 패리티 스토어를 생성한다(replication.enabled 일 때만, 기본 활성).
 
-    보관 디렉토리는 {metadata_db}.parity. 최대 용량은 서버가 정한 호스팅 상한
-    (quota_bytes)이다 — 제공 용량의 비율을 예약하던 방식은 폐기됐다. quota_bytes가
-    None(정책 미수신)이면 0으로 두어 타 사용자 청크를 받지 않는다.
-    replication.enabled=false면 None.
+    보관 청크는 내 청크와 같은 스토리지 소스에 놓이고 인덱스는 메타데이터 DB의
+    hosted_chunks다(별도 `.parity/` 디렉토리는 폐기 — 용량 집계를 하나로 모은다).
+    최대 용량은 서버가 정한 호스팅 상한(quota_bytes)이며, None(정책 미수신)이면 0으로
+    두어 타 사용자 청크를 받지 않는다. replication.enabled=false면 None.
+
+    구 버전이 남긴 `{metadata_db}.parity/` 청크는 생성 시 한 번 소스로 이관한다.
     """
     repl = config.get("replication", {})
     if not repl.get("enabled", True):  # 기본 활성
         return None
     from stardustlib.parity_store import ParityStore
 
-    base_dir = config["metadata_db"] + ".parity"
-    return ParityStore(base_dir, quota_bytes or 0)
+    logger = logging.getLogger(__name__)
+    store = ParityStore(storage_pool, metadata_store, quota_bytes or 0)
+    legacy_dir = config["metadata_db"] + ".parity"
+    if os.path.isdir(legacy_dir):
+        # 이관은 쿼터와 무관하게 이미 맡은 청크를 지키는 일이므로 상한을 잠시 푼다.
+        store.set_max_bytes(None)
+        try:
+            store.migrate_legacy_dir(legacy_dir)
+        except Exception as e:  # noqa: BLE001 — 이관 실패가 기동을 막지 않는다
+            logger.warning("레거시 보관 청크 이관 실패(다음 기동 재시도): %s", e)
+        store.set_max_bytes(quota_bytes or 0)
+    return store
 
 
 async def startup_v2(config: dict, config_path: str) -> None:
@@ -320,7 +334,9 @@ async def startup_v2(config: dict, config_path: str) -> None:
         if p2p_enabled:
             p2p_server = P2PServer(
                 storage_pool, auth_client, p2p_port, server_url,
-                parity_store=_build_parity_store(config),
+                parity_store=_build_parity_store(
+                    config, storage_pool, metadata_store
+                ),
             )
 
         recovery_mgr = OnlineRecoveryManager(
@@ -376,9 +392,13 @@ async def startup_v2(config: dict, config_path: str) -> None:
 
     # (5-a) 리플리케이션 정책 다운로드(시작 1회). 호스팅 상한은 서버가 정한다
     # (프로비저닝) — 제공 용량의 비율을 예약하던 방식은 폐기됐다.
+    from stardustlib.replication_manager import DEFAULT_TARGET_COPIES
+
     repl_config = config.get("replication", {})  # type: ignore[attr-defined]
     repl_enabled = repl_config.get("enabled", True)
-    repl_min = int(repl_config.get("min_replicas", 1))
+    repl_target = int(
+        repl_config.get("target_copies", DEFAULT_TARGET_COPIES)
+    )
     # 서버가 알려준 호스팅 상한(bytes). None이면 아직 받지 못한 상태 → 호스팅 안 함.
     repl_quota: int | None = None
     # 서버 프로비저닝 스위치(기본 허용). 구버전 서버/도달 불가 시 로컬 설정만 적용.
@@ -395,7 +415,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
         policy_p2p_allowed = policy["p2p_enabled"]
         policy_hosting_allowed = policy["hosting_enabled"]
         if repl_enabled:
-            repl_min = policy["min_replicas"]
+            repl_target = policy["target_copies"]
             repl_quota = policy["hosting_quota_bytes"]
         logger.info(
             "서버 정책 수신: 목표 카피 %d, 호스팅 상한 %s, p2p=%s, 호스팅=%s",
@@ -509,7 +529,9 @@ async def startup_v2(config: dict, config_path: str) -> None:
         # 타 사용자 청크 보관(호스팅)은 정책으로 별도 제어된다. 금지 시 패리티
         # 보관소를 만들지 않아 replica_* op가 503으로 규격 거부된다.
         if policy_hosting_allowed:
-            parity_store = _build_parity_store(config, repl_quota)
+            parity_store = _build_parity_store(
+                config, storage_pool, metadata_store, repl_quota
+            )
         else:
             logger.info("서버 정책으로 호스팅 비활성 — 타 사용자 청크를 보관하지 않습니다")
         p2p_server = P2PServer(
@@ -593,12 +615,27 @@ async def startup_v2(config: dict, config_path: str) -> None:
         repl_progress = ProgressTracker()
         repl_mgr = ReplicationManager(
             auth_client, server_url, metadata_store, storage_pool,
-            min_replicas=repl_min, progress=repl_progress,
+            target_copies=repl_target, progress=repl_progress,
         )
 
         # 서버가 알려준 호스팅 상한을 기억한다. 정책 조회가 실패하면 직전 값을
         # 유지해, 일시적 네트워크 문제로 보관을 멈추지 않는다.
         hosting_quota = {"bytes": repl_quota}
+
+        async def _report_hosting_usage() -> None:
+            """이 기기의 실제 호스팅 사용량을 서버에 보고한다(회계 정렬).
+
+            제공 용량 신고는 폐기됐다 — 상한은 서버가 정하고 클라이언트는 사용량만
+            보고한다. 실패는 비치명(다음 정책 주기에 재시도).
+            """
+            if parity_store is None or not device_mgr.device_id:
+                return
+            from stardustlib.replication_hosting import report_usage
+
+            await report_usage(
+                auth_client, server_url, device_mgr.device_id,
+                parity_store.used_bytes(), storage_pool.get_total_space(),
+            )
 
         async def _apply_policy(policy: dict) -> None:
             """주기적으로 내려받은 정책을 매니저/패리티에 반영한다.
@@ -607,16 +644,18 @@ async def startup_v2(config: dict, config_path: str) -> None:
             신규 청크 수용을 멈춘다(이미 보관 중인 청크는 소유자가 회수할 수 있도록
             유지). 상한 필드가 없으면(구버전 서버) 직전 값을 그대로 쓴다.
             """
-            repl_mgr.set_min_replicas(policy["min_replicas"])
+            repl_mgr.set_target_copies(policy["target_copies"])
             if not policy.get("hosting_enabled", True):
                 if parity_store is not None:
                     parity_store.set_max_bytes(0)
+                await _report_hosting_usage()
                 return
             quota = policy.get("hosting_quota_bytes")
             if quota is not None:
                 hosting_quota["bytes"] = int(quota)
             if parity_store is not None:
                 parity_store.set_max_bytes(hosting_quota["bytes"] or 0)
+            await _report_hosting_usage()
 
         repl_scheduler = ReplicationScheduler(
             repl_mgr, metadata_store, device_mgr.device_id,
@@ -787,24 +826,33 @@ def _mount_remote_sources(
             _mount(f"remote-{dev_id}", dev_id)
 
 
+def _eviction_safe(repl_mgr, virtual_path: str) -> bool:
+    """이 파일의 로컬 청크를 비워도 되는지 판정한다(축출 안전 게이트).
+
+    판정 기준은 총 카피 수가 아니라 **서로 다른 기기의 카피 수**다 — 카피가 모두 이
+    기기에 있으면 비우는 순간 0이 되므로 축출 대상이 아니다(Property 4). 건강성 조회가
+    실패하면 안전을 확인하지 못한 것이므로 보존한다.
+    """
+    try:
+        health = repl_mgr.replication_health(virtual_path)
+    except Exception:  # noqa: BLE001 — 안전 미확인 시 보존
+        return False
+    return getattr(health, "min_devices", 0) >= repl_mgr.target_copies
+
+
 async def _eviction_loop(storage_pool, repl_mgr, cfg: dict) -> None:
     """로컬 여유가 low_watermark 미만이면 콜드(replicated) 파일을 축출해 회수한다.
 
-    high_watermark까지 회복하도록 필요분만 축출한다. 삭제 직전 온라인 복제본 수를
-    실측(replication_health.min_online ≥ min_replicas)해 미달이면 보존한다(무손실).
+    high_watermark까지 회복하도록 필요분만 축출한다. 안전 판정은 총 카피 수가 아니라
+    **서로 다른 기기의 카피 수**로 한다 — 카피가 모두 이 기기에 있으면 비우는 순간 0이
+    되므로 축출 대상이 아니다(Property 4). 다른 기기에 목표 수만큼 있어야 지운다.
     """
     logger = logging.getLogger(__name__)
     interval = cfg.get("interval_seconds", 300)
     low = int(cfg.get("low_watermark_bytes", 200 * 1024 * 1024))
     high = int(cfg.get("high_watermark_bytes", 500 * 1024 * 1024))
-    min_repl = repl_mgr.min_replicas
-
     def _is_safe(virtual_path: str) -> bool:
-        try:
-            health = repl_mgr.replication_health(virtual_path)
-            return health.min_online >= min_repl
-        except Exception:  # noqa: BLE001 — 안전 미확인 시 보존
-            return False
+        return _eviction_safe(repl_mgr, virtual_path)
 
     while True:
         await asyncio.sleep(interval)

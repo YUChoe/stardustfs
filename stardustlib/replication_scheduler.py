@@ -17,9 +17,6 @@ logger = logging.getLogger(__name__)
 
 # 한 주기에 상한(max)만큼 처리했으면 백로그가 남은 것으로 보고 짧게 쉬고 계속 비운다.
 _BACKLOG_DRAIN_DELAY = 2.0
-# 복제 미완료(pending)가 남으면 전체 주기(backup_interval)를 기다리지 않고 짧게 재시도한다.
-# 지속 실패(예: 도달 불가·전송 한도) 시 backup_interval까지 지수 백오프로 늘려 폭주를 막는다.
-_RETRY_MIN_DELAY = 15.0
 # announce(쓰기 직후 즉시 백업) 병합 창(초). 연속 업로드 버스트를 한 사이클로 모으고,
 # 도달 불가 홀더 상황에서 announce가 hot loop가 되지 않도록 최소 간격을 보장한다.
 _ANNOUNCE_COALESCE_DELAY = 2.0
@@ -65,10 +62,9 @@ class ReplicationScheduler:
         # 로컬에 물리 파일이 없어 백업 불가한 vpath(다른 device 소유의 NULL 레코드 등).
         # 매 주기 재시도/경고 스팸을 막기 위해 캐시해 건너뛴다.
         self._skip_backup: set[str] = set()
-        # 직전 주기에서 복제 미완료(pending)로 남은 파일 수. 짧은 재시도 판단에 쓴다.
+        # 직전 주기에서 목표 카피 미달로 남은 파일 수(로그·진단용). 재시도는 heal이
+        # 맡으므로 백업 주기를 앞당기는 데는 쓰지 않는다.
         self._last_pending: int = 0
-        # 현재 재시도 백오프(초). pending이 남는 동안 _RETRY_MIN_DELAY부터 2배씩 증가.
-        self._retry_delay: float | None = None
 
     async def start(self) -> None:
         """백그라운드 루프(백업 + heal)를 기동한다."""
@@ -182,20 +178,14 @@ class ReplicationScheduler:
         """다음 백업 주기까지 대기 시간을 정한다.
 
         - 상한만큼 처리(백로그) → 짧게 쉬고 계속 비운다.
-        - 복제 미완료(pending)가 남음 → 전체 주기를 기다리지 않고 짧은 백오프로 재시도
-          (_RETRY_MIN_DELAY부터 2배씩, backup_interval 상한). 지속 실패 시 폭주 방지.
-        - 모두 완료 → 백오프 초기화 후 정상 주기 간격.
+        - 그 외 → 정상 주기 간격.
+
+        목표 카피 미달(pending)은 짧은 백오프로 재시도하지 않는다. 위치가 부족한
+        상황은 몇 초 뒤에 달라지지 않고, 카피 채우기는 heal 주기가 맡는다(스펙
+        chunk-copy-policy 3.4).
         """
         if processed >= self._max:
             return _BACKLOG_DRAIN_DELAY
-        if self._last_pending > 0:
-            nxt = (
-                self._retry_delay * 2 if self._retry_delay
-                else _RETRY_MIN_DELAY
-            )
-            self._retry_delay = min(nxt, self._backup_interval)
-            return self._retry_delay
-        self._retry_delay = None
         return self._backup_interval
 
     async def run_backup_cycle(self) -> int:
@@ -297,15 +287,21 @@ class ReplicationScheduler:
                 logger.error("재복제 주기 오류: %s", e, exc_info=True)
 
     async def run_heal_cycle(self) -> int:
-        """복제됨/pending 파일의 건강성을 점검해 유예 경과분만 보충한다.
+        """복제됨/미달 파일의 카피를 보충하고 몰린 카피를 분산한다.
 
-        degraded(청크 online < min_replicas)가 heal_grace_seconds 이상 지속된 파일만
-        ensure_replicas로 재복제한다(일시적 오프라인의 churn 방지). 건강해진 파일은
-        관측 기록을 지운다. 실제 재복제한 파일 수를 반환한다.
+        - replicated였다가 줄어든 파일: degraded가 heal_grace_seconds 이상 지속된
+          경우에만 보충한다(일시적 오프라인의 churn 방지).
+        - pending(목표 카피 미달) 파일: 유예 없이 매 주기 보충한다. 백업 사이클은
+          미달을 즉시 재시도하지 않고 이 루프에 맡긴다(스펙 3.4).
+
+        카피가 한 기기에 몰린 파일의 이전(relocate)도 이 주기에만 수행한다 — 기기 간
+        전송을 유발하므로 백업 사이클에서는 하지 않는다(Requirement 3.6).
+        실제 보충·이전한 파일 수를 반환한다.
         """
-        # replicated(건강했다가 줄어든) 파일만 유예 후 보충. pending은 backup 루프가
-        # 즉시 재시도하므로 제외한다.
-        paths = self._paths_to_back_up(("replicated",))
+        pending = set(self._paths_to_back_up(("pending",)))
+        paths = self._paths_to_back_up(("replicated",)) + [
+            vp for vp in pending
+        ]
         now = asyncio.get_running_loop().time()
         repaired = 0
         for vpath in paths[: self._max]:
@@ -319,24 +315,38 @@ class ReplicationScheduler:
                 logger.warning("건강성 점검 실패(건너뜀): %s: %s", vpath, e)
                 continue
 
-            if not summary.degraded:
+            # 카피 수는 채웠지만 한 기기에 몰려 있으면 이전 대상이다.
+            concentrated = (
+                not summary.degraded
+                and getattr(summary, "min_devices", 0) < getattr(
+                    self._manager, "target_copies", 0
+                )
+            )
+            if not summary.degraded and not concentrated:
                 self._degraded_since.pop(vpath, None)
                 continue
 
-            first = self._degraded_since.setdefault(vpath, now)
-            if (now - first) < self._heal_grace:
-                logger.info(
-                    "degraded 관측(유예 대기): %s (online=%d)",
-                    vpath, summary.min_online,
-                )
-                continue
+            # 미달(pending)·몰린 카피는 유예 없이 바로 처리한다.
+            if summary.degraded and vpath not in pending and not concentrated:
+                first = self._degraded_since.setdefault(vpath, now)
+                if (now - first) < self._heal_grace:
+                    logger.info(
+                        "degraded 관측(유예 대기): %s (카피=%d)",
+                        vpath, summary.min_copies,
+                    )
+                    continue
             try:
                 report = await asyncio.to_thread(
                     self._manager.ensure_replicas, vpath
                 )
                 repaired += 1
                 self._degraded_since.pop(vpath, None)
-                logger.info("자동 재복제: %s → %s", vpath, report.status)
+                logger.info(
+                    "자동 재복제: %s → %s (보충 %s, 이전 %s)",
+                    vpath, report.status,
+                    getattr(report, "repaired", 0),
+                    getattr(report, "relocated", 0),
+                )
             except Exception as e:  # noqa: BLE001 — 실패 격리
                 logger.warning("자동 재복제 실패(건너뜀): %s: %s", vpath, e)
         return repaired

@@ -33,7 +33,8 @@ inclusion: manual
 ## Phase 2b: 자기 device 식별 실패 노출 (Requirement 3)
 
 - [x] 2b.1 `CLISession._identify_self`가 None이면 WARNING(조회한 name/os 포함).
-- [x] 2b.2 `make_replication_manager`가 서버 정책의 `min_replicas`를 전달.
+- [x] 2b.2 `make_replication_manager`가 서버 정책의 목표 카피 수를 전달
+      (`chunk-copy-policy`에서 `target_copies`로 대체).
 - [x] 2b.3 `ReplicationManager`가 self device_id 없이 동작하면 1회 로그로 알린다.
 - [x] 2b.4 테스트: device_id 미확정 시 경고, 원본 제외 규칙만으로 배치되는지.
 

@@ -681,9 +681,9 @@ def replica_counts(config_path: str, vpath: str, names: list[str]) -> dict:
                     continue
                 if summary.chunk_count > 0:
                     out[name] = {
-                        "online": summary.min_online,
+                        "online": summary.min_copies,
                         "chunks": summary.chunk_count,
-                        "min": mgr.min_replicas,
+                        "min": mgr.target_copies,
                     }
         finally:
             mgr.close()

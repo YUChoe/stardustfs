@@ -616,12 +616,17 @@ class TestDispatchAsyncReplica:
     _CHUNK = "a" * 64  # 유효한 SHA-256 형식 chunk_id
 
     @pytest.fixture
-    def parity_server(self, storage_pool, mock_auth_client, tmp_path):
+    def parity_server(self, directory_source, mock_auth_client, tmp_path):
+        """보관 청크는 실제 소스+DB에 놓이므로 진짜 MetadataStore를 쓴다."""
+        from stardustlib.metadata_store import MetadataStore
         from stardustlib.parity_store import ParityStore
 
-        store = ParityStore(str(tmp_path / "parity"))
+        meta = MetadataStore(str(tmp_path / "parity-meta.db"), b"k" * 32)
+        meta.initialize()
+        pool = StoragePool(sources=[directory_source], metadata_store=meta)
+        store = ParityStore(pool, meta)
         return P2PServer(
-            storage_pool=storage_pool,
+            storage_pool=pool,
             auth_client=mock_auth_client,
             port=9999,
             server_url="http://localhost:8000",

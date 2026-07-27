@@ -55,21 +55,42 @@ CREATE TABLE IF NOT EXISTS directories (
 CREATE INDEX IF NOT EXISTS idx_directories_virtual_path ON directories(virtual_path);
 """
 
-# 청크 네이티브 저장(chunked=1) 파일의 청크 배치. 파일당 N행.
-# 레거시 통짜 blob(chunked=0)은 이 테이블에 행이 없고 files의
-# source_id/physical_path가 정본이다.
+# 청크 네이티브 저장(chunked=1) 파일의 청크 카피 위치. 청크 하나가 여러 위치에
+# 놓이므로 위치마다 1행이다(카피 수 = 위치 수). 레거시 통짜 blob(chunked=0)은 이
+# 테이블에 행이 없고 files의 source_id/physical_path가 정본이다.
+#
+# device_id는 PK에 들어가므로 NULL을 쓸 수 없다. 빈 문자열이 "이 기기(레거시 로컬)"를
+# 뜻하고, 조회 시 None으로 되돌려 기존 호출부의 판정(None=로컬)을 유지한다.
 _FILE_CHUNKS_SQL = """\
 CREATE TABLE IF NOT EXISTS file_chunks (
     virtual_path  TEXT    NOT NULL,
     chunk_index   INTEGER NOT NULL,
-    chunk_ref     TEXT    NOT NULL,
+    device_id     TEXT    NOT NULL DEFAULT '',
     source_id     TEXT    NOT NULL,
-    device_id     TEXT,
+    chunk_ref     TEXT,
+    kind          TEXT    NOT NULL DEFAULT 'source',
     size          INTEGER NOT NULL,
     hash          TEXT,
-    PRIMARY KEY (virtual_path, chunk_index)
+    PRIMARY KEY (virtual_path, chunk_index, device_id, source_id)
 );
 CREATE INDEX IF NOT EXISTS idx_file_chunks_source ON file_chunks(source_id);
+CREATE INDEX IF NOT EXISTS idx_file_chunks_path
+    ON file_chunks(virtual_path, chunk_index);
+"""
+
+# 타 사용자 청크 보관 인덱스(ParityStore). 청크 바이트는 스토리지 소스에 놓이고
+# 인가(owner_user_id)와 쿼터 회계(SUM(size))는 여기서 SQL로 처리한다.
+_HOSTED_CHUNKS_SQL = """\
+CREATE TABLE IF NOT EXISTS hosted_chunks (
+    chunk_id       TEXT NOT NULL PRIMARY KEY,
+    owner_user_id  TEXT NOT NULL,
+    source_id      TEXT NOT NULL,
+    physical_path  TEXT NOT NULL,
+    size           INTEGER NOT NULL,
+    stored_at      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_hosted_chunks_owner
+    ON hosted_chunks(owner_user_id);
 """
 
 
@@ -121,6 +142,7 @@ class MetadataStore:
         self._migrate_to_v5()
         self._migrate_to_v6()
         self._migrate_to_v7()
+        self._migrate_to_v8()
         self._initialized = True
         logger.info("Metadata Store 초기화 완료: %s", self._db_path)
 
@@ -388,6 +410,98 @@ class MetadataStore:
             logger.error("v7 스키마 마이그레이션 실패, 롤백 수행: %s", e)
             raise
 
+    def _migrate_to_v8(self) -> None:
+        """v7 → v8: 청크 카피 위치 다중화 + 타 사용자 청크 보관 인덱스.
+
+        - file_chunks PK를 `(virtual_path, chunk_index, device_id, source_id)`로
+          바꿔 청크 하나가 여러 위치를 갖게 한다. 기존 행은 위치 1개로 이관되고
+          NULL device_id는 빈 문자열(이 기기)로 채운다.
+        - hosted_chunks 테이블 추가(ParityStore의 index.json 대체).
+
+        PK 변경은 ALTER로 불가하므로 테이블을 새로 만들어 복사한 뒤 교체한다.
+        진행 전 DB를 `.v7.bak`으로 복사하고, 실패하면 백업 경로를 로그에 남기고
+        예외를 올린다(반쯤 바뀐 스키마로 기동하지 않는다).
+        """
+        conn = self._get_conn()
+        cur = conn.execute("PRAGMA table_info(file_chunks)")
+        cols = {r["name"] for r in cur.fetchall()}
+        if not cols:
+            return  # v7 미수행(있을 수 없음) — 안전 가드
+        row = conn.execute(
+            "SELECT version FROM schema_version WHERE id = 1"
+        ).fetchone()
+        if "kind" in cols and row is not None and row["version"] >= 8:
+            return
+
+        backup_path = f"{self._db_path}.v7.bak"
+        if "kind" not in cols:
+            # 실제 데이터 이관이 필요한 경우에만 백업한다(빈 스키마 갱신은 제외).
+            try:
+                conn.execute("PRAGMA wal_checkpoint(FULL)")
+                shutil.copy2(self._db_path, backup_path)
+                logger.info("DB 백업 생성: %s", backup_path)
+            except OSError as e:
+                logger.error(
+                    "v8 마이그레이션 중단 — DB 백업 실패(%s): %s", backup_path, e
+                )
+                raise
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if "kind" not in cols:
+                conn.execute("""
+                    CREATE TABLE file_chunks_v8 (
+                        virtual_path  TEXT    NOT NULL,
+                        chunk_index   INTEGER NOT NULL,
+                        device_id     TEXT    NOT NULL DEFAULT '',
+                        source_id     TEXT    NOT NULL,
+                        chunk_ref     TEXT,
+                        kind          TEXT    NOT NULL DEFAULT 'source',
+                        size          INTEGER NOT NULL,
+                        hash          TEXT,
+                        PRIMARY KEY (virtual_path, chunk_index, device_id, source_id)
+                    )
+                """)
+                conn.execute(
+                    "INSERT OR IGNORE INTO file_chunks_v8 "
+                    "(virtual_path, chunk_index, device_id, source_id, "
+                    "chunk_ref, kind, size, hash) "
+                    "SELECT virtual_path, chunk_index, COALESCE(device_id, ''), "
+                    "source_id, chunk_ref, 'source', size, hash "
+                    "FROM file_chunks"
+                )
+                conn.execute("DROP TABLE file_chunks")
+                conn.execute(
+                    "ALTER TABLE file_chunks_v8 RENAME TO file_chunks"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_file_chunks_source "
+                    "ON file_chunks(source_id)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_file_chunks_path "
+                    "ON file_chunks(virtual_path, chunk_index)"
+                )
+            # executescript는 열린 트랜잭션을 커밋해 버리므로 문장 단위로 실행한다.
+            for stmt in _HOSTED_CHUNKS_SQL.split(";"):
+                if stmt.strip():
+                    conn.execute(stmt)
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_version (id, version, migrated_at) "
+                "VALUES (1, 8, ?)",
+                (time.time(),),
+            )
+            conn.commit()
+            logger.info(
+                "MetadataStore v8 스키마 마이그레이션 완료 "
+                "(청크 카피 위치 다중화, hosted_chunks)"
+            )
+        except Exception as e:
+            conn.rollback()
+            logger.error(
+                "v8 마이그레이션 실패, 롤백 수행 — 백업: %s: %s", backup_path, e
+            )
+            raise
+
     # --- 청크 매니페스트 CRUD ---
 
     def put_chunks(self, virtual_path: str, chunks: list) -> None:
@@ -407,11 +521,11 @@ class MetadataStore:
         conn.executemany(
             "INSERT INTO file_chunks "
             "(virtual_path, chunk_index, chunk_ref, source_id, device_id, "
-            "size, hash) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "kind, size, hash) VALUES (?, ?, ?, ?, ?, 'source', ?, ?)",
             [
                 (
                     virtual_path, c.index, c.chunk_ref, c.source_id,
-                    c.device_id, c.size, c.hash,
+                    c.device_id or "", c.size, c.hash,
                 )
                 for c in chunks
             ],
@@ -422,11 +536,18 @@ class MetadataStore:
         )
 
     def get_chunks(self, virtual_path: str) -> list:
-        """파일의 청크 매니페스트를 chunk_index 순으로 반환한다(없으면 빈 목록)."""
+        """파일의 청크 매니페스트를 chunk_index 순으로 반환한다(없으면 빈 목록).
+
+        청크당 카피가 여럿이어도 매니페스트 한 줄(먼저 등록된 위치)만 돌려준다 —
+        파일 크기·삭제·이관 등 기존 호출부는 청크당 위치 1개를 기대한다. 위치 전체가
+        필요하면 `get_chunk_locations`를 쓴다.
+        """
         conn = self._get_conn()
         cursor = conn.execute(
-            "SELECT chunk_index, chunk_ref, source_id, device_id, size, hash "
-            "FROM file_chunks WHERE virtual_path = ? ORDER BY chunk_index",
+            "SELECT chunk_index, chunk_ref, source_id, device_id, size, hash, "
+            "MIN(rowid) AS first_row "
+            "FROM file_chunks WHERE virtual_path = ? "
+            "GROUP BY chunk_index ORDER BY chunk_index",
             (virtual_path,),
         )
         return [
@@ -434,12 +555,77 @@ class MetadataStore:
                 index=row["chunk_index"],
                 chunk_ref=row["chunk_ref"],
                 source_id=row["source_id"],
-                device_id=row["device_id"],
+                device_id=row["device_id"] or None,
                 size=row["size"],
                 hash=row["hash"],
             )
             for row in cursor.fetchall()
         ]
+
+    def get_chunk_locations(self, virtual_path: str) -> dict:
+        """청크 index → 이 기기가 아는 카피 위치 목록.
+
+        카피 간 우열이 없으므로 순서는 등록 순(rowid)일 뿐 우선순위가 아니다. 읽기
+        우선순위(로컬 우선)는 호출자가 자기 device_id로 정한다.
+        """
+        from stardustlib.chunk_location import ChunkLocation
+
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "SELECT chunk_index, device_id, source_id, chunk_ref, kind "
+            "FROM file_chunks WHERE virtual_path = ? "
+            "ORDER BY chunk_index, rowid",
+            (virtual_path,),
+        )
+        out: dict[int, list] = {}
+        for row in cursor.fetchall():
+            out.setdefault(row["chunk_index"], []).append(
+                ChunkLocation(
+                    device_id=row["device_id"] or "",
+                    source_id=row["source_id"],
+                    chunk_ref=row["chunk_ref"],
+                    kind=row["kind"] or "source",
+                )
+            )
+        return out
+
+    def add_chunk_location(
+        self, virtual_path: str, chunk_index: int, location,
+        size: int, chunk_hash: str | None = None,
+    ) -> None:
+        """카피 위치를 추가한다(같은 위치 재등록은 멱등).
+
+        청크 자체 정보(size/hash)는 위치와 무관하게 같으므로 그대로 함께 넣는다.
+        """
+        conn = self._get_conn()
+        conn.execute(
+            "INSERT OR REPLACE INTO file_chunks "
+            "(virtual_path, chunk_index, device_id, source_id, chunk_ref, "
+            "kind, size, hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                virtual_path, chunk_index, location.device_id or "",
+                location.source_id, location.chunk_ref, location.kind,
+                size, chunk_hash,
+            ),
+        )
+        conn.commit()
+
+    def remove_chunk_location(
+        self, virtual_path: str, chunk_index: int, device_id: str,
+        source_id: str,
+    ) -> None:
+        """카피 위치를 제거한다(이전 완료 후 원래 카피를 지울 때).
+
+        마지막 위치까지 지우면 청크를 잃으므로, 호출자가 새 위치 등록을 먼저 마쳐야
+        한다(Property 5).
+        """
+        conn = self._get_conn()
+        conn.execute(
+            "DELETE FROM file_chunks WHERE virtual_path = ? AND chunk_index = ? "
+            "AND device_id = ? AND source_id = ?",
+            (virtual_path, chunk_index, device_id or "", source_id),
+        )
+        conn.commit()
 
     def delete_chunks(self, virtual_path: str) -> None:
         """파일의 청크 매니페스트를 삭제하고 chunked=0으로 되돌린다."""
@@ -459,26 +645,130 @@ class MetadataStore:
         source_id: str,
         device_id: str | None,
         chunk_ref: str | None = None,
+        from_device_id: str | None = None,
+        from_source_id: str | None = None,
     ) -> None:
-        """청크 하나의 배치(소스/소유 기기/참조)를 갱신한다.
+        """청크 카피 하나를 다른 위치로 옮긴 사실을 기록한다.
 
-        스필오버·evacuate·축출처럼 청크만 옮기는 경우에 쓴다. 파일 전체를 다시
-        기록하지 않는다.
+        스필오버·evacuate·축출처럼 카피가 자리를 옮기는 경우에 쓴다(카피 수는 그대로).
+        옮길 카피를 from_device_id/from_source_id로 지목할 수 있고, 지목하지 않으면
+        매니페스트 위치(먼저 등록된 행)를 옮긴다.
+
+        목적지에 이미 다른 행이 있으면 그 행을 지운 뒤 옮긴다 — 같은 위치에 카피를
+        두 번 두지 않기 위해서다(Property 2).
         """
         conn = self._get_conn()
+        if from_source_id is not None:
+            row = conn.execute(
+                "SELECT rowid FROM file_chunks WHERE virtual_path = ? "
+                "AND chunk_index = ? AND device_id = ? AND source_id = ?",
+                (
+                    virtual_path, chunk_index, (from_device_id or ""),
+                    from_source_id,
+                ),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT MIN(rowid) AS rowid FROM file_chunks "
+                "WHERE virtual_path = ? AND chunk_index = ?",
+                (virtual_path, chunk_index),
+            ).fetchone()
+        if row is None or row["rowid"] is None:
+            return  # 옮길 카피가 없다(이미 지워졌거나 다른 표현)
+        target_rowid = row["rowid"]
+        # 목적지 중복 행 제거(PK 충돌 방지 + 같은 소스 2카피 금지)
+        conn.execute(
+            "DELETE FROM file_chunks WHERE virtual_path = ? AND chunk_index = ? "
+            "AND device_id = ? AND source_id = ? AND rowid != ?",
+            (
+                virtual_path, chunk_index, (device_id or ""), source_id,
+                target_rowid,
+            ),
+        )
         if chunk_ref is None:
             conn.execute(
                 "UPDATE file_chunks SET source_id = ?, device_id = ? "
-                "WHERE virtual_path = ? AND chunk_index = ?",
-                (source_id, device_id, virtual_path, chunk_index),
+                "WHERE rowid = ?",
+                (source_id, device_id or "", target_rowid),
             )
         else:
             conn.execute(
                 "UPDATE file_chunks SET source_id = ?, device_id = ?, "
-                "chunk_ref = ? WHERE virtual_path = ? AND chunk_index = ?",
-                (source_id, device_id, chunk_ref, virtual_path, chunk_index),
+                "chunk_ref = ? WHERE rowid = ?",
+                (source_id, device_id or "", chunk_ref, target_rowid),
             )
         conn.commit()
+
+    # --- 타 사용자 청크 보관 인덱스(ParityStore) ---
+
+    def put_hosted_chunk(
+        self, chunk_id: str, owner_user_id: str, source_id: str,
+        physical_path: str, size: int,
+    ) -> None:
+        """보관한 타 사용자 청크를 인덱싱한다(같은 chunk_id 재보관은 교체)."""
+        conn = self._get_conn()
+        conn.execute(
+            "INSERT OR REPLACE INTO hosted_chunks "
+            "(chunk_id, owner_user_id, source_id, physical_path, size, stored_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                chunk_id, owner_user_id, source_id, physical_path, size,
+                time.time(),
+            ),
+        )
+        conn.commit()
+
+    def get_hosted_chunk(self, chunk_id: str) -> dict | None:
+        """보관 청크의 소유자·위치를 반환한다(없으면 None)."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT chunk_id, owner_user_id, source_id, physical_path, size "
+            "FROM hosted_chunks WHERE chunk_id = ?",
+            (chunk_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "chunk_id": row["chunk_id"],
+            "owner_user_id": row["owner_user_id"],
+            "source_id": row["source_id"],
+            "physical_path": row["physical_path"],
+            "size": row["size"],
+        }
+
+    def delete_hosted_chunk(self, chunk_id: str) -> None:
+        """보관 청크 인덱스를 제거한다(멱등)."""
+        conn = self._get_conn()
+        conn.execute(
+            "DELETE FROM hosted_chunks WHERE chunk_id = ?", (chunk_id,)
+        )
+        conn.commit()
+
+    def hosted_bytes(self) -> int:
+        """보관 중인 타 사용자 청크의 합계 바이트(쿼터 회계)."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT COALESCE(SUM(size), 0) AS total FROM hosted_chunks"
+        ).fetchone()
+        return int(row["total"]) if row else 0
+
+    def list_hosted_chunks(self) -> list[dict]:
+        """보관 청크 전체 목록(진단·이관용)."""
+        conn = self._get_conn()
+        cursor = conn.execute(
+            "SELECT chunk_id, owner_user_id, source_id, physical_path, size "
+            "FROM hosted_chunks ORDER BY stored_at"
+        )
+        return [
+            {
+                "chunk_id": row["chunk_id"],
+                "owner_user_id": row["owner_user_id"],
+                "source_id": row["source_id"],
+                "physical_path": row["physical_path"],
+                "size": row["size"],
+            }
+            for row in cursor.fetchall()
+        ]
 
     def list_chunked_paths_in_source(self, source_id: str) -> list:
         """해당 소스에 청크를 하나라도 둔 활성 파일의 가상 경로 목록을 반환한다.
@@ -509,7 +799,7 @@ class MetadataStore:
         cursor = conn.execute(
             "SELECT c.source_id, c.chunk_ref FROM file_chunks c "
             "JOIN files f ON f.virtual_path = c.virtual_path "
-            "WHERE f.deleted = 0 AND (c.device_id = ? OR c.device_id IS NULL)",
+            "WHERE f.deleted = 0 AND c.device_id IN (?, '')",
             (device_id,),
         )
         return {
@@ -796,7 +1086,7 @@ class MetadataStore:
             "JOIN file_chunks c ON c.virtual_path = f.virtual_path "
             "WHERE f.deleted = 0 "
             f"AND COALESCE(f.replication_status, 'none') IN ({placeholders}) "
-            "AND (c.device_id = ? OR c.device_id IS NULL)",
+            "AND c.device_id IN (?, '')",
             (*statuses, device_id),
         ).fetchall()
         return [row["virtual_path"] for row in rows]

@@ -35,8 +35,8 @@ def _identify_self(my_devices: list[dict], device_name: str) -> str | None:
     return None
 
 
-async def _fetch_min_replicas(auth, server_url: str) -> int | None:
-    """서버 정책의 목표 복제본 수. 조회 실패(구버전·오프라인)면 None."""
+async def _fetch_target_copies(auth, server_url: str) -> int | None:
+    """서버 정책의 목표 카피 수. 조회 실패(구버전·오프라인)면 None."""
     from stardustlib.replication_hosting import fetch_policy
 
     try:
@@ -44,7 +44,7 @@ async def _fetch_min_replicas(auth, server_url: str) -> int | None:
     except Exception as e:  # noqa: BLE001 — 정책 조회 실패는 비치명
         logger.debug("복제 정책 조회 실패, 기본값 사용: %s", e)
         return None
-    return int(policy["min_replicas"]) if policy else None
+    return int(policy["target_copies"]) if policy else None
 
 
 class CLISession:
@@ -64,27 +64,27 @@ class CLISession:
         self.server_url: str | None = None
         self.my_devices: list[dict] | None = None
         self.self_device_id: str | None = None
-        # 서버 /replication/policy의 목표 복제본 수. 조회 실패 시 None(기본값 사용).
-        self.min_replicas: int | None = None
+        # 서버 /replication/policy의 목표 카피 수. 조회 실패 시 None(기본값 사용).
+        self.target_copies: int | None = None
 
     def make_replication_manager(self):
         """리플리케이션 매니저를 생성한다(온라인 세션 전용).
 
-        서버 정책의 목표 복제본 수를 반영한다 — 기본값으로 고정하면 정책이
-        min_replicas=2여도 1개만 확보하고 replicated로 처리된다.
+        서버 정책의 목표 카피 수를 반영한다 — 기본값으로 고정하면 정책이
+        target_copies=3이어도 다른 수를 목표로 삼는다.
 
         호출자가 close()로 정리한다.
         """
         if not self.online or self.auth is None or not self.server_url:
             raise RuntimeError("리플리케이션은 온라인 세션이 필요합니다")
         from stardustlib.replication_manager import (
-            DEFAULT_MIN_REPLICAS,
+            DEFAULT_TARGET_COPIES,
             ReplicationManager,
         )
 
         return ReplicationManager(
             self.auth, self.server_url, self.metadata, self.storage_pool,
-            min_replicas=self.min_replicas or DEFAULT_MIN_REPLICAS,
+            target_copies=self.target_copies or DEFAULT_TARGET_COPIES,
         )
 
     @classmethod
@@ -205,7 +205,7 @@ class CLISession:
         session.server_url = server_url
         session.my_devices = my_devices
         session.self_device_id = self_device_id
-        session.min_replicas = await _fetch_min_replicas(auth, server_url)
+        session.target_copies = await _fetch_target_copies(auth, server_url)
         return session
 
     @staticmethod

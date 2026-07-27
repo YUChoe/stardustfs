@@ -129,8 +129,9 @@ class _MockCentral:
     async def _record_replica(self, request: web.Request) -> web.Response:
         b = await request.json()
         lst = self.replicas.setdefault(b["chunk_id"], [])
-        if b["holder_device_id"] not in lst:
-            lst.append(b["holder_device_id"])
+        entry = (b["holder_device_id"], b.get("source_id", ""))
+        if entry not in lst:
+            lst.append(entry)
         return web.json_response({"status": "ok"})
 
     async def _list_chunks(self, request: web.Request) -> web.Response:
@@ -143,12 +144,13 @@ class _MockCentral:
     async def _list_replicas(self, request: web.Request) -> web.Response:
         chunk_id = request.match_info["chunk_id"]
         out = []
-        for d in self.replicas.get(chunk_id, []):
+        for d, source_id in self.replicas.get(chunk_id, []):
             h = self.holders.get(d)
             if h is None:
                 continue
             out.append({
                 "device_id": d,
+                "source_id": source_id,
                 "connection_address": h["address"],
                 "is_online": h["online"],
                 "status": "active",
@@ -169,7 +171,7 @@ class _Holder:
         store = MetadataStore(os.path.join(self._dir, ".m.db"), b"\x00" * 32)
         store.initialize()
         storage_pool = StoragePool([src], store, encryption_engine=None)
-        parity = ParityStore(os.path.join(self._dir, "parity"))
+        parity = ParityStore(storage_pool, store)
         auth = _FakeAuth(central_url, f"holder-{device_id}")
         self.parity = parity
         self.p2p = P2PServer(storage_pool, auth, self.port, central_url, parity_store=parity)
@@ -205,7 +207,7 @@ async def env():
     owner_auth = _FakeAuth(central.url, _OWNER)
     mgr = ReplicationManager(
         owner_auth, central.url, store, storage_pool,
-        chunk_size=64, min_replicas=3,
+        chunk_size=64, target_copies=3,
     )
 
     yield {"central": central, "holders": holders, "mgr": mgr, "storage_pool": storage_pool}
@@ -231,7 +233,7 @@ async def test_replicate_then_recover_roundtrip(env):
 
     result = await asyncio.to_thread(env["mgr"].replicate, "/doc.bin")
     assert result.status == "replicated"
-    assert all(n == 3 for n in result.replicas_per_chunk)
+    assert all(n == 3 for n in result.copies_per_chunk)
 
     # 호스트는 암호문만 보관(평문 비가독) — 홀더 ParityStore에 평문이 없다.
     for holder in env["holders"]:
@@ -287,7 +289,7 @@ async def test_pending_when_insufficient_holders(env):
     await _put_file(env, "/y", os.urandom(100))
     result = await asyncio.to_thread(env["mgr"].replicate, "/y")
     assert result.status == "pending"
-    assert all(n <= 1 for n in result.replicas_per_chunk)
+    assert all(n <= 1 for n in result.copies_per_chunk)
 
 
 @pytest.mark.asyncio

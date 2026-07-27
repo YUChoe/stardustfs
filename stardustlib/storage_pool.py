@@ -10,6 +10,7 @@ import time
 import uuid
 
 from stardustlib import chunker
+from stardustlib.chunk_location import KIND_SOURCE, ChunkLocation
 from stardustlib.encryption_engine import EncryptionEngine
 from stardustlib.exceptions import InsufficientStorageError
 from stardustlib.metadata_store import MetadataStore
@@ -674,21 +675,188 @@ class StoragePool:
         return self.encryption_engine.encrypt(plain)
 
     def _read_chunk_bytes(self, virtual_path: str, chunk: ChunkRef) -> bytes:
-        """청크 암호문을 확보하고 해시를 검증한다(청크별 로컬/원격 라우팅).
+        """청크 암호문을 확보하고 해시를 검증한다(카피 위치를 순회).
 
-        청크마다 보관 기기가 다를 수 있으므로 파일 단위 소유자가 아니라 청크의
-        device_id로 라우팅한다.
+        카피 간 우열이 없으므로 도달 가능한 카피가 하나라도 있으면 읽기가 성공해야
+        한다(Property 7). 로컬 소스 카피를 먼저 쓰고, 없거나 읽지 못하면 다른 기기의
+        카피로 넘어간다. 마지막 시도까지 실패하면 그 오류를 그대로 올린다.
         """
-        if chunk.device_id is not None and chunk.device_id != self.device_id:
-            data = self._read_remote_chunk(virtual_path, chunk)
-        else:
-            data = self._read_local_chunk(virtual_path, chunk)
-        if chunk.hash and chunker.chunk_hash(data) != chunk.hash:
-            raise OSError(
-                f"청크 해시 불일치: file={virtual_path} "
-                f"chunk_index={chunk.index} ref={chunk.chunk_ref}"
+        last_error: Exception | None = None
+        tried: list[str] = []
+        for candidate in self._chunk_read_order(virtual_path, chunk):
+            tried.append(
+                f"{candidate.device_id or 'local'}/{candidate.source_id}"
             )
-        return data
+            try:
+                if (
+                    candidate.device_id is not None
+                    and candidate.device_id != self.device_id
+                ):
+                    data = self._read_remote_chunk(virtual_path, candidate)
+                else:
+                    data = self._read_local_chunk(virtual_path, candidate)
+            except OSError as e:
+                last_error = e
+                continue
+            if chunk.hash and chunker.chunk_hash(data) != chunk.hash:
+                last_error = OSError(
+                    f"청크 해시 불일치: file={virtual_path} "
+                    f"chunk_index={chunk.index} ref={candidate.chunk_ref}"
+                )
+                continue  # 손상된 카피 → 다음 위치
+            return data
+        raise OSError(
+            f"청크를 읽을 수 있는 카피가 없습니다: file={virtual_path} "
+            f"chunk_index={chunk.index} 시도한 위치={tried or ['(없음)']}"
+            + (f" 마지막 오류={last_error}" if last_error else "")
+        )
+
+    def _chunk_read_order(self, virtual_path: str, chunk: ChunkRef) -> list:
+        """읽기를 시도할 카피 순서(로컬 우선, 그다음 다른 기기).
+
+        매니페스트에 실린 위치를 먼저 두고, 같은 청크의 다른 위치를 뒤에 붙인다.
+        위치 조회를 지원하지 않는 저장소(구버전·테스트 대역)는 매니페스트 하나만
+        쓴다(기존 동작).
+        """
+        get_locations = getattr(self.metadata_store, "get_chunk_locations", None)
+        if not callable(get_locations):
+            return [chunk]
+        try:
+            locations = get_locations(virtual_path).get(chunk.index, [])
+        except Exception:  # noqa: BLE001 — 조회 실패 시 매니페스트만
+            return [chunk]
+        order = [chunk]
+        seen = {(chunk.device_id or "", chunk.source_id)}
+        others = []
+        for loc in locations:
+            key = (loc.device_id, loc.source_id)
+            if key in seen or loc.kind != KIND_SOURCE or not loc.chunk_ref:
+                continue
+            seen.add(key)
+            ref = ChunkRef(
+                index=chunk.index, chunk_ref=loc.chunk_ref,
+                source_id=loc.source_id,
+                device_id=loc.device_id or None,
+                size=chunk.size, hash=chunk.hash,
+            )
+            # 로컬 카피를 앞으로(원격 왕복 회피).
+            if ref.device_id in (None, self.device_id):
+                order.append(ref)
+            else:
+                others.append(ref)
+        return order + others
+
+    def store_chunk_copy(
+        self, virtual_path: str, chunk_index: int, data: bytes,
+        chunk_ref: str | None, chunk_hash: str | None, source_id: str = "",
+    ) -> str | None:
+        """청크 카피를 로컬 소스에 추가로 기록하고 위치를 등록한다.
+
+        다른 기기 후보가 하나도 없을 때 같은 기기의 다른 소스에 카피를 두는 경로다
+        (Requirement 2.3). source_id를 주면 그 소스를 쓰고, 없으면 여유가 가장 많은
+        소스를 고른다. 이미 카피가 있는 소스는 다시 쓰지 않는다(Property 2).
+
+        Returns:
+            기록한 source_id, 놓을 소스가 없으면 None.
+        """
+        if not chunk_ref:
+            return None
+        used = {
+            loc.source_id
+            for loc in self.metadata_store.get_chunk_locations(
+                virtual_path
+            ).get(chunk_index, [])
+            if loc.device_id in ("", self.device_id)
+        }
+        target = None
+        if source_id and source_id not in used:
+            candidate = self._get_source_by_id(source_id)
+            if (
+                candidate is not None and candidate.is_active
+                and not candidate.is_remote
+                and candidate.get_available_space() >= len(data)
+            ):
+                target = candidate
+        if target is None:
+            usable = [
+                s for s in self.sources
+                if s.is_active and not s.is_remote
+                and s.source_id not in used
+                and s.get_available_space() >= len(data)
+            ]
+            if not usable:
+                return None
+            target = max(usable, key=lambda s: s.get_available_space())
+        target.write(chunk_ref, data)
+        self.metadata_store.add_chunk_location(
+            virtual_path, chunk_index,
+            ChunkLocation(
+                device_id=self.device_id or "", source_id=target.source_id,
+                chunk_ref=chunk_ref, kind=KIND_SOURCE,
+            ),
+            len(data), chunk_hash,
+        )
+        return target.source_id
+
+    def read_chunk_copy(self, virtual_path: str, chunk_index: int) -> bytes:
+        """로컬 카피에서 청크 암호문을 읽는다(heal이 원격 왕복을 피하는 경로).
+
+        Raises:
+            OSError: 이 기기에 읽을 수 있는 카피가 없을 때.
+        """
+        locations = self.metadata_store.get_chunk_locations(virtual_path).get(
+            chunk_index, []
+        )
+        for loc in locations:
+            if loc.device_id not in ("", self.device_id) or not loc.chunk_ref:
+                continue
+            source = self._get_source_by_id(loc.source_id)
+            if source is None or not source.is_active or source.is_remote:
+                continue
+            try:
+                return source.read(loc.chunk_ref)
+            except (FileNotFoundError, OSError):
+                continue
+        raise OSError(
+            f"로컬 카피 없음: file={virtual_path} chunk_index={chunk_index}"
+        )
+
+    def delete_chunk_copy(
+        self, virtual_path: str, chunk_index: int, source_id: str
+    ) -> None:
+        """로컬 카피 하나를 지우고 위치 등록을 해제한다(카피 이전 마지막 단계).
+
+        마지막 카피를 지우면 청크를 잃으므로, 그 소스가 이 청크의 유일한 로컬
+        카피이고 다른 위치도 없으면 아무것도 하지 않는다.
+        """
+        locations = self.metadata_store.get_chunk_locations(virtual_path).get(
+            chunk_index, []
+        )
+        if len(locations) <= 1:
+            logger.warning(
+                "마지막 카피는 지우지 않습니다: file=%s chunk_index=%d",
+                virtual_path, chunk_index,
+            )
+            return
+        target = next(
+            (
+                loc for loc in locations
+                if loc.source_id == source_id
+                and loc.device_id in ("", self.device_id)
+            ),
+            None,
+        )
+        if target is None:
+            return
+        source = self._get_source_by_id(source_id)
+        if source is not None and target.chunk_ref:
+            try:
+                source.delete(target.chunk_ref)
+            except Exception as e:  # noqa: BLE001 — 고아 블록은 orphan GC가 회수
+                logger.debug("카피 삭제 실패(무시): %s: %s", target.chunk_ref, e)
+        self.metadata_store.remove_chunk_location(
+            virtual_path, chunk_index, target.device_id, source_id
+        )
 
     def _read_local_chunk(self, virtual_path: str, chunk: ChunkRef) -> bytes:
         """로컬 소스에서 청크 암호문을 읽는다."""

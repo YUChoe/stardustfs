@@ -2,7 +2,7 @@
 
 replicate(virtual_path): 파일 평문을 자체 포함 암호문 blob으로 암호화 → 고정 크기
 청크로 분할 → 서버에 청크 등록 + placement 요청 → 배치된 홀더에 직접 push →
-ack 수집 → 레지스트리 확정 → 모든 청크가 ≥min_replicas 확보 시 replicated, 아니면
+ack 수집 → 레지스트리 확정 → 모든 청크가 target_copies 확보 시 replicated, 아니면
 pending(경고).
 
 recover(virtual_path): 서버에서 청크 목록 조회 → 청크별 도달 가능한 홀더에서 fetch →
@@ -28,20 +28,30 @@ import httpx
 
 from stardustlib import chunker, replication_progress
 from stardustlib.auth_client import AuthClient
+from stardustlib.chunk_location import (
+    KIND_PARITY,
+    KIND_SOURCE,
+    ChunkLocation,
+    copies,
+    distinct_devices,
+    has_location,
+)
 from stardustlib.encryption_engine import EncryptionEngine
 from stardustlib.exceptions import AuthenticationError
 from stardustlib.remote_source import _EventLoopThread, direct_tcp_viable
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MIN_REPLICAS = 1  # 원본 외 추가 사본 수. 서버 /replication/policy로 재정의됨.
+# 목표 카피 수. 각 청크를 서로 다른 위치 3곳에 둔다(원본/복제본 구분 없음).
+# 서버 /replication/policy의 target_copies로 재정의된다.
+DEFAULT_TARGET_COPIES = 3
 # 홀더 직접 연결 시도 타임아웃(초). 짧게 잡아 도달 불가 시 릴레이로 빨리 fallback.
 DIRECT_HOLDER_TIMEOUT = 3.0
 # 보관 한도 초과(507)를 응답한 홀더를 배치 후보에서 제외하는 기간(초). 서버 회계가
 # 홀더 실제 한도보다 낙관적일 때(신고값 노후화 등) 같은 홀더로 매 청크·매 주기
 # 재시도하는 폭주를 막는다. 만료되면 다시 후보가 되어 공간 회수를 반영한다.
 QUOTA_BLOCK_SECONDS = 1800.0
-# placement에 목표 복제본 수보다 여유 있게 후보를 요청한다. 일부 홀더가 쿼터 초과
+# placement에 목표 카피 수보다 여유 있게 후보를 요청한다. 일부 홀더가 쿼터 초과
 # (507)나 도달 불가로 실패해도 같은 청크에서 대체 홀더로 넘어갈 수 있다.
 PLACEMENT_SPARE = 2
 # 홀더 보관 한도 초과 상태 코드(p2p replica_store).
@@ -69,13 +79,18 @@ class RecoveryError(Exception):
 
 @dataclass
 class ReplicationResult:
-    """replicate 결과. status는 replicated|pending."""
+    """replicate 결과. status는 replicated|pending|skipped.
+
+    카피 수(copies_per_chunk)와 위치 분포(devices_per_chunk)를 따로 담는다 — 카피 3개가
+    한 기기에 몰린 상태와 3기기에 분산된 상태를 구분해야 한다(Requirement 2.7).
+    """
 
     status: str
     chunk_count: int
-    min_replicas: int
-    replicas_per_chunk: list[int] = field(default_factory=list)
-    # 제외 규칙 적용 후 배치 후보가 하나도 없던 청크 수(조용한 실패 방지).
+    target_copies: int
+    copies_per_chunk: list[int] = field(default_factory=list)
+    devices_per_chunk: list[int] = field(default_factory=list)
+    # 제외 규칙 적용 후 쓸 수 있는 위치가 하나도 없던 청크 수(조용한 실패 방지).
     no_holder_chunks: int = 0
 
 
@@ -83,9 +98,10 @@ class ReplicationResult:
 class HealthSummary:
     """비파괴적 건강성 점검 결과(재복제 없이 현황만)."""
 
-    degraded: bool       # 청크 중 하나라도 online 복제 수 < min_replicas
+    degraded: bool       # 청크 중 하나라도 온라인 카피 수 < target_copies
     chunk_count: int
-    min_online: int      # 청크별 online 복제 수의 최소값
+    min_copies: int      # 청크별 온라인 카피 수의 최소값
+    min_devices: int = 0  # 청크별 서로 다른 기기 수의 최소값(축출·이전 판정 기준)
 
 
 @dataclass
@@ -94,8 +110,9 @@ class HealReport:
 
     status: str  # replicated|pending
     chunk_count: int
-    min_replicas: int
-    repaired: int = 0  # 복제본을 추가한 청크 수
+    target_copies: int
+    repaired: int = 0  # 카피를 추가한 청크 수
+    relocated: int = 0  # 다른 기기로 옮긴 카피 수(위치 분산)
     unrecoverable: list[str] = field(default_factory=list)  # 도달 소스 없는 청크
 
 
@@ -110,7 +127,7 @@ class ReplicationManager:
         storage_pool: Any,
         *,
         chunk_size: int = chunker.DEFAULT_CHUNK_SIZE,
-        min_replicas: int = DEFAULT_MIN_REPLICAS,
+        target_copies: int = DEFAULT_TARGET_COPIES,
         timeout: float = 10.0,
         max_concurrent_repair: int = 4,
         io: _EventLoopThread | None = None,
@@ -122,7 +139,7 @@ class ReplicationManager:
         self._storage_pool = storage_pool
         self._engine = getattr(storage_pool, "encryption_engine", None)
         self._chunk_size = chunk_size
-        self._min_replicas = min_replicas
+        self._target_copies = target_copies
         self._timeout = timeout
         self._max_concurrent_repair = max_concurrent_repair
         self._io = io or _EventLoopThread.get_instance()
@@ -142,14 +159,14 @@ class ReplicationManager:
     # ------------------------------------------------------------------
 
     @property
-    def min_replicas(self) -> int:
-        """목표 복제본 수."""
-        return self._min_replicas
+    def target_copies(self) -> int:
+        """목표 카피 수(청크 하나를 둘 서로 다른 위치 수)."""
+        return self._target_copies
 
-    def set_min_replicas(self, n: int) -> None:
-        """목표 복제본 수를 갱신한다(정책 변경 반영)."""
+    def set_target_copies(self, n: int) -> None:
+        """목표 카피 수를 갱신한다(정책 변경 반영)."""
         if n >= 1:
-            self._min_replicas = n
+            self._target_copies = n
 
     def _mark_quota_blocked(self, device_id: str) -> None:
         """보관 한도를 초과한 홀더를 QUOTA_BLOCK_SECONDS 동안 배치 후보에서 뺀다.
@@ -173,7 +190,7 @@ class ReplicationManager:
 
         각 device는 자기 로컬 청크만 올리므로, 이 device의 전송 결과만으로는 파일이
         완료됐는지 알 수 없다(다른 device가 나머지를 올린다). 레지스트리에 등록된
-        모든 청크가 min_replicas 이상이면 replicated다.
+        모든 청크가 목표 카피 수를 채웠으면 replicated다.
 
         조회 실패 시에는 이 device의 전송 결과를 그대로 쓴다(보수적).
         """
@@ -239,7 +256,7 @@ class ReplicationManager:
     # ------------------------------------------------------------------
 
     def replicate(self, virtual_path: str) -> ReplicationResult:
-        """이 device가 보관한 청크를 ≥min_replicas 홀더에 복제한다.
+        """이 device가 보관한 청크를 서로 다른 위치 target_copies곳까지 채운다.
 
         로컬 I/O(읽기·암호화·상태 기록)는 호출 스레드에서, 네트워크는 IO 루프에서
         수행한다. 파일이 없으면 FileNotFoundError, 암호화 미설정 시 ReplicationError.
@@ -271,14 +288,18 @@ class ReplicationManager:
             )
             return ReplicationResult(
                 status="skipped", chunk_count=0,
-                min_replicas=self._min_replicas,
+                target_copies=self._target_copies,
             )
 
         self._progress_call(
             "set_stage", replication_progress.STAGE_STORING, len(chunks)
         )
         result = self._io.run_coroutine(
-            self._replicate_chunks(file_ref, chunks, origins)
+            self._replicate_chunks(
+                file_ref, chunks, origins,
+                manifest=self._local_manifest(virtual_path),
+                virtual_path=virtual_path,
+            )
         )
         # 이 device는 자기 청크만 올렸다. 파일 전체 상태는 서버 레지스트리로
         # 판정해야 다른 device가 올린 몫이 반영된다.
@@ -291,20 +312,36 @@ class ReplicationManager:
             )
             if result.no_holder_chunks:
                 reason += (
-                    f" — 배치 후보가 없는 청크 {result.no_holder_chunks}개"
-                    f"(원본 보관 기기·자기 기기·한도 초과 기기를 제외하면 남는"
-                    f" 홀더가 없습니다)"
+                    f" — 쓸 수 있는 위치가 없는 청크 {result.no_holder_chunks}개"
+                    f"(이미 카피가 있는 위치·한도 초과 기기를 제외하면 남는 위치가"
+                    f" 없습니다)"
                 )
-            # 청크가 많으면 복제수 목록이 장문이 되므로 최소/최대만 요약한다.
-            counts = result.replicas_per_chunk
+            # 청크가 많으면 목록이 장문이 되므로 최소/최대만 요약한다. 카피 수와
+            # 서로 다른 기기 수를 함께 남긴다(한 기기에 몰린 상태를 구분).
+            counts = result.copies_per_chunk
+            devices = result.devices_per_chunk
             logger.warning(
-                "파일 복제 미완료(pending): %s — 청크 %d개, 복제수 min=%d max=%d "
-                "(목표 %d)%s",
+                "파일 복제 미완료(pending): %s — 청크 %d개, 카피수 min=%d max=%d, "
+                "기기수 min=%d (목표 %d)%s",
                 virtual_path, len(counts),
                 min(counts) if counts else 0, max(counts) if counts else 0,
-                self._min_replicas, reason,
+                min(devices) if devices else 0,
+                self._target_copies, reason,
             )
         return result
+
+    def _local_manifest(self, virtual_path: str) -> dict:
+        """청크 index → 이 기기의 로컬 카피(ChunkRef). 로컬 카피도 카피로 센다."""
+        get_chunks = getattr(self._meta, "get_chunks", None)
+        if not callable(get_chunks):
+            return {}
+        self_dev = getattr(self._storage_pool, "device_id", None)
+        out = {}
+        for chunk in get_chunks(virtual_path):
+            device_id = getattr(chunk, "device_id", None)
+            if device_id in (None, "", self_dev):
+                out[chunk.index] = chunk
+        return out
 
     def _chunks_to_replicate(self, virtual_path: str) -> list:
         """이 device가 올릴 청크 목록 (idx, 암호문)을 만든다.
@@ -399,16 +436,18 @@ class ReplicationManager:
         )
 
     def ensure_replicas(self, virtual_path: str) -> HealReport:
-        """건강성을 점검해 부족한 청크의 복제본을 채운다(재복제).
+        """건강성을 점검해 부족한 청크의 카피를 채우고, 몰린 카피를 분산한다(heal).
 
-        청크는 불변이므로 온라인 홀더에서 받아(재암호화 없이) 새 홀더로 복사한다.
-        온라인 홀더가 없는 청크는 unrecoverable로 보고한다. 모든 청크가
-        min_replicas를 충족하면 replicated, 아니면 pending으로 표시한다.
+        카피는 불변이므로 로컬 카피(있으면 우선) 또는 온라인 홀더에서 받아 재암호화
+        없이 새 위치로 복사한다. 도달 가능한 카피가 없는 청크는 unrecoverable로
+        보고한다. 모든 청크가 target_copies를 충족하면 replicated, 아니면 pending이다.
         """
         report = self._io.run_coroutine(
             self._ensure_chunks(
                 self._file_ref(virtual_path),
                 self._origin_devices(virtual_path),
+                manifest=self._local_manifest(virtual_path),
+                virtual_path=virtual_path,
             )
         )
         # 메타데이터가 있는 파일이면 상태를 갱신한다(복구 전용 호출은 없을 수 있음).
@@ -441,22 +480,30 @@ class ReplicationManager:
     async def _replicate_chunks(
         self, file_ref: str, chunks: list[tuple[int, bytes]],
         origins: dict[int, str] | None = None,
+        manifest: dict | None = None,
+        virtual_path: str | None = None,
     ) -> ReplicationResult:
+        """이 기기가 보관한 청크를 위치 target_copies곳까지 채운다.
+
+        로컬 카피도 카피로 세므로(원본을 따로 세지 않는다) 부족분만 새 위치에 만든다.
+        다른 기기 후보가 있으면 그쪽을 먼저 쓰고, 하나도 없을 때만 같은 기기의 다른
+        소스를 쓴다(Property 3).
+        """
         token = await self._token()
-        # 소유자 자신의 device는 홀더에서 제외한다(자기 기기에 백업은 무의미·헤어핀 실패).
-        self_dev = getattr(self._storage_pool, "device_id", None)
-        base_exclude = [self_dev] if self_dev else []
+        self_dev = getattr(self._storage_pool, "device_id", None) or ""
         if not self_dev and not self._warned_no_self_device:
             self._warned_no_self_device = True
             logger.warning(
-                "자기 device_id를 알 수 없어 배치에서 자기 기기를 제외하지 못합니다. "
-                "원본 보관 기기 제외 규칙에만 의존합니다(daemon 미등록 상태일 수 있음)"
+                "자기 device_id를 알 수 없어 로컬 카피를 위치로 등록하지 못합니다"
+                "(daemon 미등록 상태일 수 있음)"
             )
         origins = origins or {}
-        # pending 재시도에서 이미 확보한 청크를 다시 올리지 않기 위한 기존 등록 정보.
+        manifest = manifest or {}
+        # 내용이 바뀐 청크(해시 불일치) 판정을 위한 기존 등록 정보.
         registered = await self._registered_by_idx(token, file_ref)
-        replicas_per_chunk: list[int] = []
-        skipped = 0
+        copies_per_chunk: list[int] = []
+        devices_per_chunk: list[int] = []
+        filled = 0
         no_holder = 0
         total = len(chunks)
         # 큰 파일은 한 사이클이 수 분 걸리므로 진행 상황을 주기적으로 남긴다
@@ -467,83 +514,296 @@ class ReplicationManager:
         for done, (idx, data) in enumerate(chunks, start=1):
             chunk_id = self._chunk_id(file_ref, idx)
             digest = chunker.chunk_hash(data)
-            # 같은 내용으로 이미 목표 복제본을 확보한 청크는 재전송하지 않는다.
-            # 해시가 다르면(파일 수정) 등록된 사본은 낡은 것이므로 다시 올린다.
             prior = registered.get(idx)
-            if prior is not None and prior.get("hash") == digest:
-                online = await self._online_replicas(token, chunk_id)
-                if online >= self._min_replicas:
-                    replicas_per_chunk.append(online)
-                    skipped += 1
-                    self._report_store_progress(done, replicas_per_chunk)
-                    self._log_progress(
-                        done, total, report_every, replicas_per_chunk
-                    )
-                    continue
+            # 해시가 다르면(파일 수정) 등록된 카피는 낡은 것이므로 다시 채운다.
+            stale = prior is not None and prior.get("hash") not in (None, digest)
             await self._register_chunk(
-                token, chunk_id, file_ref, idx, len(data),
-                chunk_hash=digest,
+                token, chunk_id, file_ref, idx, len(data), chunk_hash=digest,
             )
-            # 한도 초과로 배제 중인 홀더는 매 청크마다 다시 걸러낸다(같은 파일의
-            # 첫 청크에서 507이 나면 나머지 청크는 그 홀더를 요청하지 않는다).
-            exclude = base_exclude + self.quota_blocked_devices()
-            # 이 청크의 원본을 보관한 기기도 제외한다(같은 기기 사본은 무의미).
-            origin = origins.get(idx)
-            if origin and origin not in exclude:
-                exclude.append(origin)
-            holders = await self._placement(token, len(data), exclude=exclude)
-            if not holders:
-                no_holder += 1
-            placed = 0
-            for holder in holders:
-                if placed >= self._min_replicas:
-                    break  # 목표 충족 — 여유 후보는 쓰지 않는다
-                address = holder.get("connection_address")
-                device_id = holder.get("device_id")
-                if not device_id:
-                    continue
-                if await self._holder_store(
-                    device_id, address, chunk_id, data, token
-                ):
-                    if await self._record_replica(token, chunk_id, device_id):
-                        placed += 1
-            replicas_per_chunk.append(placed)
-            self._report_store_progress(done, replicas_per_chunk)
-            self._log_progress(done, total, report_every, replicas_per_chunk)
+            known, addresses = await self._chunk_locations(token, chunk_id)
+            if stale:
+                # 낡은 카피는 없는 것으로 보고 전부 다시 올린다. 기존 홀더도 후보로
+                # 되돌려(주소 맵 비우기) 같은 위치에 새 내용을 덮어쓴다.
+                known, addresses = [], {}
+            known = await self._ensure_local_location(
+                token, chunk_id, known, manifest.get(idx), self_dev
+            )
+            need = self._target_copies - copies(known)
+            if need > 0:
+                added, ran_out = await self._fill_locations(
+                    token, chunk_id, data, known, addresses, need,
+                    self_dev=self_dev, origin=origins.get(idx),
+                    virtual_path=virtual_path, chunk=manifest.get(idx),
+                    digest=digest, chunk_index=idx,
+                )
+                known += added
+                if ran_out:
+                    no_holder += 1
+            else:
+                filled += 1
+            copies_per_chunk.append(copies(known))
+            devices_per_chunk.append(distinct_devices(known))
+            self._report_store_progress(done, copies_per_chunk)
+            self._log_progress(done, total, report_every, copies_per_chunk)
 
-        if skipped:
+        if filled:
             logger.info(
-                "복제 재개: 이미 확보된 청크 %d/%d개 재전송 생략",
-                skipped, total,
+                "복제 재개: 이미 목표 카피를 확보한 청크 %d/%d개 전송 생략",
+                filled, total,
             )
-        ok = bool(replicas_per_chunk) and all(
-            n >= self._min_replicas for n in replicas_per_chunk
+        ok = bool(copies_per_chunk) and all(
+            n >= self._target_copies for n in copies_per_chunk
         )
         return ReplicationResult(
             status="replicated" if ok else "pending",
             chunk_count=len(chunks),
-            min_replicas=self._min_replicas,
-            replicas_per_chunk=replicas_per_chunk,
+            target_copies=self._target_copies,
+            copies_per_chunk=copies_per_chunk,
+            devices_per_chunk=devices_per_chunk,
             no_holder_chunks=no_holder,
+        )
+
+    async def _chunk_locations(
+        self, token: str, chunk_id: str
+    ) -> tuple[list[ChunkLocation], dict[str, str]]:
+        """서버 레지스트리의 카피 위치 목록과 기기별 접속 주소를 돌려준다.
+
+        오프라인 홀더의 위치는 카피로 세지 않는다(그 카피는 지금 쓸 수 없다). 다만
+        주소 맵에는 남겨 두어 같은 위치를 다시 고르지 않게 한다.
+
+        조회 실패(오프라인·구버전 서버)는 비치명이다. 빈 목록을 돌려주면 이 청크를
+        다시 올리는 기존 동작이 된다.
+        """
+        try:
+            holders = await self._list_replicas(token, chunk_id)
+        except Exception as e:  # noqa: BLE001 — 레지스트리 조회 실패는 비치명
+            logger.debug("카피 위치 조회 실패(%s): %s", chunk_id[:16], e)
+            return [], {}
+        self_dev = getattr(self._storage_pool, "device_id", None) or ""
+        locations: list[ChunkLocation] = []
+        addresses: dict[str, str] = {}
+        for holder in holders:
+            device_id = holder.get("device_id") or ""
+            if not device_id:
+                continue
+            addresses[device_id] = holder.get("connection_address") or ""
+            if holder.get("is_online") is False:
+                continue
+            # 이 기기 위치는 내 스토리지 소스의 카피, 나머지는 홀더 보관소다.
+            locations.append(
+                ChunkLocation(
+                    device_id=device_id,
+                    source_id=holder.get("source_id") or "",
+                    kind=KIND_SOURCE if device_id == self_dev else KIND_PARITY,
+                )
+            )
+        return locations, addresses
+
+    async def _ensure_local_location(
+        self, token: str, chunk_id: str, known: list[ChunkLocation],
+        chunk, self_dev: str,
+    ) -> list[ChunkLocation]:
+        """이 기기의 로컬 카피를 위치로 등록한다(원본을 따로 세지 않는다)."""
+        if chunk is None or not self_dev:
+            return known
+        source_id = getattr(chunk, "source_id", "") or ""
+        if has_location(known, self_dev, source_id):
+            return known
+        if await self._record_replica(token, chunk_id, self_dev, source_id):
+            known = known + [
+                ChunkLocation(
+                    device_id=self_dev, source_id=source_id,
+                    chunk_ref=getattr(chunk, "chunk_ref", None),
+                    kind=KIND_SOURCE,
+                )
+            ]
+        return known
+
+    def _target_locations(
+        self, chunk_index: int, known: list[ChunkLocation],
+        candidates: list[dict], self_dev: str = "",
+    ) -> list[dict]:
+        """이 청크에 추가할 위치를 고른다.
+
+        다른 기기 후보를 먼저 쓴다. 다른 기기 후보가 하나도 없을 때만 같은 기기의
+        미사용 소스를 쓴다(여유 공간 임계는 두지 않는다 — 로컬이 카피로 차는 것은
+        허용된 결과다). 같은 소스에 두 번 두지 않는다.
+
+        부족분보다 여유분(PLACEMENT_SPARE)만큼 더 돌려준다 — 일부 위치가 전송 실패나
+        공간 부족으로 빠져도 대체 위치로 넘어갈 수 있다. 호출자가 부족분을 채우면
+        나머지는 쓰지 않는다.
+        """
+        need = self._target_copies - copies(known)
+        if need <= 0:
+            return []
+        limit = need + PLACEMENT_SPARE
+        used_devices = {loc.device_id for loc in known}
+        remote = [
+            {"device_id": c["device_id"],
+             "connection_address": c.get("connection_address"),
+             "local": False}
+            for c in candidates
+            if c.get("device_id")
+            and c["device_id"] != self_dev
+            and c["device_id"] not in used_devices
+        ]
+        if remote:
+            return remote[:limit]
+        # 다른 기기 후보가 없다 → 같은 기기의 미사용 소스에 둔다(Requirement 2.3).
+        used_sources = {
+            loc.source_id for loc in known if loc.device_id in ("", self_dev)
+        }
+        local = [
+            {"device_id": self_dev, "source_id": source_id, "local": True}
+            for source_id in self._local_source_ids()
+            if source_id not in used_sources
+        ]
+        return local[:limit]
+
+    def _local_source_ids(self) -> list[str]:
+        """카피를 놓을 수 있는 활성 로컬 소스 id(여유 큰 순).
+
+        여유 공간 임계는 두지 않는다 — 청크가 들어갈 수 있는지는 기록 시점에
+        판정하고, 로컬이 카피로 차는 것 자체는 허용된 결과다(Requirement 2.4).
+        """
+        sources = getattr(self._storage_pool, "sources", []) or []
+        usable = [
+            s for s in sources
+            if getattr(s, "is_active", False) and not getattr(s, "is_remote", True)
+        ]
+        try:
+            usable.sort(key=lambda s: s.get_available_space(), reverse=True)
+        except Exception:  # noqa: BLE001 — 용량을 못 읽으면 등록 순서를 쓴다
+            pass
+        return [s.source_id for s in usable]
+
+    async def _fill_locations(
+        self, token: str, chunk_id: str, data: bytes,
+        known: list[ChunkLocation], addresses: dict[str, str], need: int,
+        *, self_dev: str, origin: str | None, virtual_path: str | None,
+        chunk, digest: str, chunk_index: int,
+    ) -> tuple[list[ChunkLocation], bool]:
+        """부족한 카피를 채운다. (추가된 위치, 쓸 위치가 없었는지) 를 돌려준다."""
+        # 한도 초과로 배제 중인 홀더는 매 청크마다 다시 걸러낸다(같은 파일의 첫
+        # 청크에서 507이 나면 나머지 청크는 그 홀더를 요청하지 않는다).
+        exclude = list(self.quota_blocked_devices())
+        if self_dev and self_dev not in exclude:
+            exclude.append(self_dev)  # 로컬 카피는 아래에서 직접 기록한다
+        if origin and origin not in exclude:
+            exclude.append(origin)
+        # 이미 이 청크의 카피를 가진 기기는 오프라인이어도 후보에서 뺀다(같은 기기에
+        # 두 번 두면 그 기기를 잃을 때 두 카피를 함께 잃는다).
+        exclude += [
+            device_id for device_id in addresses
+            if device_id and device_id not in exclude
+        ]
+        exclude += [
+            loc.device_id for loc in known
+            if loc.device_id and loc.device_id not in exclude
+        ]
+        candidates = await self._placement(
+            token, len(data), exclude=exclude,
+            exclude_locations=[(loc.device_id, loc.source_id) for loc in known],
+        )
+        targets = self._target_locations(
+            chunk_index, known, candidates, self_dev
+        )
+        if not targets:
+            return [], True
+
+        added: list[ChunkLocation] = []
+        for target in targets:
+            if len(added) >= need:
+                break
+            if target["local"]:
+                location = await self._store_local_copy(
+                    token, chunk_id, data, target["source_id"],
+                    virtual_path=virtual_path, chunk=chunk,
+                    chunk_index=chunk_index, digest=digest,
+                    self_dev=self_dev,
+                )
+            else:
+                location = await self._store_remote_copy(
+                    token, chunk_id, data, target, addresses
+                )
+            if location is not None:
+                added.append(location)
+        return added, False
+
+    async def _store_remote_copy(
+        self, token: str, chunk_id: str, data: bytes, target: dict,
+        addresses: dict[str, str],
+    ) -> ChunkLocation | None:
+        """다른 기기에 카피를 만들고 위치를 서버에 등록한다."""
+        device_id = target["device_id"]
+        address = target.get("connection_address") or addresses.get(device_id, "")
+        ok, source_id = await self._holder_store(
+            device_id, address, chunk_id, data, token
+        )
+        if not ok:
+            return None
+        if not await self._record_replica(
+            token, chunk_id, device_id, source_id
+        ):
+            return None
+        return ChunkLocation(
+            device_id=device_id, source_id=source_id, kind=KIND_PARITY
+        )
+
+    async def _store_local_copy(
+        self, token: str, chunk_id: str, data: bytes, source_id: str,
+        *, virtual_path: str | None, chunk, chunk_index: int, digest: str,
+        self_dev: str,
+    ) -> ChunkLocation | None:
+        """같은 기기의 다른 소스에 카피를 만들고 위치를 등록한다.
+
+        다른 기기 후보가 하나도 없을 때만 호출된다. 로컬 I/O는 IO 루프를 막지 않도록
+        스레드로 넘긴다.
+        """
+        store_copy = getattr(self._storage_pool, "store_chunk_copy", None)
+        if not callable(store_copy) or virtual_path is None or chunk is None:
+            return None
+        try:
+            written = await asyncio.to_thread(
+                store_copy, virtual_path, chunk_index, data,
+                getattr(chunk, "chunk_ref", None), digest, source_id,
+            )
+        except Exception as e:  # noqa: BLE001 — 위치 단위 실패 격리
+            logger.warning(
+                "로컬 카피 기록 실패(source=%s, chunk=%d): %s",
+                source_id, chunk_index, e,
+            )
+            return None
+        if not written:
+            return None
+        if not await self._record_replica(token, chunk_id, self_dev, written):
+            return None
+        logger.info(
+            "로컬 카피 추가: chunk=%d source=%s (다른 기기 후보 없음)",
+            chunk_index, written,
+        )
+        return ChunkLocation(
+            device_id=self_dev, source_id=written,
+            chunk_ref=getattr(chunk, "chunk_ref", None), kind=KIND_SOURCE,
         )
 
     def _log_progress(
         self, done: int, total: int, report_every: int,
-        replicas_per_chunk: list[int],
+        copies_per_chunk: list[int],
     ) -> None:
         """대용량 파일 복제의 진행 상황을 주기적으로 남긴다(report_every=0이면 무음)."""
         if not report_every:
             return
         if done % report_every and done != total:
             return
-        ok = sum(1 for n in replicas_per_chunk if n >= self._min_replicas)
+        ok = sum(1 for n in copies_per_chunk if n >= self._target_copies)
         logger.info("복제 진행: %d/%d 청크 (목표 확보 %d)", done, total, ok)
 
     def _report_store_progress(
-        self, done: int, replicas_per_chunk: list[int]
+        self, done: int, copies_per_chunk: list[int]
     ) -> None:
         """전송 단계 진행을 추적기에 반영한다(로그와 별개로 매 청크)."""
-        secured = sum(1 for n in replicas_per_chunk if n >= self._min_replicas)
+        secured = sum(1 for n in copies_per_chunk if n >= self._target_copies)
         self._progress_call("advance", done, secured)
 
     async def _registered_by_idx(
@@ -602,7 +862,8 @@ class ReplicationManager:
         return sorted(parts, key=lambda p: p[0])
 
     async def _ensure_chunks(
-        self, file_ref: str, origins: dict[int, str] | None = None
+        self, file_ref: str, origins: dict[int, str] | None = None,
+        manifest: dict | None = None, virtual_path: str | None = None,
     ) -> HealReport:
         token = await self._token()
         chunk_infos = await self._list_chunks(token, file_ref)
@@ -613,21 +874,26 @@ class ReplicationManager:
 
         sem = asyncio.Semaphore(self._max_concurrent_repair)
         origins = origins or {}
+        manifest = manifest or {}
 
         async def heal(info: dict) -> dict:
             async with sem:  # 동시 재복제 상한
                 return await self._heal_chunk(
-                    token, info, origins.get(info.get("idx"))
+                    token, info, origins.get(info.get("idx")),
+                    chunk=manifest.get(info.get("idx")),
+                    virtual_path=virtual_path,
                 )
 
         outcomes = await asyncio.gather(*[heal(i) for i in chunk_infos])
         repaired = sum(1 for o in outcomes if o["added"] > 0)
+        relocated = sum(o.get("relocated", 0) for o in outcomes)
         unrecoverable = [o["chunk_id"] for o in outcomes if not o["healthy"]]
         return HealReport(
             status="replicated" if not unrecoverable else "pending",
             chunk_count=len(chunk_infos),
-            min_replicas=self._min_replicas,
+            target_copies=self._target_copies,
             repaired=repaired,
+            relocated=relocated,
             unrecoverable=unrecoverable,
         )
 
@@ -635,89 +901,211 @@ class ReplicationManager:
         token = await self._token()
         chunk_infos = await self._list_chunks(token, file_ref)
         if not chunk_infos:
-            return HealthSummary(degraded=False, chunk_count=0, min_online=0)
-        min_online: int | None = None
-        for info in chunk_infos:
-            holders = await self._list_replicas(token, info["chunk_id"])
-            online = sum(
-                1 for h in holders if h.get("is_online") is not False
+            return HealthSummary(
+                degraded=False, chunk_count=0, min_copies=0, min_devices=0
             )
-            min_online = online if min_online is None else min(min_online, online)
-        min_online = min_online or 0
+        min_copies: int | None = None
+        min_devices: int | None = None
+        for info in chunk_infos:
+            locations, _addresses = await self._chunk_locations(
+                token, info["chunk_id"]
+            )
+            online = copies(locations)
+            devices = distinct_devices(locations)
+            min_copies = online if min_copies is None else min(min_copies, online)
+            min_devices = (
+                devices if min_devices is None else min(min_devices, devices)
+            )
+        min_copies = min_copies or 0
         return HealthSummary(
-            degraded=min_online < self._min_replicas,
+            degraded=min_copies < self._target_copies,
             chunk_count=len(chunk_infos),
-            min_online=min_online,
+            min_copies=min_copies,
+            min_devices=min_devices or 0,
         )
 
     async def _heal_chunk(
-        self, token: str, info: dict, origin: str | None = None
+        self, token: str, info: dict, origin: str | None = None,
+        chunk=None, virtual_path: str | None = None,
     ) -> dict:
-        """한 청크의 복제본을 min_replicas까지 채운다(불변 청크 복사).
+        """한 청크의 카피를 target_copies까지 채우고, 몰린 카피를 분산한다.
 
-        origin은 이 청크의 원본을 보관한 device_id로, 배치 후보에서 제외한다.
+        카피는 불변이므로 재암호화 없이 그대로 복사한다. 로컬 카피가 있으면 그것을
+        읽어(원격 왕복 없음) 새 위치에 쓴다.
+
+        카피 수는 충족했지만 서로 다른 기기 수가 target 미만이고 새 후보 기기가 있으면
+        같은 기기의 카피 하나를 그 기기로 옮긴다(Requirement 3).
         """
         chunk_id = info["chunk_id"]
-        holders = await self._list_replicas(token, chunk_id)
-        online = [
-            h for h in holders
-            if h.get("is_online") is not False and h.get("connection_address")
-        ]
-        current_devices = [h["device_id"] for h in holders if h.get("device_id")]
-        need = self._min_replicas - len(online)
+        self_dev = getattr(self._storage_pool, "device_id", None) or ""
+        known, addresses = await self._chunk_locations(token, chunk_id)
+        need = self._target_copies - copies(known)
         if need <= 0:
-            return {"chunk_id": chunk_id, "added": 0, "healthy": True}
+            relocated = await self._relocate_if_concentrated(
+                token, chunk_id, info, known, addresses,
+                self_dev=self_dev, chunk=chunk, virtual_path=virtual_path,
+            )
+            return {
+                "chunk_id": chunk_id, "added": 0, "healthy": True,
+                "relocated": relocated,
+            }
 
-        # 온라인 홀더에서 청크를 받아온다(재암호화 없이 그대로 복사).
-        # 손상된 사본을 새 홀더로 퍼뜨리지 않도록 복사 전에 무결성을 검증한다.
+        data = await self._chunk_bytes_for_heal(
+            token, chunk_id, info, known, addresses, chunk, virtual_path
+        )
+        if data is None:
+            # 도달 가능한 카피가 없어 복사 불가 — 데이터 자체는 다른 곳에 있을 수 있음.
+            return {
+                "chunk_id": chunk_id, "added": 0, "healthy": False,
+                "relocated": 0,
+            }
+
+        added, _ran_out = await self._fill_locations(
+            token, chunk_id, data, known, addresses, need,
+            self_dev=self_dev, origin=origin, virtual_path=virtual_path,
+            chunk=chunk, digest=info.get("hash") or chunker.chunk_hash(data),
+            chunk_index=info.get("idx", 0),
+        )
+        return {
+            "chunk_id": chunk_id,
+            "added": len(added),
+            "healthy": (copies(known) + len(added)) >= self._target_copies,
+            "relocated": 0,
+        }
+
+    async def _chunk_bytes_for_heal(
+        self, token: str, chunk_id: str, info: dict,
+        known: list[ChunkLocation], addresses: dict[str, str],
+        chunk, virtual_path: str | None,
+    ) -> bytes | None:
+        """카피 복사를 위한 청크 바이트를 확보한다(로컬 카피 우선).
+
+        원본을 손에 들고도 원격 왕복을 하지 않도록 로컬 소스를 먼저 읽는다. 로컬이
+        없거나 읽지 못하면 온라인 홀더에서 받아 무결성을 검증한다.
+        """
         expected_hash = info.get("hash")
-        data = None
-        for h in online:
+        local = await self._read_local_chunk(virtual_path, chunk)
+        if local is not None and self._verify_chunk(
+            chunk_id, local, expected_hash, "local"
+        ):
+            return local
+        for loc in known:
+            if not loc.device_id:
+                continue
             candidate = await self._holder_fetch(
-                h.get("device_id"), h.get("connection_address"), chunk_id, token
+                loc.device_id, addresses.get(loc.device_id, ""), chunk_id, token
             )
             if candidate is None:
                 continue
             if not self._verify_chunk(
-                chunk_id, candidate, expected_hash, h.get("device_id")
+                chunk_id, candidate, expected_hash, loc.device_id
             ):
-                continue  # 손상된 소스 → 다음 온라인 홀더
-            data = candidate
-            break
-        if data is None:
-            # 도달 가능한 소스가 없어 복제 불가 — 데이터 자체는 다른 곳에 있을 수 있음.
-            return {"chunk_id": chunk_id, "added": 0, "healthy": False}
+                continue  # 손상된 소스 → 다음 홀더
+            return candidate
+        return None
 
-        self_dev = getattr(self._storage_pool, "device_id", None)
-        exclude = list(current_devices)
-        if self_dev and self_dev not in exclude:
-            exclude.append(self_dev)
-        # 원본을 보관한 기기에는 사본을 두지 않는다.
-        if origin and origin not in exclude:
-            exclude.append(origin)
-        # 한도 초과로 배제 중인 홀더는 재복제 후보에서도 뺀다.
-        exclude += [
-            d for d in self.quota_blocked_devices() if d not in exclude
+    async def _read_local_chunk(self, virtual_path, chunk) -> bytes | None:
+        """로컬 카피를 읽는다(없거나 실패하면 None)."""
+        if virtual_path is None or chunk is None:
+            return None
+        reader = getattr(self._storage_pool, "read_chunk_copy", None)
+        if not callable(reader):
+            return None
+        try:
+            return await asyncio.to_thread(reader, virtual_path, chunk.index)
+        except Exception as e:  # noqa: BLE001 — 원격 홀더로 넘어간다
+            logger.debug("로컬 카피 읽기 실패(원격으로 진행): %s", e)
+            return None
+
+    async def _relocate_if_concentrated(
+        self, token: str, chunk_id: str, info: dict,
+        known: list[ChunkLocation], addresses: dict[str, str],
+        *, self_dev: str, chunk, virtual_path: str | None,
+    ) -> int:
+        """카피가 한 기기에 몰려 있으면 하나를 다른 기기로 옮긴다.
+
+        기기를 추가하기 전에 만들어진 로컬 카피를 분산시키는 경로다. 이전은 heal
+        주기에만 수행한다(기기 간 전송을 유발하므로).
+
+        Returns:
+            옮긴 카피 수(0 또는 1).
+        """
+        if distinct_devices(known) >= self._target_copies:
+            return 0
+        local = [
+            loc for loc in known
+            if loc.device_id in ("", self_dev) and loc.kind == KIND_SOURCE
         ]
-        candidates = await self._placement(token, len(data), exclude=exclude)
-        added = 0
-        for cand in candidates:
-            if added >= need:
-                break
-            address = cand.get("connection_address")
-            device_id = cand.get("device_id")
-            if not device_id:
-                continue
-            if await self._holder_store(
-                device_id, address, chunk_id, data, token
-            ):
-                if await self._record_replica(token, chunk_id, device_id):
-                    added += 1
-        return {
-            "chunk_id": chunk_id,
-            "added": added,
-            "healthy": (len(online) + added) >= self._min_replicas,
-        }
+        if len(local) < 2:
+            return 0  # 옮길 여분의 로컬 카피가 없다(마지막 로컬 카피는 남긴다)
+        data = await self._chunk_bytes_for_heal(
+            token, chunk_id, info, known, addresses, chunk, virtual_path
+        )
+        if data is None:
+            return 0
+        exclude = [
+            loc.device_id for loc in known if loc.device_id
+        ] + list(self.quota_blocked_devices())
+        candidates = await self._placement(
+            token, len(data), exclude=exclude,
+            exclude_locations=[(loc.device_id, loc.source_id) for loc in known],
+        )
+        target = next(
+            (c for c in candidates if c.get("device_id")
+             and c["device_id"] != self_dev), None,
+        )
+        if target is None:
+            return 0
+        moved = await self._relocate_copy(
+            token, chunk_id, data, local[-1], target,
+            virtual_path=virtual_path, chunk=chunk,
+        )
+        return 1 if moved else 0
+
+    async def _relocate_copy(
+        self, token: str, chunk_id: str, data: bytes,
+        from_loc: ChunkLocation, to_device: dict,
+        *, virtual_path: str | None, chunk,
+    ) -> bool:
+        """같은 기기에 몰린 카피 하나를 다른 기기로 옮긴다.
+
+        저장 → 서버 등록 → 로컬 삭제 순서를 지켜 카피 수가 목표 아래로 내려가지 않게
+        한다(Property 5). 어느 단계든 실패하면 원래 카피를 남기고 False를 돌려준다.
+        서버 등록까지 성공한 뒤 삭제가 실패하면 일시적으로 카피가 하나 많아진다
+        (내구성을 해치지 않으며 다음 주기에 정리된다).
+        """
+        device_id = to_device["device_id"]
+        ok, source_id = await self._holder_store(
+            device_id, to_device.get("connection_address") or "",
+            chunk_id, data, token,
+        )
+        if not ok:
+            return False
+        if not await self._record_replica(
+            token, chunk_id, device_id, source_id
+        ):
+            return False  # 등록 실패 → 원래 카피 유지(다음 주기 재시도)
+        delete_copy = getattr(self._storage_pool, "delete_chunk_copy", None)
+        if not callable(delete_copy) or virtual_path is None or chunk is None:
+            return True  # 새 위치는 확보됨(원래 카피는 그대로 — 다음 주기에 정리)
+        try:
+            await asyncio.to_thread(
+                delete_copy, virtual_path, chunk.index, from_loc.source_id,
+            )
+        except Exception as e:  # noqa: BLE001 — 카피는 유지된다
+            logger.warning(
+                "카피 이전 후 로컬 삭제 실패(카피 유지): chunk=%s source=%s: %s",
+                chunk_id[:12], from_loc.source_id, e,
+            )
+            return True
+        await self._remove_replica(
+            token, chunk_id, from_loc.device_id or "", from_loc.source_id
+        )
+        logger.info(
+            "카피 이전: chunk=%s %s → dev=%s (위치 분산)",
+            chunk_id[:12], from_loc.source_id, device_id,
+        )
+        return True
 
     async def _fetch_from_any_holder(
         self, token: str, chunk_id: str, expected_hash: str | None = None
@@ -801,17 +1189,27 @@ class ReplicationManager:
         )
 
     async def _placement(
-        self, token: str, size: int, exclude: list[str]
+        self, token: str, size: int, exclude: list[str],
+        exclude_locations: list[tuple[str, str]] | None = None,
     ) -> list[dict]:
-        """배치 후보를 받는다. 목표 복제본 수 + 여유분(PLACEMENT_SPARE)을 요청해
-        일부 홀더가 실패해도 같은 청크에서 대체 홀더를 쓸 수 있게 한다."""
+        """배치 후보를 받는다. 목표 카피 수 + 여유분(PLACEMENT_SPARE)을 요청해
+        일부 홀더가 실패해도 같은 청크에서 대체 홀더를 쓸 수 있게 한다.
+
+        exclude_locations로 이미 카피가 있는 (기기, 소스)를 알려 남은 소스가 없는
+        기기를 후보에서 뺀다(같은 소스에 두 카피 금지).
+        """
+        payload: dict[str, Any] = {
+            "size": size,
+            "count": self._target_copies + PLACEMENT_SPARE,
+            "exclude": exclude,
+        }
+        if exclude_locations:
+            payload["exclude_locations"] = [
+                [device_id, source_id] for device_id, source_id in exclude_locations
+            ]
         resp = await self._client.post(
             f"{self._server_url}/replication/placement",
-            json={
-                "size": size,
-                "count": self._min_replicas + PLACEMENT_SPARE,
-                "exclude": exclude,
-            },
+            json=payload,
             headers=self._auth_headers(token),
         )
         if resp.status_code != 200:
@@ -819,13 +1217,40 @@ class ReplicationManager:
         return list(resp.json().get("holders", []))
 
     async def _record_replica(
-        self, token: str, chunk_id: str, device_id: str
+        self, token: str, chunk_id: str, device_id: str, source_id: str = ""
     ) -> bool:
+        """카피 위치를 서버에 등록한다(기기+소스 단위 멱등)."""
         resp = await self._client.post(
             f"{self._server_url}/replication/replicas",
-            json={"chunk_id": chunk_id, "holder_device_id": device_id},
+            json={
+                "chunk_id": chunk_id, "holder_device_id": device_id,
+                "source_id": source_id or "",
+            },
             headers=self._auth_headers(token),
         )
+        return resp.status_code == 200
+
+    async def _remove_replica(
+        self, token: str, chunk_id: str, device_id: str, source_id: str
+    ) -> bool:
+        """카피 위치 등록을 지운다(이전 완료 후 원래 위치 정리).
+
+        실패는 비치명이다 — 그 위치의 바이트는 이미 지웠으므로 다음 heal 주기가
+        레지스트리를 다시 맞춘다.
+        """
+        try:
+            resp = await self._client.request(
+                "DELETE",
+                f"{self._server_url}/replication/replicas",
+                json={
+                    "chunk_id": chunk_id, "holder_device_id": device_id,
+                    "source_id": source_id or "",
+                },
+                headers=self._auth_headers(token),
+            )
+        except Exception as e:  # noqa: BLE001 — 비치명
+            logger.debug("카피 위치 등록 해제 실패(%s): %s", chunk_id[:12], e)
+            return False
         return resp.status_code == 200
 
     async def _list_chunks(self, token: str, file_ref: str) -> list[dict]:
@@ -863,15 +1288,19 @@ class ReplicationManager:
     async def _holder_store(
         self, device_id: str, address: str, chunk_id: str,
         data: bytes, token: str,
-    ) -> bool:
+    ) -> tuple[bool, str]:
         """홀더에 청크 암호문을 push한다. 직접 연결 실패 시 릴레이로 fallback한다.
 
         전송 순서: (1) 직접 TCP(광고 주소, 주로 LAN) → (2) 직접 UDP(홀펀칭) →
-        (3) 릴레이(정책 허가 시, 최후). 각 단계에서 200=성공(True), 비-200(쿼터 등)은
-        재경로 무의미하므로 False, 도달 불가(타임아웃/연결 실패)면 다음 단계로 넘어간다.
+        (3) 릴레이(정책 허가 시, 최후). 각 단계에서 200=성공, 비-200(쿼터 등)은
+        재경로 무의미하므로 실패, 도달 불가(타임아웃/연결 실패)면 다음 단계로 넘어간다.
 
         보관 한도 초과(507)는 어느 경로에서 관측되든 그 홀더를 일정 시간 배치
         후보에서 배제해(quota_blocked) 같은 실패를 반복하지 않는다.
+
+        Returns:
+            (성공 여부, 홀더가 알려준 보관 source_id). 소스를 알려주지 않는 구버전
+            홀더는 빈 문자열이며 위치 1개로 취급된다.
         """
         started = time.monotonic()
         try:
@@ -889,11 +1318,18 @@ class ReplicationManager:
     async def _holder_store_paths(
         self, device_id: str, address: str, chunk_id: str,
         data: bytes, token: str,
-    ) -> bool:
+    ) -> tuple[bool, str]:
         """_holder_store의 전송 캐스케이드 본체(직접 TCP → UDP → 릴레이)."""
         encoded = base64.b64encode(data).decode("ascii")
         body = {"chunk_id": chunk_id, "data": encoded}
         authed = {**body, "auth_token": token}
+
+        def _source_of(result) -> str:
+            """홀더 응답에서 보관 소스를 읽는다(구버전 홀더는 빈 문자열)."""
+            if isinstance(result, dict):
+                return str(result.get("source_id") or "")
+            return ""
+
         # (1) 직접 TCP — 도달 가능성 없는 주소(다른 네트워크의 사설 IP)는 건너뛴다
         if address and direct_tcp_viable(address):
             try:
@@ -903,26 +1339,32 @@ class ReplicationManager:
                 )
                 if resp.status_code == _QUOTA_STATUS and device_id:
                     self._mark_quota_blocked(device_id)
-                return resp.status_code == 200
+                if resp.status_code != 200:
+                    return False, ""
+                try:
+                    return True, _source_of(resp.json())
+                except ValueError:
+                    return True, ""
             except (httpx.TimeoutException, httpx.NetworkError):
                 pass  # 도달 불가 → 다음 경로
         # (2) 직접 UDP(홀펀칭)
         if self._udp_send is not None and device_id:
             try:
-                status, _result = await self._udp_send(
+                status, result = await self._udp_send(
                     device_id, "replica_store", authed
                 )
                 if status == _QUOTA_STATUS:
                     self._mark_quota_blocked(device_id)
-                return status == 200  # 비-200(쿼터 등)은 릴레이해도 동일
+                # 비-200(쿼터 등)은 릴레이해도 동일
+                return status == 200, _source_of(result)
             except Exception:  # noqa: BLE001 — 펀치/전송 실패 → 릴레이
                 pass
         # (3) 릴레이(정책 허가 시) — 타 사용자 홀더면 소유자 토큰으로 인가
         if not device_id:
-            return False
+            return False, ""
         try:
-            await self._relay_op(device_id, "replica_store", authed)
-            return True
+            result = await self._relay_op(device_id, "replica_store", authed)
+            return True, _source_of(result)
         except Exception as e:  # noqa: BLE001
             # RelayOpError.status로 홀더 핸들러의 원래 상태를 구분한다.
             if getattr(e, "status", None) == _QUOTA_STATUS:
@@ -932,7 +1374,7 @@ class ReplicationManager:
                     "홀더 store 실패(direct+udp+relay) dev=%s addr=%s: %s",
                     device_id, address, e,
                 )
-            return False
+            return False, ""
 
     async def _holder_fetch(
         self, device_id: str, address: str, chunk_id: str, token: str

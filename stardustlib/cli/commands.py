@@ -396,13 +396,13 @@ async def cmd_backup(session, args) -> int:
     if result.status == "replicated":
         echo(
             f"복제 완료: {path} — 청크 {result.chunk_count}개, "
-            f"각 ≥{result.min_replicas} 홀더"
+            f"각 {result.target_copies}카피"
         )
         return 0
     echo(
-        f"복제 미완료(pending): {path} — 청크별 복제수 "
-        f"{result.replicas_per_chunk} (목표 {result.min_replicas}). "
-        "홀더 확보 후 다시 시도하세요."
+        f"복제 미완료(pending): {path} — 청크별 카피수 "
+        f"{result.copies_per_chunk}, 기기수 {result.devices_per_chunk} "
+        f"(목표 {result.target_copies}카피). 위치 확보 후 다시 시도하세요."
     )
     return 4
 
@@ -446,7 +446,8 @@ async def cmd_heal(session, args) -> int:
     if report.status == "replicated":
         echo(
             f"재복제 완료: {path} — 청크 {report.chunk_count}개, "
-            f"복구 {report.repaired}개, 각 ≥{report.min_replicas} 홀더"
+            f"보충 {report.repaired}개, 이전 {report.relocated}개, "
+            f"각 {report.target_copies}카피"
         )
         return 0
     echo(

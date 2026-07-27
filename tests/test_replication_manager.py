@@ -39,6 +39,8 @@ class _FakeStoragePool:
         self.chunk_devices: dict[int, str] = {}
         # read_chunks가 실제로 읽은 청크 index(원격 읽기 없음 검증용).
         self.read_indices: list[int] = []
+        # 로컬 소스 목록(비어 있음 → 같은 기기 추가 카피 경로를 쓰지 않는다).
+        self.sources: list = []
 
     def read_chunks(
         self, virtual_path: str, local_only: bool = False, on_progress=None
@@ -130,7 +132,7 @@ class _Cloud:
                  "hash": chunk_hash}
             )
 
-        async def placement(token, size, exclude):
+        async def placement(token, size, exclude, exclude_locations=None):
             avail = [
                 {"device_id": h, "connection_address": h}
                 for h in cloud.holders if h not in exclude
@@ -140,12 +142,15 @@ class _Cloud:
         async def holder_store(device_id, address, chunk_id, data, token):
             cloud.store_calls += 1
             if address in cloud.store_fail:
-                return False
+                return False, ""
             cloud.holder_store.setdefault(address, {})[chunk_id] = data
-            return True
+            # 홀더는 보관 소스를 함께 알려준다(카피 위치 등록용).
+            return True, f"vol-{device_id}"
 
-        async def record_replica(token, chunk_id, device_id):
-            cloud.registry.setdefault(chunk_id, []).append(device_id)
+        async def record_replica(token, chunk_id, device_id, source_id=""):
+            entry = (device_id, source_id)
+            if entry not in cloud.registry.setdefault(chunk_id, []):
+                cloud.registry[chunk_id].append(entry)
             return True
 
         async def list_chunks(token, file_ref):
@@ -153,9 +158,9 @@ class _Cloud:
 
         async def list_replicas(token, chunk_id):
             return [
-                {"device_id": d, "connection_address": d,
+                {"device_id": d, "source_id": sid, "connection_address": d,
                  "is_online": d not in cloud.offline}
-                for d in cloud.registry.get(chunk_id, [])
+                for d, sid in cloud.registry.get(chunk_id, [])
             ]
 
         async def holder_fetch(device_id, address, chunk_id, token):
@@ -176,7 +181,7 @@ class _Cloud:
 def _manager(storage_pool, meta, holders, **cloud_kwargs):
     mgr = ReplicationManager(
         _FakeAuth(), "http://server", meta, storage_pool,
-        chunk_size=64, min_replicas=3,
+        chunk_size=64, target_copies=3,
     )
     cloud = _Cloud(holders, **cloud_kwargs)
     cloud.attach(mgr)
@@ -198,7 +203,7 @@ def test_replicate_then_recover_roundtrip(key):
     result = mgr.replicate("/a/file.bin")
     assert result.status == "replicated"
     assert result.chunk_count > 1  # chunk_size=64 → 다중 청크
-    assert all(n == 3 for n in result.replicas_per_chunk)
+    assert all(n == 3 for n in result.copies_per_chunk)
     assert meta.status["/a/file.bin"] == "replicated"
 
     # 복구: 원본과 정확히 일치 (Property 3)
@@ -216,7 +221,7 @@ def test_replicate_insufficient_holders_is_pending(key):
 
     result = mgr.replicate("/f")
     assert result.status == "pending"
-    assert all(n == 2 for n in result.replicas_per_chunk)
+    assert all(n == 2 for n in result.copies_per_chunk)
     assert meta.status["/f"] == "pending"
 
 
@@ -230,7 +235,7 @@ def test_replicate_skips_failed_holder(key):
     )
     result = mgr.replicate("/f")
     assert result.status == "replicated"
-    assert all(n == 3 for n in result.replicas_per_chunk)
+    assert all(n == 3 for n in result.copies_per_chunk)
 
 
 def test_recover_missing_when_no_chunks(key):
@@ -285,9 +290,9 @@ def test_ensure_replicas_tops_up_degraded_chunk(key):
     assert report.status == "replicated"
     assert report.repaired == report.chunk_count  # 모든 청크가 1개씩 보충
     assert report.unrecoverable == []
-    # h4가 각 청크의 새 홀더로 추가됨
+    # h4가 각 청크의 새 카피 위치로 추가됨
     for holders in cloud.registry.values():
-        assert "h4" in holders
+        assert "h4" in [device_id for device_id, _source in holders]
 
 
 def test_ensure_replicas_noop_when_healthy(key):
@@ -318,7 +323,7 @@ def test_ensure_replicas_unrecoverable_when_no_online_source(key):
 def _bare_manager(key):
     storage_pool = _FakeStoragePool(key)
     return ReplicationManager(
-        _FakeAuth(), "http://server", _FakeMeta(set()), storage_pool, min_replicas=2
+        _FakeAuth(), "http://server", _FakeMeta(set()), storage_pool, target_copies=2
     )
 
 
@@ -338,7 +343,7 @@ async def test_holder_store_relay_fallback_on_connect_error(key):
 
     mgr._client.post = boom
     mgr._relay_op = fake_relay
-    ok = await mgr._holder_store("devX", "1.2.3.4:9090", "c1", b"cipher", "tok")
+    ok, _source = await mgr._holder_store("devX", "1.2.3.4:9090", "c1", b"cipher", "tok")
     assert ok is True
     # 교차 사용자 홀더 인가용 소유자 토큰이 릴레이 payload에 포함돼야 한다
     assert seen == {"device_id": "devX", "op": "replica_store",
@@ -383,7 +388,7 @@ async def test_holder_store_no_relay_on_non_connection_error(key):
 
     mgr._client.post = post
     mgr._relay_op = fake_relay
-    ok = await mgr._holder_store("devX", "1.2.3.4:9090", "c1", b"x", "tok")
+    ok, _source = await mgr._holder_store("devX", "1.2.3.4:9090", "c1", b"x", "tok")
     assert ok is False and relayed["called"] is False
 
 
@@ -407,7 +412,7 @@ async def test_holder_store_udp_before_relay(key):
     mgr._client.post = boom
     mgr.set_udp_transport(udp)
     mgr._relay_op = fake_relay
-    ok = await mgr._holder_store("devX", "1.2.3.4:9090", "c1", b"cipher", "tok")
+    ok, _source = await mgr._holder_store("devX", "1.2.3.4:9090", "c1", b"cipher", "tok")
     assert ok is True
     assert seen == {"device_id": "devX", "op": "replica_store", "token": "tok"}
     assert "relay" not in seen  # UDP 성공 → 릴레이 미사용
@@ -432,7 +437,7 @@ async def test_holder_store_relay_after_udp_fails(key):
     mgr._client.post = boom
     mgr.set_udp_transport(udp)
     mgr._relay_op = fake_relay
-    ok = await mgr._holder_store("devX", "1.2.3.4:9090", "c1", b"x", "tok")
+    ok, _source = await mgr._holder_store("devX", "1.2.3.4:9090", "c1", b"x", "tok")
     assert ok is True and relayed["called"] is True
 
 
@@ -478,7 +483,7 @@ def test_replicate_skips_already_secured_chunks(key):
     assert calls_after_first > 0
     assert second.status == "replicated"
     assert cloud.store_calls == calls_after_first  # 재전송 없음
-    assert second.replicas_per_chunk == first.replicas_per_chunk
+    assert second.copies_per_chunk == first.copies_per_chunk
 
 
 def test_replicate_resends_when_content_changed(key):
@@ -572,7 +577,7 @@ async def test_direct_quota_response_blocks_holder(key):
         return _Resp()
 
     mgr._client.post = post
-    ok = await mgr._holder_store("devQ", "1.2.3.4:9090", "c1", b"x", "tok")
+    ok, _source = await mgr._holder_store("devQ", "1.2.3.4:9090", "c1", b"x", "tok")
     assert ok is False
     assert mgr.quota_blocked_devices() == ["devQ"]
 
@@ -592,7 +597,7 @@ async def test_relay_quota_response_blocks_holder(key):
 
     mgr._client.post = boom
     mgr._relay_op = fake_relay
-    ok = await mgr._holder_store("devQ", "1.2.3.4:9090", "c1", b"x", "tok")
+    ok, _source = await mgr._holder_store("devQ", "1.2.3.4:9090", "c1", b"x", "tok")
     assert ok is False
     assert mgr.quota_blocked_devices() == ["devQ"]
 
@@ -610,7 +615,7 @@ async def test_udp_quota_response_blocks_holder(key):
 
     mgr._client.post = boom
     mgr.set_udp_transport(udp)
-    ok = await mgr._holder_store("devQ", "1.2.3.4:9090", "c1", b"x", "tok")
+    ok, _source = await mgr._holder_store("devQ", "1.2.3.4:9090", "c1", b"x", "tok")
     assert ok is False
     assert mgr.quota_blocked_devices() == ["devQ"]
 
@@ -628,7 +633,7 @@ async def test_relay_reachability_failure_does_not_block_holder(key):
 
     mgr._client.post = boom
     mgr._relay_op = fake_relay
-    ok = await mgr._holder_store("devQ", "1.2.3.4:9090", "c1", b"x", "tok")
+    ok, _source = await mgr._holder_store("devQ", "1.2.3.4:9090", "c1", b"x", "tok")
     assert ok is False
     assert mgr.quota_blocked_devices() == []
 
@@ -655,7 +660,7 @@ def test_replicate_stops_asking_for_quota_blocked_holder(key):
     meta = _FakeMeta({"/f"})
     mgr = ReplicationManager(
         _FakeAuth(), "http://server", meta, storage_pool,
-        chunk_size=64, min_replicas=1,
+        chunk_size=64, target_copies=1,
     )
     storage_pool.device_id = "self-dev"
     excludes: list[list[str]] = []
@@ -664,11 +669,11 @@ def test_replicate_stops_asking_for_quota_blocked_holder(key):
                              chunk_hash=None):
         return None
 
-    async def placement(token, size, exclude):
+    async def placement(token, size, exclude, exclude_locations=None):
         excludes.append(list(exclude))
         return [{"device_id": "devQ", "connection_address": "devQ"}]
 
-    async def record_replica(token, chunk_id, device_id):
+    async def record_replica(token, chunk_id, device_id, source_id=""):
         return True
 
     async def relay_quota(device_id, op, payload):
@@ -718,7 +723,7 @@ def test_placement_requests_spare_candidates(key):
     import asyncio as _asyncio
 
     _asyncio.run(mgr._placement("tok", 100, ["x"]))
-    assert captured["count"] == mgr.min_replicas + rm.PLACEMENT_SPARE
+    assert captured["count"] == mgr.target_copies + rm.PLACEMENT_SPARE
     assert captured["exclude"] == ["x"]
 
 
@@ -953,9 +958,9 @@ def test_origin_device_excluded_from_placement(key):
     seen_excludes: list[list[str]] = []
     inner = mgr._placement
 
-    async def spy(token, size, exclude):
+    async def spy(token, size, exclude, exclude_locations=None):
         seen_excludes.append(list(exclude))
-        return await inner(token, size, exclude)
+        return await inner(token, size, exclude, exclude_locations)
 
     mgr._placement = spy
     try:
@@ -979,9 +984,9 @@ def test_local_chunks_exclude_self_device(key):
     seen: list[list[str]] = []
     inner = mgr._placement
 
-    async def spy(token, size, exclude):
+    async def spy(token, size, exclude, exclude_locations=None):
         seen.append(list(exclude))
-        return await inner(token, size, exclude)
+        return await inner(token, size, exclude, exclude_locations)
 
     mgr._placement = spy
     try:
@@ -1011,7 +1016,7 @@ def test_no_holder_after_exclusion_is_pending_with_reason(key, caplog):
     assert result.status == "pending"
     assert result.no_holder_chunks == result.chunk_count
     assert not cloud.holder_store  # 어디에도 저장하지 않았다
-    assert any("배치 후보가 없는 청크" in r.getMessage()
+    assert any("쓸 수 있는 위치가 없는 청크" in r.getMessage()
                for r in caplog.records)
 
 
@@ -1028,9 +1033,9 @@ def test_heal_excludes_origin_device(key):
         seen: list[list[str]] = []
         inner = mgr._placement
 
-        async def spy(token, size, exclude):
+        async def spy(token, size, exclude, exclude_locations=None):
             seen.append(list(exclude))
-            return await inner(token, size, exclude)
+            return await inner(token, size, exclude, exclude_locations)
 
         mgr._placement = spy
         mgr.ensure_replicas("/f")
@@ -1186,7 +1191,7 @@ async def test_slow_holder_is_logged(key, caplog, monkeypatch):
     mgr._relay_op = slow_relay
     with caplog.at_level(logging.WARNING,
                          logger="stardustlib.replication_manager"):
-        ok = await mgr._holder_store("devS", "1.2.3.4:9090", "c1", b"x", "tok")
+        ok, _source = await mgr._holder_store("devS", "1.2.3.4:9090", "c1", b"x", "tok")
 
     assert ok is False
     assert any("홀더 전송 지연" in r.getMessage() for r in caplog.records)
@@ -1212,7 +1217,7 @@ def test_progress_tracked_and_cleared(key):
     meta = _FakeMeta({"/f"})
     mgr = ReplicationManager(
         _FakeAuth(), "http://server", meta, storage_pool,
-        chunk_size=64, min_replicas=3, progress=tracker,
+        chunk_size=64, target_copies=3, progress=tracker,
     )
     _Cloud(["h1", "h2", "h3"]).attach(mgr)
     try:
@@ -1235,7 +1240,7 @@ def test_progress_cleared_on_failure(key):
     meta = _FakeMeta({"/f"})
     mgr = ReplicationManager(
         _FakeAuth(), "http://server", meta, storage_pool,
-        chunk_size=64, min_replicas=1, progress=tracker,
+        chunk_size=64, target_copies=1, progress=tracker,
     )
 
     def boom(*_a, **_k):

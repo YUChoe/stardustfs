@@ -59,7 +59,7 @@ class ProgressSnapshot:
     stage: str          # reading|storing|idle
     done: int           # 처리한 청크 수
     total: int          # 전체 청크 수
-    secured: int        # min_replicas를 확보한 청크 수
+    secured: int        # 목표 카피 수를 확보한 청크 수(chunk-copy-policy: target_copies)
     started_at: float   # monotonic
 
 class ProgressTracker:

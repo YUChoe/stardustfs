@@ -591,14 +591,15 @@ class P2PServer:
         if len(data) > MAX_WRITE_SIZE:
             return 413, {"error": "Payload too large (max 100MB)"}
         try:
-            self._parity_store.store(chunk_id, requester, data)
+            source_id = self._parity_store.store(chunk_id, requester, data)
         except ValueError:
             return 400, {"error": "Invalid chunk_id"}
         except PermissionError:
             return 403, {"error": "Chunk owner mismatch"}
         except QuotaExceededError:
             return 507, {"error": "Insufficient storage (quota exceeded)"}
-        return 200, {"bytes_written": len(data)}
+        # 보관 소스를 함께 돌려준다 — 요청자가 카피 위치(기기+소스)로 등록한다.
+        return 200, {"bytes_written": len(data), "source_id": source_id or ""}
 
     def _op_replica_fetch(
         self, body: dict, requester: str

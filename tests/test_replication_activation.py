@@ -1,4 +1,4 @@
-"""리플리케이션 운영 활성화 Phase A1: parity 자동 활성 + 호스팅 신고."""
+"""리플리케이션 운영 활성화: parity 자동 활성 + 호스팅 사용량 보고."""
 from __future__ import annotations
 
 import socket
@@ -9,7 +9,21 @@ from aiohttp import web
 
 from stardustfs import _build_parity_store
 from stardustlib.auth_client import AuthClient
-from stardustlib.replication_hosting import fetch_policy, report_hosting
+from stardustlib.metadata_store import MetadataStore
+from stardustlib.replication_hosting import fetch_policy, report_usage
+from stardustlib.storage_pool import StoragePool
+from stardustlib.storage_source import DirectorySource
+
+
+def _pool(tmp_path):
+    """보관 청크를 놓을 소스 1개짜리 StoragePool + MetadataStore."""
+    store = MetadataStore(str(tmp_path / "m.db"), b"k" * 32)
+    store.initialize()
+    src_dir = tmp_path / "src-1"
+    src_dir.mkdir()
+    source = DirectorySource("src-1", str(src_dir))
+    source.initialize()
+    return StoragePool([source], store, None, device_id="dev-self"), store
 
 
 def _free_port() -> int:
@@ -26,7 +40,8 @@ def test_parity_max_is_server_quota(tmp_path):
         "metadata_db": str(tmp_path / "m.db"),
         "replication": {"enabled": True},
     }
-    ps = _build_parity_store(config, 4096)
+    pool, store = _pool(tmp_path)
+    ps = _build_parity_store(config, pool, store, 4096)
     assert ps is not None
     assert ps._max_bytes == 4096
 
@@ -34,20 +49,23 @@ def test_parity_max_is_server_quota(tmp_path):
 def test_parity_disabled_returns_none(tmp_path):
     config = {"metadata_db": str(tmp_path / "m.db"),
               "replication": {"enabled": False}}
-    assert _build_parity_store(config) is None
+    pool, store = _pool(tmp_path)
+    assert _build_parity_store(config, pool, store) is None
 
 
 def test_parity_without_quota_hosts_nothing(tmp_path):
     """정책을 받지 못하면(quota=None) 타 사용자 청크를 받지 않는다(한도 0)."""
-    ps = _build_parity_store({"metadata_db": str(tmp_path / "m.db")})
+    pool, store = _pool(tmp_path)
+    ps = _build_parity_store({"metadata_db": str(tmp_path / "m.db")}, pool, store)
     assert ps is not None and ps._max_bytes == 0
 
 
 def test_parity_zero_quota_hosts_nothing(tmp_path):
     """할당량 0(호스팅 금지)도 한도 0이다."""
+    pool, store = _pool(tmp_path)
     ps = _build_parity_store(
         {"metadata_db": str(tmp_path / "m.db"), "replication": {"enabled": True}},
-        0,
+        pool, store, 0,
     )
     assert ps is not None and ps._max_bytes == 0
 
@@ -59,11 +77,12 @@ def test_parity_ignores_legacy_config_keys(tmp_path):
         "replication": {"enabled": True, "provided_bytes": 1000},
         "p2p": {"parity_max_bytes": 123},
     }
-    ps = _build_parity_store(config)
+    pool, store = _pool(tmp_path)
+    ps = _build_parity_store(config, pool, store)
     assert ps is not None and ps._max_bytes == 0
 
 
-# --- report_hosting ---
+# --- report_usage ---
 
 class _FakeAuth(AuthClient):
     def __init__(self, url: str) -> None:
@@ -118,21 +137,24 @@ async def hosting_server():
 
 
 @pytest.mark.asyncio
-async def test_report_hosting_success(hosting_server):
+async def test_report_usage_success(hosting_server):
+    """제공 용량 신고가 아니라 실제 사용량(hosted/총 용량)을 보고한다."""
     auth = _FakeAuth(hosting_server.url)
-    ok = await report_hosting(auth, hosting_server.url, "dev-1", 5000)
+    ok = await report_usage(auth, hosting_server.url, "dev-1", 5000, 10_000)
     await auth.close()
     assert ok is True
-    assert hosting_server.received == {"device_id": "dev-1", "provided_bytes": 5000}
+    assert hosting_server.received == {
+        "device_id": "dev-1", "hosted_bytes": 5000, "total_bytes": 10_000,
+    }
 
 
 @pytest.mark.asyncio
-async def test_report_hosting_404_graceful():
+async def test_report_usage_404_graceful():
     srv = _HostingServer(status=404)
     await srv.start()
     auth = _FakeAuth(srv.url)
     try:
-        ok = await report_hosting(auth, srv.url, "dev-1", 5000)
+        ok = await report_usage(auth, srv.url, "dev-1", 5000, 10_000)
         assert ok is False
     finally:
         await auth.close()
@@ -145,8 +167,8 @@ async def test_fetch_policy_success(hosting_server):
     auth = _FakeAuth(hosting_server.url)
     policy = await fetch_policy(auth, hosting_server.url)
     await auth.close()
+    # 폐기 필드(reciprocity_fraction·min_replicas)는 읽지 않는다.
     assert policy == {
-        "reciprocity_fraction": 0.5, "min_replicas": 3,
         "p2p_enabled": True, "hosting_enabled": True,
         # 새 필드를 안 주는 서버 → 목표 카피 기본 3, 할당량은 None(미수신)
         "target_copies": 3, "hosting_quota_bytes": None,
@@ -177,12 +199,12 @@ async def test_fetch_policy_unreachable_returns_none():
 
 
 @pytest.mark.asyncio
-async def test_report_hosting_unreachable_graceful():
+async def test_report_usage_unreachable_graceful():
     # 사용 가능한 포트지만 리스너 없음 → 연결 실패 → False
     url = f"http://127.0.0.1:{_free_port()}"
     auth = _FakeAuth(url)
     try:
-        ok = await report_hosting(auth, url, "dev-1", 5000, timeout=1.0)
+        ok = await report_usage(auth, url, "dev-1", 5000, 10_000, timeout=1.0)
         assert ok is False
     finally:
         await auth.close()
@@ -211,3 +233,24 @@ async def test_fetch_policy_zero_quota_is_not_none(hosting_server):
     policy = await fetch_policy(auth, hosting_server.url, device_id="dev-1")
     await auth.close()
     assert policy["hosting_quota_bytes"] == 0
+
+
+def test_build_parity_store_migrates_legacy_dir(tmp_path):
+    """기동 시 구 `.parity/` 청크를 소스로 이관한다(쿼터와 무관하게 지킨다)."""
+    import json
+
+    db_path = str(tmp_path / "m.db")
+    legacy = tmp_path / "m.db.parity"
+    legacy.mkdir()
+    (legacy / "aa.bin").write_bytes(b"legacy-chunk")
+    (legacy / "index.json").write_text(
+        json.dumps({"aa": {"owner": "owner-a", "size": 12}}), encoding="utf-8"
+    )
+
+    pool, store = _pool(tmp_path)
+    # 상한 0(호스팅 금지)이어도 이미 맡은 청크는 옮겨 보관한다
+    ps = _build_parity_store({"metadata_db": db_path}, pool, store, 0)
+
+    assert ps is not None
+    assert ps.fetch("aa", "owner-a") == b"legacy-chunk"
+    assert ps._max_bytes == 0  # 이관 후 상한은 정책값으로 복원된다
