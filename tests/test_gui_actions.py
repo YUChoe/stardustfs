@@ -427,3 +427,142 @@ def test_mgmt_poll_shortens_interval_during_backup():
 def test_daemon_live_sources_empty_without_daemon(tmp_path):
     """데몬이 없으면 빈 dict — 서버 레지스트리 값을 그대로 쓴다."""
     assert actions._daemon_live_sources(str(tmp_path / "none.db")) == {}
+
+
+# --- 디바이스 인벤토리 (요청 통합) ---
+
+def test_split_inventory_restores_device_and_source_shapes():
+    """인벤토리 응답을 /devices + /devices/sources 형태로 되돌린다.
+
+    병합 코드가 두 엔드포인트 형태를 전제하므로, 합쳐 받은 것을 같은 모양으로 풀어
+    구버전 서버 폴백과 경로를 공유한다.
+    """
+    devices = [
+        {
+            "id": "dev-a", "name": "A", "is_online": True,
+            "connection_address": "1.1.1.1:9090",
+            "sources": [
+                {"source_id": "s1", "type": "loopback", "capacity_bytes": 100,
+                 "used_bytes": 10, "state": "ready", "updated_at": "t1"},
+            ],
+        },
+        {
+            "id": "dev-b", "name": "B", "is_online": False,
+            "connection_address": "2.2.2.2:9090", "sources": [],
+        },
+    ]
+    devs, srcs = actions._split_inventory(devices)
+
+    # 디바이스 항목에서 sources는 빠진다(/devices 응답과 같은 모양)
+    assert [d["id"] for d in devs] == ["dev-a", "dev-b"]
+    assert all("sources" not in d for d in devs)
+    assert devs[0]["is_online"] is True
+
+    # 소스 항목에는 소속 디바이스 정보가 붙는다(/devices/sources 응답과 같은 모양)
+    assert len(srcs) == 1
+    assert srcs[0]["device_id"] == "dev-a"
+    assert srcs[0]["device_name"] == "A"
+    assert srcs[0]["is_online"] is True
+    assert srcs[0]["capacity_bytes"] == 100
+
+
+def test_split_inventory_marks_sources_of_offline_device():
+    """오프라인 디바이스의 소스는 오프라인으로 표시된다."""
+    devs, srcs = actions._split_inventory([{
+        "id": "dev-c", "name": "C", "is_online": False,
+        "sources": [{"source_id": "s9", "type": "loopback",
+                     "capacity_bytes": 1, "used_bytes": 0,
+                     "state": "ready", "updated_at": "t"}],
+    }])
+    assert len(devs) == 1
+    assert srcs[0]["is_online"] is False
+
+
+def test_split_inventory_handles_empty_and_missing_sources():
+    assert actions._split_inventory([]) == ([], [])
+    devs, srcs = actions._split_inventory([{"id": "d", "name": "D"}])
+    assert len(devs) == 1 and srcs == []
+
+
+class _MgmtStub:
+    """StardustApp._populate_mgmt의 요약 계산만 떼어 검증하기 위한 스텁."""
+
+    def __init__(self) -> None:
+        self.summaries: list[dict] = []
+        self.t = {"this_device": "현재", "status_online": "온라인",
+                  "status_offline": "오프라인", "src_state_ready": "준비됨",
+                  "src_state_initializing": "초기화 중"}
+        self._mgmt_meta: dict = {}
+        self.mgmt_tree = None  # winfo_exists 검사에서 조기 반환
+
+    def _show_device_summary(self, s: dict) -> None:
+        self.summaries.append(s)
+
+
+def test_populate_mgmt_computes_device_summary(monkeypatch):
+    """하단 패널 갱신이 같은 응답으로 온라인/전체를 계산한다(별도 조회 없음)."""
+    from stardustlib.gui.app import StardustApp
+
+    class _Tree:
+        def winfo_exists(self):
+            return True
+
+        def get_children(self):
+            return []
+
+        def delete(self, *_a):
+            pass
+
+        def insert(self, *_a, **_k):
+            return "iid"
+
+    class _Btn:
+        def config(self, **_k):
+            pass
+
+    stub = _MgmtStub()
+    stub.mgmt_tree = _Tree()
+    stub.mgmt_detach_btn = _Btn()
+
+    StardustApp._populate_mgmt(stub, True, {
+        "online": True,
+        "devices": [
+            {"id": "a", "name": "A", "online": True, "self": True,
+             "sources": []},
+            {"id": "b", "name": "B", "online": False, "sources": []},
+        ],
+    })
+    assert stub.summaries == [{"online": 1, "total": 2}]
+
+
+def test_populate_mgmt_skips_summary_when_degraded():
+    """서버 미도달(강등)이면 카운트를 건드리지 않는다(로컬만 보이기 때문)."""
+    from stardustlib.gui.app import StardustApp
+
+    class _Tree:
+        def winfo_exists(self):
+            return True
+
+        def get_children(self):
+            return []
+
+        def delete(self, *_a):
+            pass
+
+        def insert(self, *_a, **_k):
+            return "iid"
+
+    class _Btn:
+        def config(self, **_k):
+            pass
+
+    stub = _MgmtStub()
+    stub.mgmt_tree = _Tree()
+    stub.mgmt_detach_btn = _Btn()
+
+    StardustApp._populate_mgmt(stub, True, {
+        "online": False,
+        "devices": [{"id": None, "name": "이 기기", "online": True,
+                     "self": True, "sources": []}],
+    })
+    assert stub.summaries == []

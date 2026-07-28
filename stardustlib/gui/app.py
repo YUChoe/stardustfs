@@ -701,13 +701,8 @@ class StardustApp:
         self._mark_meta_seen()
         if not counts:
             return
-        # 디바이스 상태(온라인/전체)는 로그인 시 백그라운드 조회로 갱신.
-        if self._logged_in():
-            cfg = self.config_path
-            self.worker.submit(
-                lambda: actions.devices_summary(cfg),
-                lambda ok, s: self._show_device_summary(s) if ok else None,
-            )
+        # 디바이스 온라인/전체는 하단 패널 갱신(_populate_mgmt)에서 같은 응답으로
+        # 계산한다 — 파일 목록을 다시 읽을 때마다 /devices를 또 부르지 않는다.
         # 로컬 상태가 pending/replicated인 파일만 실제 복제본 수를 백그라운드 조회해
         # 병기한다. none(미백업) 뿐이면 서버 조회를 생략한다(불필요한 초기화/호출 방지).
         # (조용한 보강 — worker 콜백은 (ok, payload) 시그니처, 실패 시 상태만 유지)
@@ -1058,6 +1053,14 @@ class StardustApp:
         self.mgmt_detach_btn.config(state="disabled")
         if not ok or not isinstance(data, dict):
             return
+        # 디바이스 온라인/전체 요약을 같은 응답에서 계산한다(별도 GET /devices 없음).
+        # 서버 미도달(강등)일 때는 이 기기 로컬만 보이므로 카운트를 건드리지 않는다.
+        if data.get("online"):
+            devices = data.get("devices", [])
+            self._show_device_summary({
+                "online": sum(1 for d in devices if d.get("online")),
+                "total": len(devices),
+            })
         t = self.t
         for d in data.get("devices", []):
             name = d.get("name") or "?"
@@ -1203,16 +1206,14 @@ class StardustApp:
     # --- daemon ---
 
     def _refresh_daemon(self) -> None:
+        """daemon 생존만 5초마다 확인한다(제어 파일 읽기 — 서버 호출 없음).
+
+        디바이스 온라인 카운트는 하단 패널 갱신(_populate_mgmt)이 같은 응답으로
+        계산한다. 여기서 따로 조회하면 5초마다 GET /devices가 한 번 더 나간다.
+        """
         if self.config_path:
             cfg = self.config_path
             self.worker.submit(lambda: actions.daemon_status(cfg), self._on_daemon)
-            # 디바이스 온라인 카운트를 주기적으로 갱신(유휴 중 staleness 방지).
-            # 경량 GET /devices라 폴링 부담이 작다.
-            if self._logged_in():
-                self.worker.submit(
-                    lambda: actions.devices_summary(cfg),
-                    lambda ok, s: self._show_device_summary(s) if ok else None,
-                )
         self.root.after(5000, self._refresh_daemon)
 
     def _daemon_dot(self, text: str, color: str) -> None:

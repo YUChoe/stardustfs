@@ -370,60 +370,6 @@ async def _run_online(config_path: str, aop, sync: bool):
         await session.aclose()
 
 
-def devices_summary(config_path: str) -> dict:
-    """디바이스 온라인/전체 요약 {online, total}. 미로그인/오프라인이면 {}.
-
-    경량 인증(토큰 + GET /devices)만 사용한다 — open_online(원격 마운트)을 쓰지 않아
-    주기 폴링에 가볍고, 디바이스 목록 창(devices_list)과 동일한 /devices 응답을 세므로
-    카운트가 일치한다.
-    """
-    config = ConfigLoader(config_path).load()
-    server = config.get("server")
-    server_url = server.get("url") if isinstance(server, dict) else None
-    if not server_url:
-        return {}
-
-    async def run() -> dict:
-        import httpx
-
-        from stardustlib.auth_client import AuthClient
-        from stardustlib.credential_store import CredentialStore
-        from stardustlib.exceptions import AuthenticationError
-
-        store = CredentialStore(config["metadata_db"])
-        auth = AuthClient(server_url, credential_store=store)
-        if not auth.load_from_store():
-            await auth.close()
-            return {}
-        try:
-            token = await auth.get_valid_token()
-        except AuthenticationError:
-            await auth.close()
-            return {}
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(
-                    f"{server_url}/devices",
-                    headers={"Authorization": f"Bearer {token}"},
-                )
-            if resp.status_code >= 400:
-                return {}
-            devs = resp.json()
-            if not isinstance(devs, list):
-                return {}
-            return {
-                "online": sum(1 for d in devs if d.get("is_online")),
-                "total": len(devs),
-            }
-        finally:
-            await auth.close()
-
-    try:
-        return asyncio.run(run())
-    except Exception:  # noqa: BLE001 — 미로그인/오프라인
-        return {}
-
-
 def devices_list(config_path: str) -> list[dict]:
     async def aop(s):
         return [
@@ -437,6 +383,28 @@ def devices_list(config_path: str) -> list[dict]:
         ]
 
     return asyncio.run(_run_online(config_path, aop, sync=False))
+
+
+def _split_inventory(devices: list[dict]) -> tuple[list[dict], list[dict]]:
+    """인벤토리 응답을 (디바이스 목록, 소스 목록)으로 되돌린다.
+
+    아래 병합 코드는 /devices + /devices/sources 형태를 전제하므로, 합쳐 받은 것을
+    같은 모양으로 풀어 준다(구버전 서버 폴백과 경로를 공유한다).
+    """
+    devs: list[dict] = []
+    srcs: list[dict] = []
+    for device in devices:
+        device_id = device.get("id")
+        devs.append({k: v for k, v in device.items() if k != "sources"})
+        for source in device.get("sources") or []:
+            srcs.append({
+                **source,
+                "device_id": device_id,
+                "device_name": device.get("name"),
+                # 소스의 온라인 여부는 그 소스를 가진 디바이스의 상태다.
+                "is_online": device.get("is_online"),
+            })
+    return devs, srcs
 
 
 def _daemon_live_sources(metadata_db: str) -> dict:
@@ -601,6 +569,13 @@ def storage_and_devices(config_path: str) -> dict:
         try:
             headers = {"Authorization": f"Bearer {token}"}
             async with httpx.AsyncClient(timeout=10.0) as client:
+                # 인벤토리 1회로 디바이스 + 소스를 함께 받는다. 이 화면은 주기
+                # 폴링되므로 왕복 하나가 그대로 반복 부하가 된다.
+                ir = await client.get(
+                    f"{server_url}/devices/inventory", headers=headers)
+                if ir.status_code == 200:
+                    return _split_inventory(ir.json().get("devices", []))
+                # 구버전 서버(인벤토리 미지원) → 기존 두 엔드포인트
                 dr = await client.get(f"{server_url}/devices", headers=headers)
                 sr = await client.get(
                     f"{server_url}/devices/sources", headers=headers)
