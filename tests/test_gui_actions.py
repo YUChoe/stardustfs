@@ -303,7 +303,7 @@ def test_delegate_backup_reports_unreachable():
 # --- 복제 진행 표시 (GUI 상태바) ---
 
 class _ProgressStub:
-    """StardustApp._show_progress만 떼어 검증하기 위한 최소 스텁."""
+    """StardustApp._show_progress / _mgmt_poll만 떼어 검증하기 위한 최소 스텁."""
 
     def __init__(self) -> None:
         self.t = {
@@ -313,9 +313,21 @@ class _ProgressStub:
         }
         self._showing_progress = False
         self.status_text = "이전 상태"
+        self.refreshed = 0
+        self.scheduled: list[int] = []
+        self.root = self
 
     def _set_status(self, text: str) -> None:
         self.status_text = text
+
+    def _refresh_mgmt(self) -> None:
+        self.refreshed += 1
+
+    def _mgmt_poll(self) -> None:  # after()에 넘길 콜백(재예약은 하지 않는다)
+        pass
+
+    def after(self, delay: int, _fn) -> None:  # root.after 대역
+        self.scheduled.append(delay)
 
 
 def test_progress_shown_in_status_bar():
@@ -363,3 +375,55 @@ def test_progress_poll_failure_keeps_status():
     StardustApp._show_progress(stub, False, None)
     StardustApp._show_progress(stub, True, None)
     assert stub.status_text == "이전 상태"
+
+
+def test_backup_start_and_finish_refresh_storage_panel():
+    """백업 시작·종료 시 스토리지 패널을 즉시 갱신한다.
+
+    백업은 daemon이 수행하므로 GUI의 쓰기 경로(_after_write)를 타지 않는다 —
+    여기서 당겨오지 않으면 용량이 멈춘 것처럼 보인다.
+    """
+    from stardustlib.gui.app import StardustApp
+
+    stub = _ProgressStub()
+    StardustApp._show_progress(stub, True, {
+        "active": True, "path": "/a/big.bin", "stage": "storing",
+        "done": 1, "total": 10,
+    })
+    assert stub._showing_progress is True
+    assert stub.refreshed == 1, "백업 시작 시 갱신하지 않음"
+
+    # 진행 중 반복 호출은 추가 갱신을 유발하지 않는다(주기 폴링이 맡는다)
+    StardustApp._show_progress(stub, True, {
+        "active": True, "path": "/a/big.bin", "stage": "storing",
+        "done": 5, "total": 10,
+    })
+    assert stub.refreshed == 1
+
+    StardustApp._show_progress(stub, True, {"active": False})
+    assert stub._showing_progress is False
+    assert stub.refreshed == 2, "백업 종료 시 최종 용량을 반영하지 않음"
+    assert stub.status_text == "준비됨"
+
+
+def test_mgmt_poll_shortens_interval_during_backup():
+    """백업 중에는 패널 갱신 주기를 줄인다."""
+    from stardustlib.gui.app import (
+        _MGMT_POLL_BACKUP_MS,
+        _MGMT_POLL_IDLE_MS,
+        StardustApp,
+    )
+
+    stub = _ProgressStub()
+    StardustApp._mgmt_poll(stub)
+    assert stub.scheduled[-1] == _MGMT_POLL_IDLE_MS
+
+    stub._showing_progress = True
+    StardustApp._mgmt_poll(stub)
+    assert stub.scheduled[-1] == _MGMT_POLL_BACKUP_MS
+    assert _MGMT_POLL_BACKUP_MS < _MGMT_POLL_IDLE_MS
+
+
+def test_daemon_live_sources_empty_without_daemon(tmp_path):
+    """데몬이 없으면 빈 dict — 서버 레지스트리 값을 그대로 쓴다."""
+    assert actions._daemon_live_sources(str(tmp_path / "none.db")) == {}

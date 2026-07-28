@@ -30,6 +30,11 @@ logger = logging.getLogger(__name__)
 # 상태 폴링 주기(5s)보다 충분히 커서 부팅 중 중복 시작을 막는다.
 _DAEMON_RESTART_COOLDOWN = 20.0
 
+# 스토리지·디바이스 패널 갱신 주기(ms). 백업이 도는 동안에는 용량이 계속 변하므로
+# 짧게 돌려 진행이 화면에 반영되게 한다(유휴 시에는 서버 조회를 아끼려 길게).
+_MGMT_POLL_IDLE_MS = 15000
+_MGMT_POLL_BACKUP_MS = 3000
+
 
 def _human(n: int) -> str:
     size = float(n)
@@ -446,16 +451,20 @@ class StardustApp:
         daemon 미실행·조회 실패(payload=None)면 아무것도 하지 않는다.
         """
         if not ok or not payload or not payload.get("active"):
-            # 진행이 끝났으면 상태바를 기본 문구로 되돌린다.
+            # 진행이 끝났으면 상태바를 기본 문구로 되돌리고 최종 용량을 반영한다.
             if self._showing_progress:
                 self._showing_progress = False
                 self._set_status(self.t["ready"])
+                self._refresh_mgmt()
             return
         name = payload.get("path", "").rsplit("/", 1)[-1]
         key = (
             "backup_progress_reading"
             if payload.get("stage") == "reading" else "backup_progress"
         )
+        if not self._showing_progress:
+            # 백업 시작 — 짧은 주기 갱신으로 전환되기 전에 한 번 당겨 온다.
+            self._refresh_mgmt()
         self._showing_progress = True
         self._set_status(self.t[key].format(
             name=name, done=payload.get("done", 0),
@@ -993,8 +1002,17 @@ class StardustApp:
             lambda: actions.storage_and_devices(cfg), self._populate_mgmt)
 
     def _mgmt_poll(self) -> None:
+        """스토리지·디바이스 패널 주기 갱신. 백업 중에는 주기를 줄인다.
+
+        백업은 daemon이 수행하므로 GUI의 쓰기 경로(_after_write)를 타지 않는다.
+        진행 중 용량이 멈춘 것처럼 보이지 않도록 여기서 따라간다.
+        """
         self._refresh_mgmt()
-        self.root.after(15000, self._mgmt_poll)
+        delay = (
+            _MGMT_POLL_BACKUP_MS if self._showing_progress
+            else _MGMT_POLL_IDLE_MS
+        )
+        self.root.after(delay, self._mgmt_poll)
 
     def _populate_mgmt(self, ok, data) -> None:
         tv = getattr(self, "mgmt_tree", None)

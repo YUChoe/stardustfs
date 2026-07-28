@@ -439,6 +439,22 @@ def devices_list(config_path: str) -> list[dict]:
     return asyncio.run(_run_online(config_path, aop, sync=False))
 
 
+def _daemon_live_sources(metadata_db: str) -> dict:
+    """데몬이 보고하는 로컬 소스 실시간 용량. source_id → {total, used, state}.
+
+    데몬 미실행·조회 실패면 빈 dict(호출자는 서버 레지스트리 값을 그대로 쓴다).
+    """
+    from stardustlib.daemon_control import storage_via_daemon
+
+    try:
+        rows = storage_via_daemon(metadata_db)
+    except Exception:  # noqa: BLE001 — 표시 경로라 실패는 무시
+        return {}
+    if not rows:
+        return {}
+    return {r["source_id"]: r for r in rows if r.get("source_id")}
+
+
 def _local_live_sources(config_path: str) -> list[dict]:
     """서버 미도달(강등) 시 이 디바이스의 로컬 소스를 라이브로 구성한다."""
     session = _offline_session(config_path)
@@ -615,6 +631,20 @@ def storage_and_devices(config_path: str) -> dict:
             "state": s.get("state", "ready"),
             "online": bool(s.get("is_online")),
         })
+    # 이 기기 소스는 데몬의 실시간 값으로 덮어쓴다. 서버 레지스트리 값은 소스
+    # 인벤토리 재신고 주기만큼 뒤처져 백업이 도는 동안 화면이 멈춘 것처럼 보인다.
+    live = _daemon_live_sources(config["metadata_db"])
+    if live and self_id:
+        for src in by_dev.get(self_id, []):
+            fresh = live.get(src["source_id"])
+            if fresh is None:
+                continue
+            if fresh.get("total") is not None:
+                src["total"] = fresh["total"]
+            if fresh.get("used") is not None:
+                src["used"] = fresh["used"]
+            src["state"] = fresh.get("state", src["state"])
+
     devices = []
     for d in devs:
         did = d.get("id")

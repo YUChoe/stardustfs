@@ -133,6 +133,37 @@ def progress_via_daemon(metadata_db: str) -> dict | None:
         return None
 
 
+def storage_via_daemon(metadata_db: str) -> list[dict] | None:
+    """데몬이 마운트한 로컬 소스의 실시간 용량을 조회한다.
+
+    서버 레지스트리의 용량은 소스 인벤토리 재신고 주기(기본 60초)만큼 뒤처지므로
+    백업이 도는 동안 화면이 멈춘 것처럼 보인다. 데몬은 자기 StoragePool을 들고
+    있으니 그 값을 직접 물어본다.
+
+    Returns:
+        [{"source_id", "total", "used", "state"}] 또는 데몬 미실행·조회 실패 시
+        None(호출자는 서버 레지스트리 값을 그대로 쓴다).
+    """
+    ctl = read_ctl(metadata_db)
+    if ctl is None:
+        return None
+    try:
+        resp = httpx.post(
+            f"http://127.0.0.1:{ctl['port']}/ctl/storage",
+            json={},
+            headers={"X-Ctl-Token": ctl["token"]},
+            timeout=_PROGRESS_TIMEOUT,
+        )
+    except httpx.HTTPError:
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        return list(resp.json().get("sources", []))
+    except ValueError:
+        return None
+
+
 class DaemonControlServer:
     """데몬의 로컬 전송 위임 서버(127.0.0.1)."""
 
@@ -161,6 +192,7 @@ class DaemonControlServer:
             web.post("/ctl/get", self._handle_get),
             web.post("/ctl/announce", self._handle_announce),
             web.post("/ctl/progress", self._handle_progress),
+            web.post("/ctl/storage", self._handle_storage),
         ])
         # 접근 로그를 끈다. GUI가 /ctl/progress를 3초마다 폴링하므로 요청당 한 줄이
         # 쌓이면 하루 약 3만 줄이 되어 실제 이벤트가 묻힌다. 각 핸들러가 필요한 것만
@@ -261,6 +293,33 @@ class DaemonControlServer:
         if snapshot is None:
             return web.json_response({"active": False})
         return web.json_response(snapshot.as_dict())
+
+    async def _handle_storage(self, request: web.Request) -> web.Response:
+        """마운트된 로컬 소스의 실시간 용량을 반환한다(GUI 폴링).
+
+        원격 소스는 제외한다 — 그 용량은 보관 기기가 신고한다.
+        """
+        if not self._authorised(request):
+            return web.json_response({"error": "unauthorised"}, status=403)
+        sources = []
+        for source in getattr(self._storage_pool, "sources", []):
+            if getattr(source, "is_remote", False):
+                continue
+            try:
+                total = source.get_total_space()
+                used = max(0, total - source.get_available_space())
+            except Exception:  # noqa: BLE001 — 조회 실패 소스는 미상으로 둔다
+                total = used = None
+            sources.append({
+                "source_id": source.source_id,
+                "total": total,
+                "used": used,
+                "state": (
+                    "ready" if getattr(source, "is_active", False)
+                    else "initializing"
+                ),
+            })
+        return web.json_response({"sources": sources})
 
     async def _handle_get(self, request: web.Request) -> web.Response:
         if not self._authorised(request):

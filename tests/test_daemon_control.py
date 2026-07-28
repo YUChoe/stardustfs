@@ -258,3 +258,92 @@ async def test_progress_returns_none_without_daemon(tmp_path):
     db = str(tmp_path / "absent.db")
     res = await asyncio.to_thread(daemon_control.progress_via_daemon, db)
     assert res is None
+
+
+class _FakeSource:
+    """용량을 보고하는 소스 대역(로컬/원격 구분 포함)."""
+
+    def __init__(self, source_id, total, avail, *, remote=False, active=True):
+        self.source_id = source_id
+        self.is_remote = remote
+        self.is_active = active
+        self._total = total
+        self._avail = avail
+
+    def get_total_space(self):
+        return self._total
+
+    def get_available_space(self):
+        return self._avail
+
+
+class _PoolWithSources(_FakeStoragePool):
+    def __init__(self, sources):
+        super().__init__()
+        self.sources = sources
+
+
+@pytest.mark.asyncio
+async def test_storage_reports_live_local_usage(tmp_path):
+    """데몬이 마운트한 로컬 소스의 실시간 사용량을 돌려준다.
+
+    서버 레지스트리 값은 소스 재신고 주기만큼 뒤처지므로, 백업 중 용량을 따라가려면
+    데몬이 들고 있는 StoragePool을 직접 읽어야 한다.
+    """
+    db = str(tmp_path / "m.db")
+    pool = _PoolWithSources([
+        _FakeSource("loop-a", 1000, 400),           # used 600
+        _FakeSource("remote-x", 9999, 1, remote=True),  # 원격은 제외
+    ])
+    server = DaemonControlServer(pool, _FakeSync(), db)
+    await server.start()
+    try:
+        rows = await asyncio.to_thread(daemon_control.storage_via_daemon, db)
+        assert [r["source_id"] for r in rows] == ["loop-a"]
+        assert rows[0]["total"] == 1000
+        assert rows[0]["used"] == 600
+        assert rows[0]["state"] == "ready"
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_storage_marks_inactive_source_initialising(tmp_path):
+    """아직 준비되지 않은 소스는 initializing으로 보고한다."""
+    db = str(tmp_path / "m.db")
+    pool = _PoolWithSources([_FakeSource("loop-b", 100, 100, active=False)])
+    server = DaemonControlServer(pool, _FakeSync(), db)
+    await server.start()
+    try:
+        rows = await asyncio.to_thread(daemon_control.storage_via_daemon, db)
+        assert rows[0]["state"] == "initializing"
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_storage_survives_source_error(tmp_path):
+    """용량 조회가 실패하는 소스가 있어도 나머지를 보고한다(미상은 None)."""
+    class _Broken(_FakeSource):
+        def get_available_space(self):
+            raise OSError("image unreadable")
+
+    db = str(tmp_path / "m.db")
+    pool = _PoolWithSources([
+        _Broken("loop-bad", 100, 0),
+        _FakeSource("loop-ok", 200, 50),
+    ])
+    server = DaemonControlServer(pool, _FakeSync(), db)
+    await server.start()
+    try:
+        rows = await asyncio.to_thread(daemon_control.storage_via_daemon, db)
+        by_id = {r["source_id"]: r for r in rows}
+        assert by_id["loop-bad"]["used"] is None
+        assert by_id["loop-ok"]["used"] == 150
+    finally:
+        await server.stop()
+
+
+def test_storage_returns_none_without_daemon(tmp_path):
+    """데몬이 없으면 None — 호출자는 서버 레지스트리 값을 그대로 쓴다."""
+    assert daemon_control.storage_via_daemon(str(tmp_path / "none.db")) is None
