@@ -264,6 +264,56 @@ async def test_wrong_password_fails_restore(key_server, _key_password_env):
     assert not os.path.isfile(key_file_b)
 
 
+async def test_backup_survives_unresponsive_server(key_server, _key_password_env):
+    """서버가 응답하지 않아도 key 백업이 예외를 올리지 않는다(daemon 기동 보호).
+
+    서버가 TCP는 받고 HTTP 응답을 주지 않으면 httpx.ReadTimeout이 난다. 이때
+    예외가 daemon startup까지 전파되면 데몬이 아예 뜨지 못한다 — 오프라인 모드로
+    계속 진행할 수 있어야 한다.
+    """
+    import httpx
+
+    logger = logging.getLogger("key-recovery-test")
+    tmp = tempfile.mkdtemp()
+    key_file = os.path.join(tmp, "a.key")
+    with open(key_file, "wb") as f:
+        f.write(os.urandom(32))
+    auth = _FakeAuthClient(key_server.url)
+
+    async def _timeout(*args, **kwargs):
+        raise httpx.ReadTimeout("server did not respond")
+
+    # 존재 확인(GET) 단계에서 무응답
+    orig_get = httpx.AsyncClient.get
+    httpx.AsyncClient.get = _timeout
+    try:
+        await stardustfs._backup_key_to_server(auth, key_file, logger)
+    finally:
+        httpx.AsyncClient.get = orig_get
+    assert key_server._key_blob is None, "무응답인데 업로드가 일어났음"
+
+    # 업로드(PUT) 단계에서 무응답
+    orig_put = httpx.AsyncClient.put
+    httpx.AsyncClient.put = _timeout
+    try:
+        await stardustfs._backup_key_to_server(auth, key_file, logger)
+    finally:
+        httpx.AsyncClient.put = orig_put
+
+
+async def test_backup_survives_unreachable_server(_key_password_env):
+    """서버에 연결조차 되지 않아도 key 백업이 예외를 올리지 않는다."""
+    logger = logging.getLogger("key-recovery-test")
+    tmp = tempfile.mkdtemp()
+    key_file = os.path.join(tmp, "a.key")
+    with open(key_file, "wb") as f:
+        f.write(os.urandom(32))
+
+    # 아무도 듣지 않는 포트
+    auth = _FakeAuthClient(f"http://127.0.0.1:{_free_port()}")
+    await stardustfs._backup_key_to_server(auth, key_file, logger)
+
+
 def _derive_db_key(master_key: bytes) -> bytes:
     """master_key에서 metadata DB 암호화 키를 파생한다 (stardustfs.py와 동일)."""
     from cryptography.hazmat.primitives import hashes

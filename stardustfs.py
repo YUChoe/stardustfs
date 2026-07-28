@@ -1062,11 +1062,16 @@ async def _backup_key_to_server(
 
     서버에 이미 key가 존재하면 덮어쓰지 않는다.
     환경변수 STARDUST_KEY_PASSWORD로 암호화한다.
+
+    서버 도달 불가·인증 실패는 경고만 남기고 넘어간다(best-effort). key 백업은
+    부팅 필수 단계가 아니고 다음 기동에서 재시도되므로, 여기서 예외를 올리면
+    서버가 응답하지 않는 동안 daemon이 아예 뜨지 못한다.
     """
     from pathlib import Path
 
     import httpx
 
+    from stardustlib.exceptions import AuthenticationError
     from stardustlib.key_backup_engine import KeyBackupEngine
 
     # key_password: 자격증명 저장소 우선, 없으면 환경변수(마이그레이션)
@@ -1081,31 +1086,40 @@ async def _backup_key_to_server(
         return
 
     # 서버에 이미 key가 존재하는지 확인
-    token = await auth_client.get_valid_token()
-    server_url = auth_client._server_url
+    try:
+        token = await auth_client.get_valid_token()
+        server_url = auth_client._server_url
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        check_resp = await client.get(
-            f"{server_url}/sync/key",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        if check_resp.status_code == 200:
-            logger.info("서버에 key 백업이 이미 존재, 덮어쓰지 않음")
-            return
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            check_resp = await client.get(
+                f"{server_url}/sync/key",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+    except (httpx.HTTPError, AuthenticationError) as e:
+        logger.warning("key 백업 확인 실패, 건너뜀(다음 기동에 재시도): %s", e)
+        return
+
+    if check_resp.status_code == 200:
+        logger.info("서버에 key 백업이 이미 존재, 덮어쓰지 않음")
+        return
 
     # 서버에 key가 없으면 업로드
     master_key = Path(key_file_path).read_bytes()
     engine = KeyBackupEngine()
     encrypted_blob = engine.encrypt_for_backup(master_key, key_password)
 
-    token = await auth_client.get_valid_token()
+    try:
+        token = await auth_client.get_valid_token()
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.put(
-            f"{server_url}/sync/key",
-            headers={"Authorization": f"Bearer {token}"},
-            content=encrypted_blob,
-        )
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.put(
+                f"{server_url}/sync/key",
+                headers={"Authorization": f"Bearer {token}"},
+                content=encrypted_blob,
+            )
+    except (httpx.HTTPError, AuthenticationError) as e:
+        logger.warning("key 백업 업로드 실패, 건너뜀(다음 기동에 재시도): %s", e)
+        return
 
     if response.status_code < 400:
         logger.info("key 백업 업로드 완료")
