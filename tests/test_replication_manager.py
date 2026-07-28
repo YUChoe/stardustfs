@@ -163,6 +163,13 @@ class _Cloud:
                 for d, sid in cloud.registry.get(chunk_id, [])
             ]
 
+        async def file_manifest(token, file_ref):
+            # 실서버와 같은 형식: 청크 목록 + 각 청크의 카피 위치
+            return [
+                {**info, "holders": await list_replicas(token, info["chunk_id"])}
+                for info in cloud.chunk_meta.get(file_ref, [])
+            ]
+
         async def holder_fetch(device_id, address, chunk_id, token):
             data = cloud.holder_store.get(address, {}).get(chunk_id)
             if data is not None and address in cloud.corrupt:
@@ -175,6 +182,7 @@ class _Cloud:
         mgr._record_replica = record_replica
         mgr._list_chunks = list_chunks
         mgr._list_replicas = list_replicas
+        mgr._file_manifest = file_manifest
         mgr._holder_fetch = holder_fetch
 
 
@@ -689,6 +697,9 @@ def test_replicate_stops_asking_for_quota_blocked_holder(key):
     mgr._record_replica = record_replica
     mgr._relay_op = relay_quota
     mgr._client.post = boom
+    # get도 막는다 — 매니페스트·카피 위치 조회가 실제 호스트('server')로 나가면
+    # 이름 해석 실패까지 청크마다 수 초씩 기다린다(테스트 의도와 무관한 지연).
+    mgr._client.get = boom
     try:
         result = mgr.replicate("/f")
     finally:
@@ -1266,3 +1277,170 @@ def test_progress_optional(key):
         assert mgr.replicate("/f").status == "replicated"
     finally:
         mgr.close()
+
+
+def test_backup_uses_manifest_instead_of_per_chunk_replica_calls(key):
+    """매니페스트가 있으면 청크별 카피 위치 조회를 하지 않는다.
+
+    청크마다 GET /replication/replicas를 부르면 왕복이 청크 수만큼 늘어난다
+    (운영 로그에서 파일 하나에 수십 회 관측). 매니페스트 1회로 대체한다.
+    """
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/m", b"manifest" * 100)  # chunk_size=64 → 청크 여러 개
+    meta = _FakeMeta({"/m"})
+    mgr, cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
+    try:
+        mgr.replicate("/m")  # 1차: 등록 생성
+
+        per_chunk = {"n": 0}
+        plain_list = mgr._list_replicas
+
+        async def counting_list(token, chunk_id):
+            per_chunk["n"] += 1
+            return await plain_list(token, chunk_id)
+
+        async def manifest(token, file_ref):
+            rows = []
+            for info in cloud.chunk_meta.get(file_ref, []):
+                rows.append({
+                    **info,
+                    "holders": await plain_list(token, info["chunk_id"]),
+                })
+            return rows
+
+        mgr._list_replicas = counting_list
+        mgr._file_manifest = manifest
+
+        result = mgr.replicate("/m")
+    finally:
+        mgr.close()
+
+    assert result.status == "replicated"
+    assert per_chunk["n"] == 0, "매니페스트가 있는데 청크별 조회를 했다"
+    assert result.chunk_count > 1  # 여러 청크였는데도 청크별 조회 0회
+
+
+def test_backup_falls_back_when_manifest_unsupported(key):
+    """구버전 서버(매니페스트 미지원)에서는 청크별 조회로 되돌아간다."""
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/m2", b"legacy" * 100)
+    meta = _FakeMeta({"/m2"})
+    mgr, cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
+    try:
+        mgr.replicate("/m2")
+
+        per_chunk = {"n": 0}
+        plain_list = mgr._list_replicas
+
+        async def counting_list(token, chunk_id):
+            per_chunk["n"] += 1
+            return await plain_list(token, chunk_id)
+
+        async def unsupported(token, file_ref):
+            return None  # 404 → 미지원
+
+        mgr._list_replicas = counting_list
+        mgr._file_manifest = unsupported
+
+        result = mgr.replicate("/m2")
+    finally:
+        mgr.close()
+
+    assert result.status == "replicated"
+    assert per_chunk["n"] >= result.chunk_count, "폴백 경로가 청크별 조회를 하지 않음"
+
+
+def test_unsupported_manifest_is_asked_only_once(key):
+    """404를 한 번 받으면 파일마다 다시 묻지 않는다.
+
+    구버전 서버에 대고 파일 단위로 매니페스트를 계속 시도하면 왕복이 낭비된다.
+    """
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/n1", b"a" * 200)
+    storage_pool.put("/n2", b"b" * 200)
+    meta = _FakeMeta({"/n1", "/n2"})
+    mgr, _cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
+
+    asks = {"n": 0}
+
+    class _Resp:
+        status_code = 404
+
+        def json(self):  # 404에서는 호출되지 않는다
+            raise AssertionError("404 응답의 본문을 읽었다")
+
+    async def get_404(url, headers=None):
+        asks["n"] += 1
+        return _Resp()
+
+    try:
+        mgr._file_manifest = ReplicationManager._file_manifest.__get__(mgr)
+        mgr._client.get = get_404
+        mgr.replicate("/n1")
+        mgr.replicate("/n2")
+    finally:
+        mgr.close()
+
+    assert asks["n"] == 1, f"매니페스트를 {asks['n']}회 물었다(1회여야 함)"
+    assert mgr._manifest_supported is False
+
+
+def test_unreachable_manifest_does_not_double_the_wait(key):
+    """도달 불가 시 매니페스트 실패 후 청크 목록으로 폴백하지 않는다.
+
+    폴백해도 같은 이유로 실패하므로 오프라인 사이클의 지연만 두 배가 된다.
+    """
+    import asyncio as _asyncio
+
+    storage_pool = _FakeStoragePool(key)
+    storage_pool.put("/u1", b"c" * 200)
+    meta = _FakeMeta({"/u1"})
+    mgr, _cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
+
+    listed = {"n": 0}
+    plain_chunks = mgr._list_chunks
+
+    async def counting_chunks(token, file_ref):
+        listed["n"] += 1
+        return await plain_chunks(token, file_ref)
+
+    async def unreachable(url, headers=None):
+        raise httpx.ConnectError("server unreachable")
+
+    try:
+        mgr._file_manifest = ReplicationManager._file_manifest.__get__(mgr)
+        mgr._list_chunks = counting_chunks
+        mgr._client.get = unreachable
+        result = mgr.replicate("/u1")
+    finally:
+        mgr.close()
+
+    # 재개 판정은 포기하지만(전체 재전송) 청크 목록을 또 시도하지는 않는다
+    assert result.status == "replicated"
+    assert listed["n"] == 0, "도달 불가인데 청크 목록 조회를 시도했다"
+    assert mgr._manifest_supported is None  # 일시적 오류는 기억하지 않는다
+
+
+def test_manifest_result_matches_per_chunk_path(key):
+    """매니페스트 경로와 청크별 조회 경로가 같은 결과를 낸다."""
+    content = b"same" * 200
+    results = []
+    for use_manifest in (True, False):
+        storage_pool = _FakeStoragePool(key)
+        storage_pool.put("/s", content)
+        meta = _FakeMeta({"/s"})
+        mgr, _cloud = _manager(storage_pool, meta, ["h1", "h2", "h3"])
+        try:
+            if not use_manifest:
+                async def unsupported(token, file_ref):
+                    return None
+
+                mgr._file_manifest = unsupported
+            results.append(mgr.replicate("/s"))
+        finally:
+            mgr.close()
+
+    assert results[0].status == results[1].status
+    assert results[0].chunk_count == results[1].chunk_count
+    assert results[0].copies_per_chunk == results[1].copies_per_chunk
+    assert results[0].devices_per_chunk == results[1].devices_per_chunk

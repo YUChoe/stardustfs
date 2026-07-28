@@ -119,6 +119,10 @@ class HealReport:
 class ReplicationManager:
     """암호화 청크 복제/복구 오케스트레이터."""
 
+    # 서버 매니페스트 지원 여부(None=아직 모름). 인스턴스에서 덮어쓴다 —
+    # 클래스 기본값을 두어 __init__을 거치지 않는 경로에서도 안전하다.
+    _manifest_supported: bool | None = None
+
     def __init__(
         self,
         auth_client: AuthClient,
@@ -151,6 +155,9 @@ class ReplicationManager:
         self._quota_blocked: dict[str, float] = {}
         # 자기 device_id 미확정 경고를 1회만 남기기 위한 플래그.
         self._warned_no_self_device = False
+        # 서버가 파일 매니페스트를 지원하는지(None=아직 모름). 404를 한 번 받으면
+        # False로 굳혀 파일마다 다시 묻지 않는다.
+        self._manifest_supported: bool | None = None
         # 진행 상태 추적기(선택). daemon이 주입하면 제어 채널·GUI에 노출된다.
         self._progress = progress
 
@@ -520,7 +527,13 @@ class ReplicationManager:
             await self._register_chunk(
                 token, chunk_id, file_ref, idx, len(data), chunk_hash=digest,
             )
-            known, addresses = await self._chunk_locations(token, chunk_id)
+            # 사이클 시작에 받은 매니페스트의 위치를 쓴다(청크별 재조회 없음).
+            # 그 사이 다른 기기가 등록한 카피는 이 사이클에서 안 보이지만, 같은
+            # 청크를 두 번 처리하지 않으므로 다음 사이클·heal이 맞춘다.
+            if prior is not None:
+                known, addresses = await self._locations_of(token, prior)
+            else:
+                known, addresses = await self._chunk_locations(token, chunk_id)
             if stale:
                 # 낡은 카피는 없는 것으로 보고 전부 다시 올린다. 기존 홀더도 후보로
                 # 되돌려(주소 맵 비우기) 같은 위치에 새 내용을 덮어쓴다.
@@ -579,6 +592,26 @@ class ReplicationManager:
         except Exception as e:  # noqa: BLE001 — 레지스트리 조회 실패는 비치명
             logger.debug("카피 위치 조회 실패(%s): %s", chunk_id[:16], e)
             return [], {}
+        return self._locations_from_holders(holders)
+
+    async def _locations_of(
+        self, token: str, info: dict
+    ) -> tuple[list[ChunkLocation], dict[str, str]]:
+        """청크 정보에 실려 온 카피 위치를 쓰고, 없으면 서버에 따로 묻는다.
+
+        매니페스트로 받은 항목에는 `holders`가 들어 있어 왕복이 필요 없다.
+        """
+        if "holders" in info:
+            return self._locations_from_holders(info["holders"])
+        return await self._chunk_locations(token, info["chunk_id"])
+
+    def _locations_from_holders(
+        self, holders: list[dict]
+    ) -> tuple[list[ChunkLocation], dict[str, str]]:
+        """홀더 응답을 카피 위치 목록과 주소 맵으로 변환한다.
+
+        서버가 청크별로 준 것이든 파일 매니페스트로 한 번에 준 것이든 형식이 같다.
+        """
         self_dev = getattr(self._storage_pool, "device_id", None) or ""
         locations: list[ChunkLocation] = []
         addresses: dict[str, str] = {}
@@ -809,13 +842,20 @@ class ReplicationManager:
     async def _registered_by_idx(
         self, token: str, file_ref: str
     ) -> dict[int, dict]:
-        """서버에 등록된 이 파일의 청크를 idx로 색인한다(재개 판정용).
+        """서버에 등록된 이 파일의 청크를 idx로 색인한다(재개 판정 + 카피 위치).
 
-        조회 실패(오프라인·구버전 서버)는 비치명이다. 빈 dict를 돌려주면 모든 청크를
-        다시 올리는 기존 동작이 된다.
+        매니페스트 1회로 청크 메타와 각 청크의 카피 위치(`holders`)를 함께 받는다 —
+        청크마다 위치를 따로 조회하면 왕복이 청크 수만큼 늘어난다(4MiB 청크 파일
+        하나에 수십~수백 회). 매니페스트를 모르는 구버전 서버는 청크 목록만 받고
+        위치는 청크별 조회로 돌아간다.
+
+        조회 실패(오프라인)는 비치명이다. 빈 dict를 돌려주면 모든 청크를 다시 올리는
+        기존 동작이 된다.
         """
         try:
-            infos = await self._list_chunks(token, file_ref)
+            infos = await self._file_manifest(token, file_ref)
+            if infos is None:
+                infos = await self._list_chunks(token, file_ref)
         except Exception as e:  # noqa: BLE001 — 재개 최적화 실패는 비치명
             logger.debug("기존 청크 조회 실패, 전체 재전송: %s", e)
             return {}
@@ -866,7 +906,11 @@ class ReplicationManager:
         manifest: dict | None = None, virtual_path: str | None = None,
     ) -> HealReport:
         token = await self._token()
-        chunk_infos = await self._list_chunks(token, file_ref)
+        # 매니페스트 1회로 청크와 카피 위치를 함께 받는다. 각 청크는 한 번만
+        # 처리하므로 스냅샷으로 충분하다(미지원 서버는 청크별 조회로 폴백).
+        chunk_infos = await self._file_manifest(token, file_ref)
+        if chunk_infos is None:
+            chunk_infos = await self._list_chunks(token, file_ref)
         if not chunk_infos:
             raise RecoveryError(
                 f"재복제할 청크가 없습니다: file_ref={file_ref}", []
@@ -899,7 +943,11 @@ class ReplicationManager:
 
     async def _health(self, file_ref: str) -> HealthSummary:
         token = await self._token()
-        chunk_infos = await self._list_chunks(token, file_ref)
+        # 매니페스트 1회로 청크와 카피 위치를 함께 받는다(읽기 전용 집계라 스냅샷이
+        # 그대로 맞다). 미지원 서버는 청크 목록 + 청크별 위치 조회로 돌아간다.
+        chunk_infos = await self._file_manifest(token, file_ref)
+        if chunk_infos is None:
+            chunk_infos = await self._list_chunks(token, file_ref)
         if not chunk_infos:
             return HealthSummary(
                 degraded=False, chunk_count=0, min_copies=0, min_devices=0
@@ -907,9 +955,7 @@ class ReplicationManager:
         min_copies: int | None = None
         min_devices: int | None = None
         for info in chunk_infos:
-            locations, _addresses = await self._chunk_locations(
-                token, info["chunk_id"]
-            )
+            locations, _addresses = await self._locations_of(token, info)
             online = copies(locations)
             devices = distinct_devices(locations)
             min_copies = online if min_copies is None else min(min_copies, online)
@@ -938,7 +984,7 @@ class ReplicationManager:
         """
         chunk_id = info["chunk_id"]
         self_dev = getattr(self._storage_pool, "device_id", None) or ""
-        known, addresses = await self._chunk_locations(token, chunk_id)
+        known, addresses = await self._locations_of(token, info)
         need = self._target_copies - copies(known)
         if need <= 0:
             relocated = await self._relocate_if_concentrated(
@@ -1270,6 +1316,40 @@ class ReplicationManager:
         if resp.status_code != 200:
             return []
         return list(resp.json())
+
+    async def _file_manifest(
+        self, token: str, file_ref: str
+    ) -> list[dict] | None:
+        """청크 메타 + 각 청크의 카피 위치를 한 번에 받는다.
+
+        Returns:
+            청크 목록(각 항목에 `holders`) 또는 매니페스트를 모르는 구버전 서버일 때
+            None(호출자가 청크별 조회로 돌아간다). 등록된 청크가 없는 file_ref는
+            200 + 빈 목록이므로 404는 곧 미지원을 뜻하고, 한 번 확인하면 기억해
+            파일마다 다시 묻지 않는다.
+
+        Raises:
+            도달 불가·타임아웃은 그대로 올린다. 청크 목록 조회도 같은 이유로 실패할
+            것이므로 폴백을 시도하면 지연만 두 배가 된다.
+        """
+        if self._manifest_supported is False:
+            return None
+        resp = await self._client.get(
+            f"{self._server_url}/replication/manifest/{file_ref}",
+            headers=self._auth_headers(token),
+        )
+        if resp.status_code == 404:
+            self._manifest_supported = False
+            logger.debug("서버가 매니페스트를 지원하지 않습니다 — 청크별 조회 사용")
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            chunks = list(resp.json().get("chunks", []))
+        except (ValueError, AttributeError):
+            return None
+        self._manifest_supported = True
+        return chunks
 
     # ------------------------------------------------------------------
     # 홀더 직접 전송 (단위 테스트에서 패치 가능)

@@ -9,9 +9,17 @@ import pytest
 
 from stardustlib.storage_source import DirectorySource, StorageSource
 
-# Windows에서 확실히 존재하지 않는 경로
+# 확실히 존재하지 않는 경로.
+# Windows에서 매핑되지 않은 드라이브 문자(Z: 등)를 조회하면 네트워크 드라이브
+# 재연결을 시도해 호출 한 번에 20초가 걸린다. 시스템 드라이브 하위의 없는 경로는
+# 즉시 실패한다(DirectorySource.initialize는 os.path.isdir만 보고 디렉토리를
+# 만들지 않으므로 결과는 같다).
 _NONEXISTENT_PATH = (
-    "Z:\\__nonexistent_stardustfs_test_xyz__"
+    os.path.join(
+        os.environ.get("SystemDrive", "C:") + os.sep,
+        "__nonexistent_stardustfs_test_xyz__",
+        "sub",
+    )
     if sys.platform == "win32"
     else "/nonexistent_stardustfs_test_xyz"
 )

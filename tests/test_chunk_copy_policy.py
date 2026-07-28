@@ -359,6 +359,13 @@ class _Registry:
                 for d, sid in reg.replicas.get(chunk_id, [])
             ]
 
+        async def file_manifest(token, file_ref):
+            # 실서버와 같은 형식: 청크 목록 + 각 청크의 카피 위치
+            return [
+                {**info, "holders": await list_replicas(token, info["chunk_id"])}
+                for info in await list_chunks(token, file_ref)
+            ]
+
         async def holder_fetch(device_id, address, chunk_id, token):
             return reg.stored.get(device_id, {}).get(chunk_id)
 
@@ -369,6 +376,7 @@ class _Registry:
         mgr._remove_replica = remove_replica
         mgr._list_chunks = list_chunks
         mgr._list_replicas = list_replicas
+        mgr._file_manifest = file_manifest
         mgr._holder_fetch = holder_fetch
 
     def only_chunk_id(self) -> str:
