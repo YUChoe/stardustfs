@@ -130,6 +130,87 @@ def test_serve_invokes_on_reload(tmp_path):
     worker.join(timeout=5)
 
 
+def test_claim_marks_running_before_startup_finishes(tmp_path):
+    """claim은 startup이 끝나기 전부터 running으로 보이게 한다.
+
+    serve()는 서버 등록·스토리지 마운트가 끝나야 호출된다. 그전까지 제어 파일이
+    없으면 감시자(GUI)가 'daemon 없음'으로 보고 새 인스턴스를 띄워 중복이 쌓인다.
+    """
+    db = str(tmp_path / "meta.db")
+    assert daemon.read_status(db)["running"] is False
+    try:
+        assert daemon.claim(db) is True
+        assert daemon.read_status(db)["running"] is True
+        assert daemon.read_status(db)["pid"] == os.getpid()
+    finally:
+        daemon.release_claim(db)
+
+
+def test_claim_rejects_second_instance(tmp_path):
+    """이미 살아 있는 daemon이 있으면 claim이 거절한다."""
+    db = str(tmp_path / "meta.db")
+    try:
+        assert daemon.claim(db) is True
+        assert daemon.claim(db) is False
+    finally:
+        daemon.release_claim(db)
+
+
+def test_claim_beacon_keeps_heartbeat_fresh(tmp_path):
+    """startup이 길어져도 비콘이 heartbeat를 갱신해 stale로 떨어지지 않는다."""
+    db = str(tmp_path / "meta.db")
+    try:
+        assert daemon.claim(db) is True
+        first = daemon.read_status(db)["heartbeat_age"]
+        # 비콘 주기(약 5초)보다 길게 기다려 갱신을 확인한다
+        time.sleep(daemon._TICK_SECONDS * daemon._HEARTBEAT_EVERY_TICKS + 1.5)
+        status = daemon.read_status(db)
+        assert status["running"] is True, "비콘이 heartbeat를 갱신하지 않음"
+        assert status["heartbeat_age"] < daemon._STALE_SECONDS
+        assert first is not None
+    finally:
+        daemon.release_claim(db)
+
+
+def test_release_claim_allows_restart(tmp_path):
+    """startup 실패로 반납하면 제어 파일이 지워지고 다시 기동할 수 있다."""
+    db = str(tmp_path / "meta.db")
+    assert daemon.claim(db) is True
+    daemon.release_claim(db)
+    assert not os.path.exists(daemon._control_path(db))
+    assert daemon.read_status(db)["running"] is False
+    try:
+        assert daemon.claim(db) is True
+    finally:
+        daemon.release_claim(db)
+
+
+def test_serve_takes_over_claim(tmp_path):
+    """serve()가 비콘을 이어받아 기동 시각을 승계하고 종료 시 정리한다."""
+    db = str(tmp_path / "meta.db")
+    assert daemon.claim(db) is True
+    claimed_at = daemon.read_status(db)["started_at"]
+
+    async def _cleanup():
+        return None
+
+    worker = threading.Thread(
+        target=lambda: asyncio.run(daemon.serve(db, _cleanup)), daemon=True
+    )
+    worker.start()
+    for _ in range(100):
+        if daemon._beacon is None and daemon.read_status(db).get("running"):
+            break
+        time.sleep(0.05)
+
+    assert daemon._beacon is None, "serve가 비콘을 이어받지 않음"
+    assert daemon.read_status(db)["started_at"] == claimed_at, "기동 시각 미승계"
+
+    assert daemon.request_stop(db)["stopped"] is True
+    worker.join(timeout=5)
+    assert not os.path.exists(daemon._control_path(db))
+
+
 def test_serve_lifecycle_start_status_stop(tmp_path):
     db = str(tmp_path / "meta.db")
     cleaned = {"done": False}

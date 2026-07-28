@@ -111,13 +111,6 @@ def _run_daemon(config_path: str) -> None:
         logging.error("설정 로드 실패: %s", e)
         sys.exit(1)
 
-    # 중복 실행 방지 (제어 파일 기준)
-    metadata_db = config.get("metadata_db")  # type: ignore[attr-defined]
-    if metadata_db and daemon.read_status(metadata_db).get("running"):
-        pid = daemon.read_status(metadata_db).get("pid")
-        logging.error("daemon이 이미 실행 중입니다 (pid=%s)", pid)
-        sys.exit(1)
-
     version = config.get("version")  # type: ignore[attr-defined]
 
     if version != 2:
@@ -127,7 +120,22 @@ def _run_daemon(config_path: str) -> None:
         )
         sys.exit(1)
 
-    asyncio.run(startup_v2(config, config_path))
+    # 중복 실행 방지 — 제어 파일을 기동 즉시 잡는다. startup(서버 등록 재시도 등)이
+    # 길어지는 동안에도 heartbeat가 유지되므로, 감시자(GUI)가 'daemon 없음'으로 보고
+    # 새 인스턴스를 띄우는 일이 없다.
+    metadata_db = config.get("metadata_db")  # type: ignore[attr-defined]
+    if metadata_db and not daemon.claim(metadata_db):
+        pid = daemon.read_status(metadata_db).get("pid")
+        logging.error("daemon이 이미 실행 중입니다 (pid=%s)", pid)
+        sys.exit(1)
+
+    try:
+        asyncio.run(startup_v2(config, config_path))
+    except BaseException:
+        # startup 실패 시 제어 파일을 반납한다 — 남겨 두면 다음 기동이 막힌다.
+        if metadata_db:
+            daemon.release_claim(metadata_db)
+        raise
 
 
 def _daemon_status(config_path: str) -> int:

@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import signal
+import threading
 import time
 from collections.abc import Awaitable, Callable
 
@@ -142,6 +143,73 @@ def request_stop(metadata_db: str) -> dict:
     return {"stopped": False, "reason": "timeout"}
 
 
+class _StartupBeacon:
+    """startup이 끝나기 전까지 제어 파일 heartbeat를 유지하는 백그라운드 스레드."""
+
+    def __init__(self, control: str, started: float) -> None:
+        self.control = control
+        self.started = started
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="daemon-startup-beacon", daemon=True
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        interval = _TICK_SECONDS * _HEARTBEAT_EVERY_TICKS
+        while not self._stop.wait(interval):
+            _write_control(self.control, self.started, time.time())
+
+    def release(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+
+
+# 이 프로세스가 잡은 startup 비콘(프로세스당 daemon은 하나뿐이라 모듈 전역).
+_beacon: _StartupBeacon | None = None
+
+
+def claim(metadata_db: str) -> bool:
+    """이 프로세스를 유일한 daemon으로 등록한다. 이미 살아 있으면 False.
+
+    startup(인증·서버 등록·스토리지 마운트)은 서버가 느리거나 응답하지 않으면
+    수십 초가 걸린다. 그동안 제어 파일이 없으면 감시자(GUI)가 'daemon 없음'으로
+    보고 새 인스턴스를 계속 띄워 중복이 쌓인다 — 여러 daemon이 같은 제어 파일과
+    스토리지를 다투게 된다. 기동 즉시 제어 파일을 잡고 heartbeat를 유지해 그
+    창(window)을 없앤다. serve()가 비콘을 이어받는다.
+
+    제어 파일을 쓰지 못하면(권한/잠금) False를 반환한다 — 자기 존재를 알릴 수
+    없는 daemon은 중복 판정 대상이 되지 않으므로 기동하지 않는다.
+    """
+    global _beacon
+    if read_status(metadata_db).get("running"):
+        return False
+
+    started = time.time()
+    control = _control_path(metadata_db)
+    if not _write_control(control, started, started):
+        return False
+
+    _beacon = _StartupBeacon(control, started)
+    _beacon.start()
+    return True
+
+
+def release_claim(metadata_db: str) -> None:
+    """claim 이후 startup이 실패했을 때 제어 파일을 반납한다."""
+    global _beacon
+    if _beacon is None:
+        return
+    _beacon.release()
+    _beacon = None
+    try:
+        os.remove(_control_path(metadata_db))
+    except OSError:
+        pass
+
+
 class _StopState:
     """시그널 핸들러가 설정하는 정지 플래그."""
 
@@ -188,7 +256,14 @@ async def serve(
             # 메인 스레드가 아니거나 미지원 — 센티넬 기반 정지로 대체
             pass
 
+    # startup 비콘이 있으면 이어받는다(기동 시각 승계 후 자체 루프로 전환).
+    global _beacon
     started = time.time()
+    if _beacon is not None:
+        started = _beacon.started
+        _beacon.release()
+        _beacon = None
+
     _write_control(control, started, started)
     logger.info(
         "daemon 시작: pid=%d (정지: Ctrl+C 또는 'daemon stop')", os.getpid()
