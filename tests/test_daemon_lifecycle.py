@@ -156,18 +156,28 @@ def test_claim_rejects_second_instance(tmp_path):
         daemon.release_claim(db)
 
 
-def test_claim_beacon_keeps_heartbeat_fresh(tmp_path):
+def test_claim_beacon_keeps_heartbeat_fresh(tmp_path, monkeypatch):
     """startup이 길어져도 비콘이 heartbeat를 갱신해 stale로 떨어지지 않는다."""
     db = str(tmp_path / "meta.db")
+    # 실제 주기(5초)를 기다리지 않는다 — 검증 대상은 '갱신이 일어나는가'다.
+    monkeypatch.setattr(daemon, "_TICK_SECONDS", 0.05)
+    monkeypatch.setattr(daemon, "_HEARTBEAT_EVERY_TICKS", 1)
     try:
         assert daemon.claim(db) is True
-        first = daemon.read_status(db)["heartbeat_age"]
-        # 비콘 주기(약 5초)보다 길게 기다려 갱신을 확인한다
-        time.sleep(daemon._TICK_SECONDS * daemon._HEARTBEAT_EVERY_TICKS + 1.5)
+        # heartbeat를 과거로 밀어 두고, 비콘이 되돌려 놓는지 본다
+        daemon.write_control(
+            daemon._control_path(db), time.time(),
+            time.time() - daemon._STALE_SECONDS - 1,
+        )
+        assert daemon.read_status(db)["running"] is False
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            if daemon.read_status(db)["running"]:
+                break
+            time.sleep(0.05)
         status = daemon.read_status(db)
         assert status["running"] is True, "비콘이 heartbeat를 갱신하지 않음"
         assert status["heartbeat_age"] < daemon._STALE_SECONDS
-        assert first is not None
     finally:
         daemon.release_claim(db)
 

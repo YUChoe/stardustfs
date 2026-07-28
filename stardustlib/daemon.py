@@ -44,7 +44,7 @@ def _reload_path(metadata_db: str) -> str:
     return metadata_db + ".daemon.reload"
 
 
-def _write_control(path: str, started_at: float, heartbeat_at: float) -> bool:
+def write_control(path: str, started_at: float, heartbeat_at: float) -> bool:
     """제어 파일을 원자적으로 기록한다(tmp + replace). 성공 여부를 반환한다.
 
     Windows에서 os.replace는 대상이 다른 프로세스(백신/인덱서/OneDrive/다른 daemon
@@ -78,13 +78,17 @@ def _write_control(path: str, started_at: float, heartbeat_at: float) -> bool:
     return False
 
 
-def read_status(metadata_db: str) -> dict:
-    """daemon 생존 상태를 반환한다.
+# 하위 호환 별칭(기존 호출부·테스트). 신규 코드는 write_control을 쓴다.
+_write_control = write_control
+
+
+def read_control(path: str) -> dict:
+    """제어 파일이 가리키는 프로세스의 생존 상태를 반환한다.
 
     반환: {running: bool, stale: bool, pid, started_at, heartbeat_age}.
-    제어 파일이 없으면 running=False, stale=False.
+    파일이 없으면 running=False, stale=False. heartbeat 신선도로만 판정한다
+    (시그널/os.kill 미사용 — Windows에서 신뢰할 수 없다).
     """
-    path = _control_path(metadata_db)
     if not os.path.exists(path):
         return {"running": False, "stale": False}
     try:
@@ -102,6 +106,11 @@ def read_status(metadata_db: str) -> dict:
         "started_at": data.get("started_at"),
         "heartbeat_age": age,
     }
+
+
+def read_status(metadata_db: str) -> dict:
+    """daemon 생존 상태를 반환한다(read_control의 daemon 제어 파일 판)."""
+    return read_control(_control_path(metadata_db))
 
 
 def signal_stop(metadata_db: str) -> dict:

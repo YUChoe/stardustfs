@@ -48,9 +48,14 @@ def _human(n: int) -> str:
 class StardustApp:
     """메인 윈도우."""
 
-    def __init__(self, root: tk.Tk, config_path: str | None) -> None:
+    def __init__(
+        self, root: tk.Tk, config_path: str | None, instance_lock=None
+    ) -> None:
         self.root = root
         self.config_path = config_path
+        # 단일 인스턴스 락(선택). 메인루프에서 heartbeat를 갱신하고, 두 번째 실행이
+        # 남긴 포커스 요청을 소비해 창을 앞으로 올린다.
+        self._instance_lock = instance_lock
         self.vpath = "/"
         self.worker = Worker()
         self._rows: dict[str, dict] = {}
@@ -92,10 +97,40 @@ class StardustApp:
         self.root.after(200, self._refresh_daemon)
         self.root.after(250, self._mgmt_poll)  # 하단 스토리지·디바이스 패널 갱신 루프
         self.root.after(3000, self._poll_meta)
+        if self._instance_lock is not None:
+            self.root.after(300, self._instance_poll)
         if self.config_path:
             self.refresh()
         else:
             self._set_status(self.t["select_config_hint"])
+
+    def _instance_poll(self) -> None:
+        """단일 인스턴스 heartbeat 갱신 + 두 번째 실행의 포커스 요청 처리.
+
+        갱신이 멈추면(창이 얼어붙으면) 락이 stale이 되어 새 인스턴스가 뜬다 —
+        응답하지 않는 창을 붙들고 사용자를 막지 않기 위한 의도된 동작이다.
+        """
+        from stardustlib.single_instance import (
+            BEAT_INTERVAL_SECONDS,
+            consume_focus_request,
+        )
+
+        lock = self._instance_lock
+        if lock is None:
+            return
+        lock.beat()
+        if consume_focus_request(lock.path):
+            logger.info("두 번째 실행 요청 — 기존 창을 앞으로 올립니다")
+            self._show_window()
+        self.root.after(int(BEAT_INTERVAL_SECONDS * 1000), self._instance_poll)
+
+    def _show_window(self) -> None:
+        """트레이로 숨었거나 최소화된 창을 다시 보여주고 앞으로 올린다."""
+        try:
+            self.root.deiconify()
+        except Exception:  # noqa: BLE001 — 이미 표시 중이면 무시
+            pass
+        self._bring_to_front()
 
     def _bring_to_front(self) -> None:
         """시작 시 창을 화면 앞으로 올려 포커스한다(일시적 topmost 후 해제)."""
@@ -1283,9 +1318,26 @@ def _hide_console_if_frozen() -> None:
         pass
 
 
-def run_gui(config_path: str | None) -> None:
-    """GUI를 실행한다 (블로킹)."""
+def run_gui(config_path: str | None) -> int:
+    """GUI를 실행한다 (블로킹). 이미 실행 중이면 그 창을 띄우고 1을 반환한다.
+
+    GUI가 여러 개 뜨면 같은 스토리지를 다투고 각자 daemon을 감독하려 들어 서로의
+    판단을 무너뜨린다.
+    """
+    from stardustlib.single_instance import InstanceLock, gui_lock_path, request_focus
+
+    lock = InstanceLock(gui_lock_path())
+    if not lock.acquire():
+        pid = lock.holder().get("pid")
+        logger.info("StardustFS GUI가 이미 실행 중입니다 (pid=%s)", pid)
+        request_focus(lock.path)  # 먼저 뜬 창을 앞으로 끌어올린다
+        return 1
+
     _hide_console_if_frozen()
     root = tk.Tk()
-    StardustApp(root, config_path)
-    root.mainloop()
+    try:
+        StardustApp(root, config_path, instance_lock=lock)
+        root.mainloop()
+    finally:
+        lock.release()
+    return 0
