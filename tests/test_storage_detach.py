@@ -6,7 +6,7 @@ import tempfile
 
 import pytest
 
-from stardustlib.gui import actions
+from stardustlib.gui import act_storage, actions
 from stardustlib.storage_pool import StoragePool
 from stardustlib.metadata_store import MetadataStore
 from stardustlib.storage_source import LoopbackSource
@@ -325,7 +325,7 @@ def test_detach_source_removes_from_config_when_evacuated(tmp_path, monkeypatch)
             pass
 
     # detach(오프라인)는 쓰기용 _rw_session으로 evacuate한다.
-    monkeypatch.setattr(actions, "_rw_session", lambda c: _FakeSession())
+    monkeypatch.setattr(act_storage, "_rw_session", lambda c: _FakeSession())
     report = actions.detach_source(cfg, sid)
     assert report["detached"] is True
     assert all(s.get("id") != sid for s in actions.list_sources(cfg))
@@ -367,7 +367,7 @@ def test_detach_source_kept_when_unmoved(tmp_path, monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr(actions, "_rw_session", lambda c: _FakeSession())
+    monkeypatch.setattr(act_storage, "_rw_session", lambda c: _FakeSession())
     report = actions.detach_source(cfg, sid)
     assert report["detached"] is False
     assert any(s.get("id") == sid for s in actions.list_sources(cfg))  # 유지

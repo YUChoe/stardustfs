@@ -2,8 +2,8 @@
 
 import json
 
-from stardustlib.gui import actions
-from stardustlib.gui.app import _human
+from stardustlib.gui import act_inventory, act_replication, actions
+from stardustlib.gui.format import human_bytes
 
 
 def test_imports():
@@ -13,11 +13,11 @@ def test_imports():
 
 
 def test_human_size():
-    assert _human(0) == "0 B"
-    assert _human(512) == "512 B"
-    assert _human(1024) == "1.0 KiB"
-    assert _human(1536) == "1.5 KiB"
-    assert _human(1048576) == "1.0 MiB"
+    assert human_bytes(0) == "0 B"
+    assert human_bytes(512) == "512 B"
+    assert human_bytes(1024) == "1.0 KiB"
+    assert human_bytes(1536) == "1.5 KiB"
+    assert human_bytes(1048576) == "1.0 MiB"
 
 
 def test_create_config_generates_key(tmp_path):
@@ -278,7 +278,7 @@ def test_remote_chunk_devices_excludes_local():
          _StubChunk(2, "dev-B"), _StubChunk(3, "dev-B")],
         {},
     )
-    assert actions._remote_chunk_devices(session, "/f") == {"dev-B"}
+    assert act_replication._remote_chunk_devices(session, "/f") == {"dev-B"}
 
 
 def test_delegate_backup_calls_each_remote_once():
@@ -286,7 +286,7 @@ def test_delegate_backup_calls_each_remote_once():
     remote_b, remote_c = _StubRemote(), _StubRemote()
     session = _StubSession([], {"dev-B": remote_b, "dev-C": remote_c})
 
-    failed = actions._delegate_backup(session, "/f", {"dev-B", "dev-C"})
+    failed = act_replication._delegate_backup(session, "/f", {"dev-B", "dev-C"})
     assert failed == []
     assert remote_b.announced == ["/f"]
     assert remote_c.announced == ["/f"]
@@ -296,7 +296,7 @@ def test_delegate_backup_reports_unreachable():
     """도달 불가·미마운트 기기는 실패로 보고한다(로컬 전송 강행 없음)."""
     session = _StubSession([], {"dev-B": _StubRemote(reachable=False)})
 
-    failed = actions._delegate_backup(session, "/f", {"dev-B", "dev-missing"})
+    failed = act_replication._delegate_backup(session, "/f", {"dev-B", "dev-missing"})
     assert sorted(failed) == ["dev-B", "dev-missing"]
 
 
@@ -408,10 +408,10 @@ def test_backup_start_and_finish_refresh_storage_panel():
 
 def test_mgmt_poll_shortens_interval_during_backup():
     """백업 중에는 패널 갱신 주기를 줄인다."""
-    from stardustlib.gui.app import (
+    from stardustlib.gui.app import StardustApp
+    from stardustlib.gui.panel_mgmt import (
         _MGMT_POLL_BACKUP_MS,
         _MGMT_POLL_IDLE_MS,
-        StardustApp,
     )
 
     stub = _ProgressStub()
@@ -426,7 +426,7 @@ def test_mgmt_poll_shortens_interval_during_backup():
 
 def test_daemon_live_sources_empty_without_daemon(tmp_path):
     """데몬이 없으면 빈 dict — 서버 레지스트리 값을 그대로 쓴다."""
-    assert actions._daemon_live_sources(str(tmp_path / "none.db")) == {}
+    assert act_inventory._daemon_live_sources(str(tmp_path / "none.db")) == {}
 
 
 # --- 디바이스 인벤토리 (요청 통합) ---
@@ -451,7 +451,7 @@ def test_split_inventory_restores_device_and_source_shapes():
             "connection_address": "2.2.2.2:9090", "sources": [],
         },
     ]
-    devs, srcs = actions._split_inventory(devices)
+    devs, srcs = act_inventory._split_inventory(devices)
 
     # 디바이스 항목에서 sources는 빠진다(/devices 응답과 같은 모양)
     assert [d["id"] for d in devs] == ["dev-a", "dev-b"]
@@ -468,7 +468,7 @@ def test_split_inventory_restores_device_and_source_shapes():
 
 def test_split_inventory_marks_sources_of_offline_device():
     """오프라인 디바이스의 소스는 오프라인으로 표시된다."""
-    devs, srcs = actions._split_inventory([{
+    devs, srcs = act_inventory._split_inventory([{
         "id": "dev-c", "name": "C", "is_online": False,
         "sources": [{"source_id": "s9", "type": "loopback",
                      "capacity_bytes": 1, "used_bytes": 0,
@@ -479,8 +479,8 @@ def test_split_inventory_marks_sources_of_offline_device():
 
 
 def test_split_inventory_handles_empty_and_missing_sources():
-    assert actions._split_inventory([]) == ([], [])
-    devs, srcs = actions._split_inventory([{"id": "d", "name": "D"}])
+    assert act_inventory._split_inventory([]) == ([], [])
+    devs, srcs = act_inventory._split_inventory([{"id": "d", "name": "D"}])
     assert len(devs) == 1 and srcs == []
 
 

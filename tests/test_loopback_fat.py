@@ -114,18 +114,18 @@ def test_read_only_on_missing_image_is_inactive(tmp_path):
 
 def test_storage_initializing_until_formatted(tmp_path):
     # 이미지가 아직 없으면(추가 직후) 초기화 중, 포맷되면 준비됨.
-    from stardustlib.gui import actions
+    from stardustlib.gui import act_storage, actions
 
     cfg = actions.create_config(str(tmp_path / "s"), "", "dev", generate_key=True)
     img = str(tmp_path / "init.img")
     actions.add_source(cfg, "loopback", img, size=SIZE)
-    assert actions._fat_ready(img) is False
+    assert act_storage._fat_ready(img) is False
     assert actions.storage_initializing(cfg) is True
     # 데몬 역할: 소스를 rw로 열어 FAT 포맷.
     s = LoopbackSource("loopback-init", img, SIZE)
     s.initialize()
     s.close()
-    assert actions._fat_ready(img) is True
+    assert act_storage._fat_ready(img) is True
     assert actions.storage_initializing(cfg) is False
 
 

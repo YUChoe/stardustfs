@@ -39,6 +39,42 @@ PALETTE: dict[str, str] = {
 }
 
 
+# 본문 폰트 후보(앞선 것 우선). 한글 자형이 있는 시스템 폰트를 플랫폼별로 고른다 —
+# 특정 폰트를 하드코딩하면 그 폰트가 없는 시스템에서 Tk가 임의 대체 폰트를 쓴다.
+_FONT_CANDIDATES = (
+    "Malgun Gothic",     # Windows 한국어
+    "Segoe UI",          # Windows
+    "Apple SD Gothic Neo",  # macOS 한국어
+    "Helvetica Neue",    # macOS
+    "Noto Sans CJK KR",  # Linux 한국어
+    "DejaVu Sans",       # Linux
+)
+
+_font_family: str | None = None
+
+
+def ui_font_family() -> str:
+    """설치된 폰트 중 첫 후보를 고른다(없으면 Tk 기본 폰트 유지).
+
+    조회는 Tk가 뜬 뒤에만 가능하고 결과는 실행 중 바뀌지 않으므로 한 번만 계산한다.
+    """
+    global _font_family
+    if _font_family is not None:
+        return _font_family
+    try:
+        import tkinter.font as tkfont
+
+        available = {name.lower() for name in tkfont.families()}
+        for family in _FONT_CANDIDATES:
+            if family.lower() in available:
+                _font_family = family
+                return _font_family
+        _font_family = tkfont.nametofont("TkDefaultFont").actual("family")
+    except Exception:  # noqa: BLE001 — 폰트 조회 실패 시 Tk 기본값 이름
+        _font_family = "TkDefaultFont"
+    return _font_family
+
+
 def apply_palette(root: tk.Misc, style, *, dark: bool) -> None:
     """Primer 팔레트를 적용한다. dark일 때 표면색까지 칠하고, 브랜드 강조(녹색 CTA,
     파란 선택)는 항상 적용한다(light는 sv_ttk 밝은 표면 유지)."""

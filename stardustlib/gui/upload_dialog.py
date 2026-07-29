@@ -16,15 +16,7 @@ from collections.abc import Iterable
 from tkinter import filedialog, ttk
 
 from stardustlib.gui import actions, theme
-
-
-def _human(n: int) -> str:
-    size = float(n)
-    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if size < 1024 or unit == "TiB":
-            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
-        size /= 1024
-    return f"{n} B"
+from stardustlib.gui.format import human_bytes
 
 
 class UploadDialog:
@@ -187,7 +179,7 @@ class UploadDialog:
                 self._ok += 1
                 self._log(
                     self.t["upload_log_done"].format(
-                        name=name, size=_human(payload)
+                        name=name, size=human_bytes(payload)
                     )
                 )
                 # 성공한 파일은 목록에서 제거(실패는 남겨 재시도 가능).
