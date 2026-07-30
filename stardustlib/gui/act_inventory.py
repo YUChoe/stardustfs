@@ -67,6 +67,7 @@ def _local_live_sources(config_path: str) -> list[dict]:
             "device_id": None,
             "device": "",  # 이 기기(라벨은 GUI에서)
             "source_id": s.source_id,
+            "path": s.path,  # 사람이 읽을 이름을 만들 때 쓴다(이 기기 소스만 안다)
             "type": "loopback",
             "total": total,
             "used": used,
@@ -178,6 +179,7 @@ def storage_and_devices(config_path: str) -> dict:
             "online": True, "self": True,
             "sources": [
                 {"source_id": s["source_id"], "type": s["type"],
+                 "path": s.get("path", ""),
                  "total": s["total"], "used": s["used"],
                  "state": s["state"], "online": True}
                 for s in srcs
@@ -246,6 +248,16 @@ def storage_and_devices(config_path: str) -> dict:
             if fresh.get("used") is not None:
                 src["used"] = fresh["used"]
             src["state"] = fresh.get("state", src["state"])
+    # 소스 경로는 레지스트리 응답에 없다. 이 기기 소스만 로컬에서 알 수 있으므로
+    # 여기서 채워 화면에 사람이 읽을 이름을 보여 준다(다른 기기 소스는 ID 유지).
+    if self_id:
+        try:
+            local_paths = {s["source_id"]: s.get("path", "")
+                           for s in _local_live_sources(config_path)}
+        except Exception:  # noqa: BLE001 — 표시용 보강
+            local_paths = {}
+        for src in by_dev.get(self_id, []):
+            src["path"] = local_paths.get(src["source_id"], "")
 
     devices = []
     for d in devs:

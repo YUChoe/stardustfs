@@ -1,9 +1,21 @@
 """GUI 표시용 값 포매팅.
 
-app.py와 upload_dialog.py에 같은 함수가 중복돼 있던 것을 한곳으로 모았다.
+여러 화면에 같은 함수가 중복돼 있던 것을 한곳으로 모았다.
 """
 
 from __future__ import annotations
+
+
+def shorten(text: str, limit: int = 20) -> str:
+    """상태바 한 줄에 들어가도록 가운데를 줄인다(확장자는 남긴다).
+
+    긴 파일명을 그대로 쓰면 좁은 창에서 옆 항목을 밀어내 잘리게 만든다.
+    """
+    if len(text) <= limit:
+        return text
+    head = (limit - 1) // 2
+    tail = limit - 1 - head
+    return f"{text[:head]}…{text[-tail:]}"
 
 
 def human_bytes(n: int) -> str:

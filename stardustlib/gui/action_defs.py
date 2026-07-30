@@ -38,12 +38,14 @@ TOOLBAR_GROUPS: tuple[tuple[Action, ...], ...] = (
     ),
     (
         Action("mkdir", "_mkdir", Need.NOTHING),
-        Action("delete", "_delete", Need.ANY),
+        Action("rename", "_rename", Need.ONE),
         Action("move", "_move", Need.ONE),
         Action("copy", "_copy", Need.ONE_FILE),
+        Action("delete", "_delete", Need.ANY),
     ),
     (
-        Action("backup_now", "_backup_selected", Need.FILES, accent=True),
+        # 주 동작(Accent)은 업로드 하나만 둔다 — 강조가 둘이면 위계가 흐려진다.
+        Action("backup_now", "_backup_selected", Need.FILES),
         Action("heal_now", "_heal_selected", Need.FILES),
         Action("restore_now", "_restore_selected", Need.FILES),
     ),
@@ -58,8 +60,25 @@ CONTEXT_MENU: tuple[Action | None, ...] = (
     Action("restore_now", "_restore_selected", Need.FILES),
     None,
     Action("download", "_download", Need.ONE_FILE),
+    Action("rename", "_rename", Need.ONE),
     Action("delete", "_delete", Need.ANY),
+    None,
+    Action("upload_cancel", "_cancel_uploads", Need.NOTHING),
 )
+
+
+def tooltip(action: Action, t: dict, *, enabled: bool) -> str:
+    """액션 툴팁 문구 — 동작 설명 + (비활성이면) 필요한 선택 상태.
+
+    i18n 키는 정의에서 파생한다(`tip_{key}`, `need_{need}`). 액션을 추가하면 문구도
+    같은 규칙으로 따라온다.
+    """
+    text = t.get(f"tip_{action.key}", t.get(action.key, action.key))
+    if not enabled and action.need is not Need.NOTHING:
+        hint = t.get(f"need_{action.need.value}")
+        if hint:
+            text = f"{text}\n{hint}"
+    return text
 
 
 def is_enabled(action: Action, rows: list[dict], *, has_config: bool) -> bool:

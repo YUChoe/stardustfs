@@ -22,7 +22,7 @@ import logging
 import os
 import threading
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import ttk
 
 from stardustlib.gui import i18n, prefs, theme, tray
 from stardustlib.gui.daemon_control import DaemonControlMixin
@@ -40,8 +40,15 @@ logger = logging.getLogger(__name__)
 _WIN_SIZE = (900, 620)
 _WIN_MIN = (760, 480)
 
-# 세로 분할에서 파일 목록이 차지하는 초기 비율(나머지는 스토리지·디바이스 패널).
-_FILE_PANE_RATIO = 0.68
+# 세로 분할에서 파일 목록 pane이 차지하는 초기 비율(나머지는 스토리지·디바이스
+# 패널). 이 pane에는 액션 툴바가 함께 들어 있고 관리 패널에도 헤더·액션 바가
+# 있으므로, 목록만 있던 때보다 아래쪽에 자리를 더 준다 — 그러지 않으면 관리 트리에
+# 디바이스 행만 보이고 그 아래 소스가 스크롤 밖으로 밀린다. 사용자가 분할선을
+# 옮기면 그 비율이 prefs에 저장되어 다음부터 그 위치로 열린다.
+_FILE_PANE_RATIO = 0.58
+
+# 분할선을 위로 끌 때 파일 목록에 남겨 두는 최소 높이(px, 헤딩 + 두어 행).
+_MIN_LIST_HEIGHT = 60
 
 
 class StardustApp(
@@ -66,6 +73,12 @@ class StardustApp(
         self.vpath = "/"
         self.worker = Worker()
         self._rows: dict[str, dict] = {}
+        self._last_rows: list[dict] = []  # 마지막으로 받은 서버 목록(정렬 재적용용)
+        # 업로드 큐. 별도 창 없이 파일 목록에 진행 행으로 그린다.
+        self._uploads: list = []
+        self._uploading = False
+        self._upload_ok = self._upload_fail = self._upload_skip = 0
+        self._upload_written = False
         # daemon은 항상 온라인으로 감독(supervise)한다. 다음 재시작 허용 시각(쿨다운).
         self._daemon_restart_until = 0.0
         # 직전 폴링에서 본 daemon 생존 여부. 정지→실행 전이를 감지해 조회 세션을
@@ -79,6 +92,9 @@ class StardustApp(
         self.lang = prefs.lang(i18n.detect_lang())
         self.t = i18n.get_text(self.lang)
         self.theme = prefs.theme("dark")
+        self._sort = prefs.sort()
+        self._mgmt_collapsed = prefs.flag("mgmt_collapsed")
+        self._sash_ratio = prefs.ratio("sash_ratio", _FILE_PANE_RATIO)
         self._icon_photo = None  # 브랜드 마크 아이콘 참조(GC 방지)
 
         root.title(self.t["app_title"])
@@ -239,8 +255,16 @@ class StardustApp(
             )
 
     def _hide_window(self) -> None:
+        """창 닫기(X) → 트레이로 숨김. 처음 한 번은 그 사실을 알린다.
+
+        X가 종료가 아니라는 것은 처음 보면 알 수 없다. 상태바 문구는 놓치기 쉬우므로
+        최초 1회만 배너로 알리고 그 뒤로는 조용히 숨는다.
+        """
         self.root.withdraw()
         self._set_status(self.t["tray_minimised"])
+        if not prefs.flag("tray_hint_shown"):
+            prefs.save(tray_hint_shown=True)
+            self._show_banner(self.t["tray_hint"], level="info")
 
     def _quit(self) -> None:
         # 종료 시 daemon도 정지(센티넬만 즉시 생성, 대기 없음 — daemon이 ~1초 내 종료).
@@ -281,32 +305,54 @@ class StardustApp(
     # --- 위젯 구성 ---
 
     def _build_body(self) -> None:
-        """경로 바 → 하단 고정 바 → 파일 목록/관리 패널 분할.
+        """경로 바 → 상태바 → 파일 목록·액션 툴바 / 관리 패널 분할.
 
-        하단 고정 바(상태바·액션 툴바)를 파일 목록보다 먼저 pack해 공간을 선점한다.
-        pack은 선언 순서로 공간을 떼어 가므로, expand=True인 목록을 먼저 배치하면
-        창이 작거나 DPI 배율이 높을 때 마지막에 배치된 툴바가 화면 밖으로 밀린다
-        (업로드 버튼이 사라지는 증상). 목록이 줄어드는 쪽이 옳다.
+        위에서 아래로 경로 바, 파일 목록, 액션 툴바, 스토리지·디바이스 패널,
+        상태바가 놓인다. 액션 툴바는 파일 목록에 대한 동작이므로 목록과 같은 pane에
+        넣어 분할선을 옮겨도 목록 바로 아래에 붙어 있게 한다.
+
+        어느 컨테이너에서든 고정 바를 expand=True인 위젯보다 먼저 pack한다. pack은
+        선언 순서로 공간을 떼어 가므로, 목록을 먼저 배치하면 창이 작거나 DPI 배율이
+        높을 때 나중에 배치된 툴바가 화면 밖으로 밀린다(업로드 버튼이 사라지는 증상).
+        목록이 줄어드는 쪽이 옳다.
         """
         self._build_path_bar(self.body)
         self._update_title()
         self._build_statusbar(self.body)
-        self._build_action_toolbar(self.body)
 
         # 파일 목록 + 하단 스토리지·디바이스 패널을 세로 분할(구분선 드래그로 조절).
         paned = ttk.PanedWindow(self.body, orient="vertical")
         paned.pack(fill="both", expand=True)
+        self._paned = paned
 
         file_frame = ttk.Frame(paned)
+        self._build_action_toolbar(file_frame)  # 목록보다 먼저 — 하단 공간 선점
         self._build_file_tree(file_frame)
         paned.add(file_frame, weight=3)
 
         mgmt_frame = ttk.Frame(paned)
+        self._mgmt_frame = mgmt_frame
         self._build_mgmt_panel(mgmt_frame)
         paned.add(mgmt_frame, weight=1)
         self._place_sash(paned)
+        # ttk.PanedWindow는 pane별 minsize가 없어 드래그로 위쪽 pane을 0까지 줄일 수
+        # 있다. 드래그 중·놓을 때 하한으로 되민다.
+        paned.bind("<B1-Motion>", self._clamp_sash, add="+")
+        paned.bind("<ButtonRelease-1>", self._clamp_sash, add="+")
 
         self._refresh_login_state()
+
+    def _clamp_sash(self, _e=None) -> None:
+        """분할선이 액션 툴바를 덮지 않도록 최소 위치로 되민다."""
+        paned = getattr(self, "_paned", None)
+        if paned is None:
+            return
+        try:
+            floor = self._toolbar.winfo_reqheight() + _MIN_LIST_HEIGHT
+            if paned.sashpos(0) < floor:
+                paned.sashpos(0, floor)
+        except tk.TclError:  # 창이 이미 닫혔거나 아직 배치 전
+            pass
 
     def _place_sash(self, paned: ttk.PanedWindow) -> None:
         """분할선 초기 위치를 파일 목록 쪽으로 둔다.
@@ -321,14 +367,35 @@ class StardustApp(
                 if height < 100:  # 아직 배치 전 — 다음 프레임에 다시 시도
                     paned.after(50, _apply)
                     return
-                paned.sashpos(0, int(height * _FILE_PANE_RATIO))
+                paned.sashpos(0, int(height * self._sash_ratio))
             except tk.TclError:  # 창이 이미 닫혔으면 무시
                 pass
 
         paned.after_idle(_apply)
 
+    def _save_sash_ratio(self) -> None:
+        """현재 분할선 위치를 비율로 기억한다(다음 실행·언어 전환에서 복원)."""
+        paned = getattr(self, "_paned", None)
+        if paned is None:
+            return
+        try:
+            height = paned.winfo_height()
+            if height < 100:
+                return
+            ratio = paned.sashpos(0) / height
+        except (tk.TclError, ZeroDivisionError):
+            return
+        if 0.2 <= ratio <= 0.9 and abs(ratio - self._sash_ratio) > 0.01:
+            self._sash_ratio = ratio
+            prefs.save(sash_ratio=round(ratio, 3))
+
     def _rebuild_body(self) -> None:
-        """본문 위젯을 전부 다시 만든다(언어 전환 등 라벨 일괄 변경 시)."""
+        """본문 위젯을 전부 다시 만든다(언어 전환 등 라벨 일괄 변경 시).
+
+        경로·정렬·분할선 비율·관리 패널 접힘은 인스턴스 상태이므로 재구성 후에도
+        그대로 복원된다 — 언어를 바꿨다고 보고 있던 폴더가 루트로 돌아가지 않는다.
+        """
+        self._save_sash_ratio()
         self.body.destroy()
         self.body = ttk.Frame(self.root)
         self.body.pack(fill="both", expand=True)
@@ -346,7 +413,7 @@ class StardustApp(
 
     def _submit(self, fn, on_ok=None, busy: str | None = None) -> None:
         if not self.config_path:
-            messagebox.showwarning(self.t["app_title"], self.t["need_config"])
+            self._show_banner(self.t["need_config"], level="warning")
             return
         self._set_status(busy or self.t["busy_browse"])
 
@@ -356,8 +423,10 @@ class StardustApp(
                 if on_ok:
                     on_ok(payload)
             else:
+                # 실패는 모달 대신 배너로 알린다 — 실패가 이어질 때 확인 버튼만
+                # 반복해 누르게 만들지 않는다.
                 self._set_status(self.t["err_status"].format(msg=payload))
-                messagebox.showerror(self.t["err"], str(payload))
+                self._show_banner(str(payload))
 
         self.worker.submit(fn, done)
 

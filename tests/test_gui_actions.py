@@ -185,6 +185,7 @@ class _DaemonStub:
 
     def __init__(self) -> None:
         self.t = {
+            "daemon_running_short": "daemon",
             "daemon_running": "daemon {pid}",
             "daemon_stopped": "stopped",
             "daemon_stale": "stale",
@@ -194,7 +195,7 @@ class _DaemonStub:
         self.reopened = 0
         self.ensured = 0
 
-    def _daemon_dot(self, text, color) -> None:
+    def _daemon_dot(self, text, color, detail="") -> None:
         pass
 
     def _reopen_after_daemon_start(self) -> None:
@@ -315,10 +316,15 @@ class _ProgressStub:
         self.status_text = "이전 상태"
         self.refreshed = 0
         self.scheduled: list[int] = []
+        self.progress_shown: tuple[int, int] | None = None
+        self._uploads: list = []  # 업로드 중이면 그 표시가 우선한다
         self.root = self
 
     def _set_status(self, text: str) -> None:
         self.status_text = text
+
+    def _set_progress(self, done: int, total: int) -> None:
+        self.progress_shown = (done, total)
 
     def _refresh_mgmt(self) -> None:
         self.refreshed += 1

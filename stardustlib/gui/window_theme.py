@@ -54,8 +54,8 @@ class WindowThemeMixin:
             style = ttk.Style()
             style.configure(".", font=fnt)
             # sv-ttk가 위젯 스타일별로 자체 폰트를 지정하므로 각 스타일에 직접 적용.
-            for st in ("TLabel", "TButton", "Accent.TButton", "TEntry",
-                       "TMenubutton", "TCheckbutton", "TRadiobutton",
+            for st in ("TLabel", "TButton", "Accent.TButton", "Cta.TButton",
+                       "TEntry", "TMenubutton", "TCheckbutton", "TRadiobutton",
                        "Toolbutton", "TLabelframe.Label", "TNotebook.Tab",
                        "Treeview", "Treeview.Heading"):
                 try:
@@ -97,3 +97,7 @@ class WindowThemeMixin:
         self._build_menu()
         # 컨텍스트 메뉴도 tk.Menu라 색을 다시 입혀야 한다(본문 재구성 없이).
         self._build_context_menu()
+        # 목록 행 태그 색은 다크/라이트가 다르다(다크용 밝은 회색을 라이트 배경에
+        # 그대로 쓰면 글자가 묻는다).
+        self._apply_row_tags()
+        self._apply_mgmt_tags()

@@ -36,8 +36,14 @@ class DaemonControlMixin:
             self.worker.submit(lambda: actions.daemon_status(cfg), self._on_daemon)
         self.root.after(_DAEMON_POLL_MS, self._refresh_daemon)
 
-    def _daemon_dot(self, text: str, color: str) -> None:
+    def _daemon_dot(self, text: str, color: str, detail: str = "") -> None:
+        """상태바 왼쪽의 daemon 점. 진단용 상세(pid 등)는 툴팁으로 돌린다.
+
+        상태바 한 줄에 daemon·스토리지·디바이스·진행·백업 요약이 모두 들어가므로,
+        평소 읽을 필요가 없는 값까지 문구에 넣으면 오른쪽 항목이 잘린다.
+        """
         self.daemon_label.config(text="● " + text, foreground=color)
+        self._daemon_detail = detail or text
 
     def _on_daemon(self, ok, payload) -> None:
         grey, green, orange = "#9aa0a6", "#2da44e", "#d29922"
@@ -46,7 +52,8 @@ class DaemonControlMixin:
             return
         if payload.get("running"):
             self._daemon_dot(
-                self.t["daemon_running"].format(pid=payload.get("pid")), green
+                self.t["daemon_running_short"], green,
+                self.t["daemon_running"].format(pid=payload.get("pid")),
             )
             if self._daemon_was_running is False:
                 self._reopen_after_daemon_start()

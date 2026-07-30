@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from stardustlib.gui.act_auth import is_logged_in, login, logout
+from stardustlib.gui.act_auth import account_email, is_logged_in, login, logout
 from stardustlib.gui.act_core import (
     RemotePathExists,
     browse,
@@ -60,6 +60,7 @@ from stardustlib.gui.act_storage import (
 
 __all__ = [
     "RemotePathExists",
+    "account_email",
     "add_source",
     "announce_paths",
     "backup_paths",

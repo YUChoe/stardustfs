@@ -58,3 +58,21 @@ def is_logged_in(config_path: str) -> bool:
     config = ConfigLoader(config_path).load()
     from stardustlib.credential_store import CredentialStore
     return CredentialStore(config["metadata_db"]).exists()
+
+
+def account_email(config_path: str | None) -> str:
+    """로그인한 계정의 이메일(없거나 읽을 수 없으면 빈 문자열).
+
+    자격증명 저장소는 JSON 파일이라 메인 스레드에서 읽어도 sqlite 스레드 제약을
+    타지 않는다. 화면 표시용이므로 실패는 빈 문자열로 흡수한다.
+    """
+    if not config_path:
+        return ""
+    from stardustlib.credential_store import CredentialStore
+
+    try:
+        config = ConfigLoader(config_path).load()
+        data = CredentialStore(config["metadata_db"]).load() or {}
+        return str(data.get("email") or "")
+    except Exception:  # noqa: BLE001 — 표시용 조회
+        return ""

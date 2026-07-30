@@ -111,16 +111,87 @@ def apply_palette(root: tk.Misc, style, *, dark: bool) -> None:
     style.map("Accent.TButton",
               background=[("active", p["success_emphasis_hover"]),
                           ("pressed", p["success_emphasis_hover"])])
+    _define_cta(style)
 
 
-def style_listbox(listbox: tk.Listbox) -> None:
-    """tk.Listbox를 Primer 표면색으로 칠한다(ttk가 아니라 직접 제어)."""
+def _define_cta(style) -> None:
+    """주 동작(CTA) 버튼을 디자인 시스템 녹색으로 만든다.
+
+    sv_ttk는 버튼 배경을 엘리먼트 이미지로 그리므로 Accent.TButton에
+    background를 지정해도 화면에는 sv_ttk 기본 파랑이 그대로 나온다. clam의 버튼
+    레이아웃을 빌려 색을 직접 통제하는 별도 스타일을 만든다. 실패하면
+    Accent.TButton으로 폴백하도록 그대로 둔다(호출부가 스타일 이름을 고른다).
+    """
     p = PALETTE
+    try:
+        style.layout("Cta.TButton", style.layout("TButton"))
+        style.element_create("Cta.button", "from", "clam", "Button.button")
+        style.layout("Cta.TButton", [
+            ("Cta.button", {"sticky": "nswe", "children": [
+                ("Button.padding", {"sticky": "nswe", "children": [
+                    ("Button.label", {"sticky": "nswe"}),
+                ]}),
+            ]}),
+        ])
+    except Exception:  # noqa: BLE001 — 이미 만들었거나 clam이 없음
+        pass
+    style.configure(
+        "Cta.TButton", background=p["success_emphasis"], foreground="#ffffff",
+        bordercolor=p["success_emphasis"], focuscolor=p["success_emphasis"],
+        lightcolor=p["success_emphasis"], darkcolor=p["success_emphasis"],
+        relief="flat", padding=(10, 4),
+    )
+    style.map(
+        "Cta.TButton",
+        background=[("disabled", p["fg_disabled"]),
+                    ("active", p["success_emphasis_hover"]),
+                    ("pressed", p["success_emphasis_hover"])],
+        foreground=[("disabled", p["canvas"])],
+        lightcolor=[("active", p["success_emphasis_hover"])],
+        darkcolor=[("active", p["success_emphasis_hover"])],
+    )
+
+
+# 라이트 테마용 전경색(Primer light). PALETTE는 다크 표면을 전제로 한 값이라
+# 밝은 배경에 그대로 쓰면 글자가 배경에 묻는다.
+_LIGHT_TEXT = {
+    "success": "#1a7f37",
+    "accent": "#0969da",
+    "danger": "#cf222e",
+    "fg_default": "",      # 빈 문자열 = 위젯 기본 전경색 사용
+    "fg_subtle": "#656d76",
+    "fg_faint": "#8c959f",
+}
+
+
+def text_colour(name: str, *, dark: bool) -> str:
+    """전경색 하나를 테마에 맞게 고른다(빈 문자열이면 위젯 기본색).
+
+    목록 행 태그·배너처럼 배경 위에 얹는 글자에 쓴다.
+    """
+    if dark:
+        return PALETTE.get(name, "")
+    return _LIGHT_TEXT.get(name, PALETTE.get(name, ""))
+
+
+def style_listbox(listbox: tk.Listbox, *, dark: bool = True) -> None:
+    """tk.Listbox를 Primer 표면색으로 칠한다(ttk가 아니라 직접 제어).
+
+    라이트 테마에서는 밝은 표면을 쓴다 — 다크 표면을 그대로 두면 창 하나만 검게
+    남아 튄다.
+    """
+    p = PALETTE
+    if dark:
+        listbox.configure(background=p["surface"], foreground=p["fg_default"],
+                          highlightbackground=p["border_muted"],
+                          highlightcolor=p["border_default"])
+    else:
+        listbox.configure(background="#ffffff", foreground="#1f2328",
+                          highlightbackground="#d0d7de",
+                          highlightcolor="#8c959f")
     listbox.configure(
-        background=p["surface"], foreground=p["fg_default"],
-        selectbackground=p["accent"], selectforeground="#ffffff",
-        highlightthickness=1, highlightbackground=p["border_muted"],
-        highlightcolor=p["border_default"], borderwidth=0,
+        selectbackground=PALETTE["accent"], selectforeground="#ffffff",
+        highlightthickness=1, borderwidth=0,
     )
 
 

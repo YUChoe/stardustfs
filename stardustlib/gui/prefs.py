@@ -57,3 +57,27 @@ def lang(default: str) -> str:
     """저장된 언어(미지원 값이면 default — 보통 로케일 추정값)."""
     value = load().get("lang")
     return value if value in TRANSLATIONS else default
+
+
+def flag(key: str, default: bool = False) -> bool:
+    """저장된 참/거짓 설정(관리 패널 접힘, 트레이 안내 완료 등)."""
+    value = load().get(key)
+    return bool(value) if isinstance(value, bool) else default
+
+
+def sort(default: tuple[str, bool] = ("name", False)) -> tuple[str, bool]:
+    """저장된 목록 정렬 상태 (컬럼, 내림차순). 형식이 다르면 default."""
+    value = load().get("sort")
+    if (isinstance(value, list) and len(value) == 2
+            and value[0] in ("name", "size", "backup")):
+        return (str(value[0]), bool(value[1]))
+    return default
+
+
+def ratio(key: str, default: float, *, low: float = 0.2,
+          high: float = 0.9) -> float:
+    """저장된 비율(분할선 위치 등). 범위를 벗어나면 default."""
+    value = load().get(key)
+    if isinstance(value, (int, float)) and low <= float(value) <= high:
+        return float(value)
+    return default
