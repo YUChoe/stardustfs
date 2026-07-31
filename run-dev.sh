@@ -1,6 +1,6 @@
 #!/bin/bash
 # StardustFS 개발용 실행 스크립트
-# 10MB 루프백 파일 3개를 사용하는 WebDAV 서버를 시작한다.
+# dev-config.json의 루프백 스토리지로 상주 daemon을 시작한다.
 
 set -e
 
@@ -39,7 +39,7 @@ fi
 source "$SCRIPT_DIR/.venv/Scripts/activate"
 
 echo "StardustFS daemon 시작"
-echo "  스토리지: 10MB x 3 루프백"
+echo "  스토리지: dev-config.json의 루프백 소스"
 echo "  CLI 예: python stardustfs.py --config dev-config.json ls"
 echo "  상태/정지: daemon status / daemon stop"
 echo "  종료: Ctrl+C"

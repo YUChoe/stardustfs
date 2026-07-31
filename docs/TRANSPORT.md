@@ -152,5 +152,6 @@ UDP와 릴레이 경로에는 서버 게이트키퍼가 없으므로, 파일 op 
 
 - `.kiro/specs/holepunch-transport/` — 홀펀칭 직접 전송(rudp·p2p_udp·랑데부·캐스케이드).
 - `.kiro/specs/daemon-transfer-delegation/` — 데몬 전송 위임 제어 채널.
-- `.kiro/specs/storage_pool-spillover-eviction/` — 스필오버·콜드 축출.
+- `.kiro/specs/jbod-spillover-eviction/` — 스필오버·콜드 축출(디렉터리 이름은 폐기된
+  JBOD 용어를 그대로 쓴다. 코드는 `StoragePool`로 리네임됐다).
 - `.kiro/specs/cross-user-replica-relay/` — 교차 사용자 복제본 릴레이 인가.

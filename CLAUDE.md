@@ -1,28 +1,29 @@
 # StardustFS 개발 준수사항
 
-StardustFS는 WebDAV/FUSE 기반 분산 파일시스템입니다. 여러 스토리지 노드를 하나의 마운트 포인트로 통합하고, P2P 동기화와 암호화 메타데이터를 제공합니다.
+StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서버로 묶는 암호화 분산 파일시스템입니다. 접근 계층은 FTP 유사 CLI와 데스크톱 GUI이며(WebDAV 실시간 마운트는 MVP10에서 폐기), 파일은 클라이언트에서 4 MiB 암호문 청크로 나뉘어 저장되고 메타데이터는 중앙 서버를 통해 디바이스 간 동기화됩니다.
 
 ## 개발 환경
-- Python, 가상환경 `.venv` (Windows Git Bash: `source .venv/Scripts/activate`)
-- 메인 진입점: `stardustfs.py`
-- 핵심 라이브러리: `stardustlib/`
-- 중앙 서버: 별도 저장소 `../stardustfs-server/`
-- WebDAV 서버: http://127.0.0.1:8080/ (개발 계정: admin / stardust)
+- Python 3.10 이상, 가상환경 `.venv` (Windows Git Bash: `source .venv/Scripts/activate`)
+- 메인 진입점: `stardustfs.py` (`daemon` / `gui` / 단발 CLI 서브커맨드)
+- 핵심 라이브러리: `stardustlib/` (접근 계층은 `stardustlib/cli/`, `stardustlib/gui/`)
+- 중앙 서버: 별도 저장소 `../stardustfs-server/` (개발 서버 URL은 `dev-config.json`, 계정은 `.env`)
 - 비동기 프로그래밍: `async/await` (aiohttp, httpx)
 - 의존성: `requirements.txt` (버전 고정)
 
 ## 실행
 ```bash
-# 개발용 실행 (10MB 루프백 스토리지 3개)
+# 개발용 daemon 실행 (dev-config.json의 루프백 스토리지)
 ./run-dev.sh
 
-# 직접 실행
-source .venv/Scripts/activate
-python stardustfs.py --config dev-config.json
+# 개발용 GUI 실행
+./run.sh
 
-# 테스트
-source .venv/Scripts/activate
-pytest
+# 단발 CLI
+python stardustfs.py ls --config dev-config.json
+python stardustfs.py daemon status --config dev-config.json
+
+# 테스트 (약 2.5분)
+PYTHONPATH=. .venv/Scripts/python -m pytest -q
 ```
 
 ## 기본 원칙
@@ -45,7 +46,7 @@ pytest
 - `%`-스타일 지연 포매팅 사용(기존 코드 관례): `logger.info("설정 로드 실패: %s", e)`
 - 레벨 가이드: DEBUG(실행 흐름) / INFO(주요 이벤트) / WARNING(잠재 문제) / ERROR(실패, `exc_info=True`) / CRITICAL(종료급 오류)
 - 민감정보(암호화 키, 토큰, 비밀번호) 로깅 금지
-- 외부 라이브러리 로그는 WARNING으로 억제(httpx, httpcore, wsgidav)
+- 외부 라이브러리 로그는 WARNING으로 억제(`_setup_logging`: httpx, httpcore)
 
 ## 데이터베이스 (메타데이터)
 - 메타데이터 저장소: `stardustlib/metadata_store.py`

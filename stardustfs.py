@@ -307,7 +307,7 @@ async def startup_v2(config: dict, config_path: str) -> None:
         sys.exit(1)
 
     if offline_mode:
-        # 오프라인 모드: (4)-(6) 건너뛰기, WebDAV 시작 + 백그라운드 복구
+        # 오프라인 모드: (4)-(6) 건너뛰기, 상주 루프 + 백그라운드 온라인 복구
         from stardustlib.conflict_resolver import ConflictResolver
         from stardustlib.device_manager import DeviceManager
         from stardustlib.online_recovery import OnlineRecoveryManager
@@ -906,10 +906,10 @@ def _build_local_sources(config: dict, *, read_only: bool = False) -> list:
 
 
 def _build_core(config: dict, *, read_only: bool = False) -> tuple:
-    """로컬 스토리지 핵심 컴포넌트를 조립해 반환한다 (WebDAV 비의존).
+    """로컬 스토리지 핵심 컴포넌트를 조립해 반환한다.
 
-    기존 initializer.py의 Phase 3-6 로직을 재사용한다. WebDAV 앱 생성은 포함하지
-    않으므로 daemon(WebDAV)과 CLI가 공통으로 호출할 수 있다.
+    키 로드 → 소스 검증 → 메타데이터 스토어 → 스토리지 풀 순서로 조립하며 접근 계층에
+    의존하지 않는다. 그래서 daemon과 CLI/GUI 세션이 공통으로 호출한다.
 
     Returns:
         (storage_pool, metadata_store, encryption_engine, db_key) 튜플.

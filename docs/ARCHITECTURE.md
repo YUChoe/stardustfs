@@ -6,7 +6,8 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
 파일시스템이다. 사용자는 같은 계정의 여러 PC/Linux에 분산된 스토리지를 단일
 네임스페이스로 업로드/다운로드한다.
 
-접근 계층은 FTP 유사 CLI다(MVP10 피벗). 과거의 WebDAV 실시간 마운트는 제거되었다.
+접근 계층은 FTP 유사 CLI와 데스크톱 GUI(Tkinter 파일탐색기)다(MVP10 피벗). 과거의
+WebDAV 실시간 마운트는 제거되었다.
 파일은 클라이언트에서 AES-256-GCM으로 암호화되어 각 디바이스의 스토리지에
 저장되고, 메타데이터는 중앙 서버를 통해 디바이스 간 동기화된다. 디바이스 간 파일
 전송은 직접 TCP → 홀펀칭 UDP → 서버 릴레이의 캐스케이드로 이뤄진다(상세
@@ -16,30 +17,43 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
 서버가 다루는 것은 암호화된 불투명 blob과 정수 version, 그리고 라우팅/인증에 필요한
 최소 정보뿐이다.
 
-## 프로세스 구조 (daemon + CLI)
+## 프로세스 구조 (daemon + CLI/GUI)
 
-같은 설정(config + metadata_db)을 공유하는 두 종류의 프로세스가 있다.
+같은 설정(config + metadata_db)을 공유하는 세 종류의 프로세스가 있다.
 
 ```
-┌─────────────────────────┐     ┌─────────────────────────┐
-│  stardustfs daemon       │     │  stardustfs <cmd>        │
-│  (상주, 온라인 피어)      │     │  (단발 CLI)              │
-│  - device 등록/heartbeat │     │  - ls/df/status         │
-│  - P2P 서버 + 릴레이 워커 │     │  - put/get/rm/mkdir/... │
-│  - 주기/롱폴 메타 동기화  │     │  - devices/login/logout │
-└───────────┬─────────────┘     └───────────┬─────────────┘
-            │   메타데이터 SQLite (WAL, 동시 접근)   │
-            └───────────────┬───────────────────────┘
-                            ▼
-                  {metadata_db} (.credentials/.daemon/.syncstate)
+┌─────────────────────────┐  ┌────────────────────┐  ┌────────────────────┐
+│  stardustfs daemon      │  │  stardustfs <cmd>  │  │  stardustfs gui    │
+│  (상주, 온라인 피어)     │  │  (단발 CLI)         │  │  (데스크톱 GUI)     │
+│  - device 등록/heartbeat│  │  - ls/df/status    │  │  - 파일탐색기       │
+│  - P2P 서버 + 릴레이 워커│  │  - put/get/rm/...  │  │  - daemon 감독      │
+│  - 주기/롱폴 메타 동기화 │  │  - devices         │  │  - 스토리지·디바이스 │
+│  - 복제 스케줄러         │  │  - login/logout    │  │  - 트레이 상주      │
+│  - 제어 채널 /ctl/*     │  └─────────┬──────────┘  └─────────┬──────────┘
+└───────────┬─────────────┘            │ 전송 위임(/ctl/put·get) │
+            │        메타데이터 SQLite (WAL, 동시 접근)          │
+            └────────────────────┬──────────────────────────────┘
+                                 ▼
+        {metadata_db} (.credentials / .daemon / .daemon.ctl / .daemon.log)
 ```
 
 - daemon(`stardustfs.py daemon`): 이 device를 온라인 피어로 유지한다. device 등록,
-  P2P 서버, 릴레이 워커, heartbeat, 주기/version 롱폴 동기화를 수행한다. 생존·종료는
-  제어 파일 기반 라이프사이클(start/status/stop)로 관리한다(POSIX 시그널 비의존).
+  P2P 서버, 릴레이 워커, 홀펀칭 서비스, heartbeat, 주기/version 롱폴 동기화, 복제
+  스케줄러, 로컬 전송 위임 채널을 수행한다. 생존·종료는 제어 파일 기반
+  라이프사이클(start/status/stop)로 관리한다(POSIX 시그널 비의존). 기동 즉시 제어
+  파일을 선점해 중복 실행을 막는다.
 - CLI(`stardustfs.py <cmd>`): 단발 명령. 로컬 명령(ls/df/status)은 서버 없이 동작하고,
   온라인 명령(devices/get/put 등)은 저장된 토큰으로 서버에 접근한다. CLI는 device를
   재등록하지 않고(daemon이 소유), 메타데이터 DB를 WAL로 daemon과 공유한다.
+- GUI(`stardustfs.py gui`): Tkinter 파일탐색기. CLI와 같은 코어 API를 쓰고, 조회
+  세션은 루프백 이미지를 읽기 전용으로 연다(쓰기는 daemon 단독). daemon 생존을 5초
+  주기로 확인해 죽어 있으면 자동 재시작하며, 설정이 없으면 새 설정을 만들 수 있다
+  (`act_storage.create_config`). 단일 인스턴스 락으로 중복 실행을 막고 창을 닫으면
+  트레이로 숨는다.
+
+전송(put/get)은 단발 프로세스가 홀펀칭 세션을 가질 수 없으므로 daemon 제어 채널에
+위임한다(`/ctl/put`·`/ctl/get`, 상세 [TRANSPORT.md](./TRANSPORT.md)). daemon이 없으면
+호출자가 직접 수행으로 폴백한다.
 
 ## 클라이언트 핵심 컴포넌트 (stardustlib/)
 
@@ -110,8 +124,19 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
   NAT 뒤 직접 연결은 UDP 홀펀칭(holepunch)으로 연다(UPnP 폐지).
 - `auth_client.py` + `credential_store.py`: 토큰 인증. 토큰을 자격증명 저장소
   (`{metadata_db}.credentials.json`, 소유자 전용)에 영속화하고 만료 전 자동 갱신.
-- `daemon.py`: daemon 라이프사이클(제어 파일 + 정지 센티넬 + heartbeat).
+- `daemon.py`: daemon 라이프사이클(제어 파일 + 정지/리로드 센티넬 + heartbeat + 기동
+  즉시 선점 `claim`). `single_instance.py`는 GUI 단일 인스턴스 락.
+- `online_recovery.py`: 오프라인으로 기동한 daemon이 주기(60초)마다 인증 → device 등록
+  → pending 업로드 → 메타데이터 병합 → P2P → heartbeat 순으로 온라인 복구를 시도한다.
+- `key_backup_engine.py`: 마스터키를 사용자 백업 암호로 2차 암호화(PBKDF2-SHA256
+  600k + AES-256-GCM)해 서버에 보관/복원한다. 새 기기 셋업의 전제
+  (상세 [NEW_DEVICE_SETUP.md](./NEW_DEVICE_SETUP.md)).
 - `cli/`: 단발 명령 디스패처/세션/명령/출력 포매터.
+- `gui/`: Tkinter 파일탐색기. 화면 영역별 모듈(`app`/`panel_files`/`panel_mgmt`/
+  `statusbar`/`session`/`file_ops`/`widgets/`)과 Tk 비의존 백엔드 액션(`act_core`,
+  `act_auth`, `act_storage`, `act_files`, `act_daemon`, `act_replication`,
+  `act_inventory`; `actions`가 공개 표면). 테마·트레이·다국어는 `theme`/`window_theme`/
+  `tray`/`i18n`.
 - 리플리케이션(MVP3): `chunker.py`(암호문 4MiB 청크 split/join), `parity_store.py`
   (호스트 역할 — 타 사용자 청크 암호문 보관·쿼터·소유자 인가), `replication_manager.py`
   (replicate/recover/ensure_replicas), `holepunch.py`(UDP 동시 오픈). P2P
@@ -202,9 +227,10 @@ StardustFS는 여러 디바이스의 스토리지를 하나의 가상 파일서�
   `PROGRESS_REPORTS`(10)회로 나눠 진행 로그를 남기고, 한 청크 전송이
   `SLOW_HOLDER_SECONDS`(30s)를 넘기면 지연 홀더를 경고로 남긴다. daemon은
   `ProgressTracker`(메모리, 파일 기록 없음)에 단계·처리/전체 청크 수를 유지하고
-  `POST /ctl/progress`로 노출한다. GUI는 기존 3초 폴링에서 함께 읽어 상태바에
+  `POST /ctl/progress`로 노출한다. GUI는 상태바의 기존 3초 폴링에서 함께 읽어
   "백업 중: {파일} {처리}/{전체} 청크"를 표시하며, 조회 실패·데몬 미실행이면 표시를
-  생략한다. 응답에는 가상 경로와 수치만 담는다.
+  생략한다. 응답에는 가상 경로와 수치만 담는다. 하단 관리 패널은 유휴 시 15초,
+  백업 진행 중에만 3초로 갱신해 요청 수를 줄인다(daemon 생존 확인은 5초).
 - 홀더 보관 한도 초과(507) 처리: 서버 배치 회계(상한 − 사용량)가 홀더의 실제 소스 여유
   보다 낙관적으로 남을 수 있다(사용량 보고 노후화·구버전 홀더). 소스 공간 부족도 쿼터
   초과와 같은 507로 응답하므로 요청자 쪽 처리가 동일하다.

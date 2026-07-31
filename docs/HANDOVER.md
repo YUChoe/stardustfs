@@ -28,7 +28,7 @@ AES-256-GCM 암호화되어 로컬 스토리지에 저장되고, 메타데이터
   - `tests/`: pytest 테스트
   - `data/DATABASE_SCHEMA.md`: DB 스키마 (반드시 최신 유지, 추측 금지)
 
-두 저장소 모두 현재 브랜치는 `mvp13-partial-metadata-sync`이다.
+클라이언트 현재 브랜치는 `mvp16-gui-ux-cleanup`(기준 브랜치 `dev-mvp1`)이다.
 
 ## 3. 핵심 컴포넌트 (클라이언트 stardustlib/)
 
@@ -65,7 +65,15 @@ AES-256-GCM 암호화되어 로컬 스토리지에 저장되고, 메타데이터
 - `device_manager.py`: 디바이스 등록/heartbeat. 광고 주소는 LAN 주소(UPnP·reflexive
   공인 IP 보정 모두 폐지 — 사용자 포트포워딩을 전제하지 않음). 직접 TCP는 같은 LAN
   전용이고, 다른 네트워크의 직접 연결은 홀펀칭이 담당
-- `webdav_provider.py`: wsgidav 기반 WebDAV. 오프라인 원격 파일은 `.offline` placeholder
+- `daemon.py`: daemon 라이프사이클(제어 파일 + 정지/리로드 센티넬 + heartbeat). 기동
+  즉시 `claim`으로 제어 파일을 선점해 중복 실행을 막는다
+- `replication_manager.py`/`replication_scheduler.py`/`replication_hosting.py`/
+  `parity_store.py`/`replication_progress.py`: 복제 엔진·스케줄러·정책·보관소·진행 추적
+- `cli/`: 단발 명령 디스패처·세션·핸들러·출력 포매터
+- `gui/`: Tkinter 파일탐색기. 화면 영역별 모듈(`app`, `panel_files`, `panel_mgmt`,
+  `statusbar`, `session`, `file_ops`, `widgets/`) + 백엔드 액션(`act_*`, `actions`가
+  공개 표면). daemon 생존을 폴링해 죽어 있으면 자동 재시작하고, `single_instance.py`로
+  GUI 중복 실행을 막는다
 
 ## 4. 완료된 작업 (시간순, 최신이 아래)
 
@@ -73,23 +81,52 @@ AES-256-GCM 암호화되어 로컬 스토리지에 저장되고, 메타데이터
 - tombstone 기반 삭제 동기화, CAS 낙관적 잠금, P2P 실환경 검증, 새 디바이스 key 복원
 - tombstone GC + 장기 오프라인 재조정, PBT 8종
 
-### dev-mvp5-share-demo 브랜치 (현재)
-순서대로:
+### 크로스 디바이스 전송 (dev-mvp5-share-demo)
 1. MVP5 파일 공유 데모(평문) → **폐기 결정**. 교차 계정 P2P는 암호화 복제만 허용
-2. remote 소스 통합 마운트(783964e): 같은 유저 디바이스 간 전송 연결
-3. 파일 device_id 기록 버그 수정 + 디바이스 목록 조회(85d7e68)
-4. 내 다른 디바이스 자동 remote 마운트(27ba791)
-5. 크로스 디바이스 파일 자동 라우팅(5d833d0): source_id 기반, device_id로 로컬/원격 분기
-6. 오프라인 원격 소스가 WebDAV PROPFIND를 500으로 깨뜨리던 버그 수정(b5591de): `is_remote` 도입
-7. 이중 NAT reflexive 공인 IP 보정(e14fb11, ebada5c): 서버 STUN 등가 + 즉시 heartbeat 반영
-8. 오프라인 비활성 마운트 + 동적 재네고시에이션(0855cea)
-9. P2P 릴레이 fallback(bd1cd1b 클라 / 2c4bfb6 서버 / d587805 reflexive):
-   이중 NAT/CGNAT로 직접 연결 불가 시 서버 long-polling 릴레이로 우회
-10. LoopbackSource 동반 디렉토리 경로 버그 수정(6f5e0d9): dispatch가 항상 404 나던 문제
-11. 원격 파일 수정 시 로컬 소유권 이전 3a + orphan GC(9a0222d)
-12. 메타데이터 version 롱폴링 즉시 동기화(1bbe6f6 클라 / a92bb61 서버)
+2. remote 소스 통합 마운트 + 내 다른 디바이스 자동 마운트, device_id 기반 자동 라우팅
+3. 오프라인 비활성 마운트 + 동적 재네고시에이션(`is_remote`, `refresh`)
+4. P2P 릴레이 fallback(이중 NAT/CGNAT에서 서버 long-polling 경유)
+5. 원격 파일 수정 시 소유권 이전 + orphan GC
+6. 메타데이터 version 롱폴링 즉시 동기화(폴링 30초 → ~1.4초)
 
-현재 상태: 클라이언트 427 passed(+2 skip), 서버 72 passed.
+### MVP10: CLI 가상 파일서버 피벗
+WebDAV 실시간 마운트와 wsgidav 의존을 제거하고, 상주 daemon + 단발 CLI 구조로 전환.
+설정은 v2 스키마만 지원한다(v1은 daemon이 거부).
+
+### 토큰 인증 전환
+`.env` 재로그인 → 자격증명 저장소 영속화. 7-1절 참조.
+
+### MVP3: 암호화 리플리케이션
+청킹·홀더 배치·호혜 회계·`parity_store`·`/replication/*`. 10절 참조.
+
+### 홀펀칭 전송 캐스케이드
+`rudp`/`p2p_udp`/`holepunch_service` + 서버 랑데부. UPnP·reflexive 공인 IP 보정 폐지.
+GUI/CLI 전송을 daemon에 위임하는 제어 채널(`daemon_control`) 추가.
+리모트 대용량 파일은 4 MiB 청크 전송. 상세 [TRANSPORT.md](./TRANSPORT.md).
+
+### 스토리지: FAT 루프백 이미지
+루프백 소스를 파일 내 FAT 이미지(pyfatfs)로 전환(동반 디렉터리 폐지). 스필오버·티어링·
+detach(evacuate 후 분리). "JBOD" 용어를 폐기하고 `StoragePool`로 리네임.
+
+### GUI (mvp12)
+Tkinter 파일탐색기. 통합 스토리지 상태 뷰, 하단 스토리지·디바이스 패널, 다크 테마,
+모달 다이얼로그, 브랜드 아이콘, PyInstaller onedir + zip 배포(`.github/workflows/
+build-windows.yml`).
+
+### 파셜 동기화 + 청크 네이티브 저장 (mvp13)
+레코드 단위 증분 메타데이터 동기화, 저장 시점부터 4 MiB 암호문 청크로 보관. 10절 참조.
+
+### 정책 프로비저닝 + 3카피 (mvp14~15)
+P2P·호스팅을 서버 정책으로 제어(기본 활성), 호스팅 상한을 서버가 지정, 복제 소유 모델을
+사용자 단위로 정정, 청크 3카피 정책(카피 수와 기기 수를 따로 집계), 백업 진행 가시성
+(`/ctl/progress`), 홀더 507 배제, daemon/GUI 중복 실행 방지.
+
+### GUI UX 정리 (mvp16, 현재)
+GUI를 화면 영역별 모듈로 분해, 선택 상태를 따르는 액션, 폴링 요청 4분의 1로 축소,
+파일 매니페스트로 청크별 왕복 제거, 배치·입력 흐름·표시 일관성 정리.
+
+현재 상태: 클라이언트 910 passed / 1 skipped (152초, 2026-07-31 실행). 서버 테스트
+수치는 별도 확인 필요.
 
 ## 5. 실환경에서 검증된 동작 (2 PC, 이중 NAT)
 
@@ -113,7 +150,10 @@ AES-256-GCM 암호화되어 로컬 스토리지에 저장되고, 메타데이터
 ## 7. 개발 환경 및 규칙
 
 - Windows + Git Bash. 가상환경 `.venv` (`source .venv/Scripts/activate`), `PYTHONPATH=.`
-- 프로덕션 Python 3.9 (3.10+ 전용 API 금지. 예: `TemporaryDirectory(ignore_cleanup_errors=)` 사용 불가 → mkdtemp+rmtree)
+- Python 3.10 이상. 개발 환경은 3.10.6, Windows 배포 빌드(CI)는 3.13이다. 코드가
+  `X | None` 어노테이션을 `from __future__ import annotations` 없이 쓰므로 3.9에서는
+  임포트가 실패한다. 3.11+ 전용 API(예: `TemporaryDirectory(ignore_cleanup_errors=)`)는
+  쓰지 않는다 → mkdtemp+rmtree
 - SQLite는 python 스크립트로만 조작(`sqlite3` CLI 없음). python -c는 단일 라인
 - 파일은 LF + UTF-8
 - 응답/주석 한국어. 영어 텍스트는 영국 영어
@@ -152,14 +192,19 @@ AES-256-GCM 암호화되어 로컬 스토리지에 저장되고, 메타데이터
 
 ## 8. 빌드/테스트/실행 명령
 
+`&&` 데이지체인 없이 한 명령씩 실행한다.
+
 ```bash
 # 클라이언트 (c:\Users\yonguk.choe\src\stardustfs)
-source .venv/Scripts/activate && PYTHONPATH=. python -m pytest -q        # 전체 테스트
-./run-dev.sh                                                              # 개발 실행(WebDAV 8080)
+PYTHONPATH=. .venv/Scripts/python -m pytest -q     # 전체 테스트(약 2.5분)
+./run-dev.sh                                        # 개발 daemon 실행(dev-config.json)
+./run.sh                                            # 개발 GUI 실행
+python stardustfs.py daemon status --config dev-config.json
+python stardustfs.py ls --config dev-config.json
 
 # 서버 (c:\Users\yonguk.choe\src\stardustfs-server)
-source .venv/Scripts/activate && python -m pytest -q                      # 전체 테스트
-STARDUST_PORT=8000 python main.py                                         # 로컬 서버
+.venv/Scripts/python -m pytest -q                   # 전체 테스트
+STARDUST_PORT=8000 python main.py                   # 로컬 서버
 
 # E2E (로컬 서버 필요)
 STARDUST_TEST_SERVER_URL=http://127.0.0.1:8000 PYTHONPATH=. python -m pytest tests/test_relay_e2e.py tests/test_sync_longpoll_e2e.py -v
@@ -169,11 +214,15 @@ E2E 테스트는 롱폴/릴레이 미배포 서버에서는 자동 skip된다(�
 
 ## 9. 배포 시 주의
 
-- 서버 커밋(2c4bfb6 릴레이, a92bb61 롱폴링)을 운영 서버에 배포해야 해당 기능 동작
-- 미배포 서버에서는 클라이언트가 404 감지 후 기존 방식으로 자동 폴백(하위 호환)
-- DB 스키마 변경 없음(릴레이/롱폴링/랑데부 모두 메모리 상태 또는 기존 컬럼 사용)
+- 클라이언트는 서버 기능 부재를 404로 감지해 구 경로로 자동 폴백한다(릴레이·롱폴·
+  레코드 동기화·복제 정책). 따라서 서버 배포가 늦어도 기동은 되지만 해당 기능은 꺼진다.
+- 서버 측 신규 기능은 배포가 전제다: 릴레이/롱폴(메모리 상태), 랑데부(옵트인),
+  메타데이터 레코드 저장(`metadata_records`·`metadata_version`), 복제 레지스트리
+  (chunks/replicas/hosting + `/replication/policy`). 뒤 두 개는 서버 DB 스키마를 쓴다 —
+  `../stardustfs-server/data/DATABASE_SCHEMA.md`를 확인하고 추측하지 말 것.
+- 릴레이/롱폴링/랑데부는 단일 uvicorn 워커 + 메모리 상태를 가정한다.
 
-## 10. 다음 단계 (미완료)
+## 10. 완료된 주요 설계 결정과 남은 과제
 
 ### B: 파셜/증분 메타데이터 전송 — 완료 (mvp13)
 B-1(레코드 단위 암호화)으로 결정·구현했다. zero-knowledge를 유지하기 위해 B-2(서버가
@@ -210,11 +259,15 @@ B-1(레코드 단위 암호화)으로 결정·구현했다. zero-knowledge를 �
   같아 등록된 청크 해시가 계속 유효하다. 그전에는 청크 암호문 연결을 다시 4 MiB로
   나눠 복제하고 복구 때 단일 GCM blob으로 복호화하려 해 다중 청크 파일에서 실패했다.
 - UDP 홀펀칭(`holepunch.py` + 서버 `rendezvous.py` 옵트인). E2E `test_replication_e2e.py`.
-- 운영 활성화(스펙 `.kiro/specs/replication-activation/`, Phase A1~A3): daemon이
-  `replication.enabled` 시 제공 용량 신고(`report_hosting`) + ParityStore(provided*0.5)
-  + `replication_scheduler`(자동 backup/heal 백그라운드 루프, heal은 degraded가
-  `heal_grace_seconds`(기본 24h) 이상 지속 시에만 재복제 — 일시 오프라인 churn 방지).
-  기본 비활성.
+- 운영 활성화(스펙 `.kiro/specs/replication-activation/`, `.kiro/specs/chunk-copy-policy/`):
+  `replication.enabled` 기본 **활성**. daemon이 시작 시·주기적으로
+  `GET /replication/policy`로 목표 카피 수(`target_copies`, 기본 3)와 이 기기의 호스팅
+  상한을 받아 적용하고, 클라이언트는 제공 용량을 신고하지 않고 **실제 사용량**만
+  보고한다(`POST /replication/hosting`). 상한을 한 번도 받지 못하면 0으로 두어 타 사용자
+  청크를 받지 않는다. `replication_scheduler`가 자동 backup(기본 300초)/heal(기본 1시간)
+  루프를 돌리고, heal은 degraded가 `heal_grace_seconds`(기본 24h) 이상 지속된 파일만
+  재복제한다(미달 pending은 유예 없음). P2P·호스팅 허용 자체도 서버 정책으로 제어된다
+  (프로비저닝, 기본 허용).
 
 남은 항목(이관/후속):
 - 교차 사용자 릴레이 fallback: RelayHub가 same-user만 중개 → 허브 인가 모델 재설계
@@ -235,12 +288,19 @@ B-1(레코드 단위 암호화)으로 결정·구현했다. zero-knowledge를 �
 
 ## 11. 스펙 위치
 
-`.kiro/specs/` 아래 기능별 requirements/design/tasks:
-- `cross-device-file-routing/`: device_id 기반 자동 라우팅
-- `p2p-relay-fallback/`: 서버 경유 long-polling 릴레이
-- `remote-write-takeover/`: 소유권 이전 3a + orphan GC
-- `sync-longpoll-events/`: 메타데이터 version 롱폴링
-- `replication-parity/`: 암호화 리플리케이션(MVP3, Phase 1~7 완료)
-- `mvp2-client-multidevice/`: MVP2 전체
+`.kiro/specs/` 아래 기능별 requirements/design/tasks. 주제별로:
+
+- 코어·멀티디바이스: `stardustfs-core/`, `mvp2-phase1/`, `mvp2-client-multidevice/`,
+  `cross-device-file-routing/`, `remote-write-takeover/`, `sync-longpoll-events/`,
+  `partial-metadata-sync/`
+- 전송: `p2p-relay-fallback/`, `holepunch-transport/`, `daemon-transfer-delegation/`,
+  `remote-chunked-transfer/`, `cross-user-replica-relay/`
+- 스토리지: `loopback-fat-image/`, `jbod-spillover-eviction/`, `storage-detach/`,
+  `chunk-native-storage/`, `unified-storage-status/`, `device-source-registry/`,
+  `daemon-config-reload/`
+- 복제: `replication-parity/`, `replication-activation/`, `chunk-integrity-hash/`,
+  `chunk-copy-policy/`, `replication-ownership-progress/`
+- 인증·GUI: `token-auth-transition/`, `gui-ux-cleanup/`
+- 폐기: `mvp5-file-sharing-demo/`(평문 공유 — 채택하지 않음)
 
 작업 재개 시 해당 스펙의 tasks.md에서 미완료(`[ ]`) 항목을 확인할 것.
