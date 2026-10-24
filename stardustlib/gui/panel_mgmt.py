@@ -11,11 +11,11 @@ import logging
 import os
 from tkinter import messagebox, ttk
 
-from stardustlib.gui import actions, prefs
-from stardustlib.gui.file_ops import storage_fields
+from stardustlib.gui import actions, errors, prefs, theme
 from stardustlib.gui.format import human_bytes
 from stardustlib.gui.widgets import tooltip
-from stardustlib.gui.widgets.form_dialog import FormDialog
+from stardustlib.gui.widgets.form_dialog import INT, SAVE, Field, FormDialog
+from stardustlib.gui.window_state import fit_first_column
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,37 @@ _MGMT_POLL_BACKUP_MS = 3000
 
 # 이 비율 이상 차면 경고 색으로 표시한다.
 _FULL_RATIO = 0.9
+
+# 관리 트리 기본 컬럼 폭(96 DPI 기준 px).
+MGMT_COL_DEFAULTS = {"#0": 320, "status": 90, "cap": 190}
+
+
+def storage_fields(t: dict) -> tuple[Field, ...]:
+    """루프백 스토리지 추가 입력(이미지 경로 + 크기)."""
+    return (
+        Field("path", t["src_loop_path"], SAVE, required=True,
+              pick_title=t["src_loop_path"]),
+        Field("size_mb", t["src_loop_size_prompt"], INT, initial="100",
+              required=True, minimum=10),
+    )
+
+
+def _show_mgmt_empty(app, text: str) -> None:
+    """관리 트리 위에 안내를 겹쳐 보인다(빈 문자열이면 감춘다).
+
+    메서드가 아니라 함수인 이유: 테스트가 _populate_mgmt를 최소 스텁으로 호출한다.
+    """
+    label = getattr(app, "_mgmt_empty_label", None)
+    if label is None:
+        return
+    try:
+        if text:
+            label.config(text=text)
+            label.place(relx=0.5, rely=0.5, anchor="center")
+        else:
+            label.place_forget()
+    except Exception:  # noqa: BLE001 — 재구성 중 파괴된 위젯
+        pass
 
 
 class MgmtPanelMixin:
@@ -53,8 +84,8 @@ class MgmtPanelMixin:
         ttk.Button(bar, text=t["src_add_loop"],
                    command=self._mgmt_add_storage).pack(side="left")
         self.mgmt_detach_btn = ttk.Button(
-            bar, text=t["src_remove"], command=self._mgmt_detach, state="disabled")
-        self.mgmt_detach_btn.pack(side="left", padx=4)
+            bar, text=t["src_detach"], command=self._mgmt_detach, state="disabled")
+        self.mgmt_detach_btn.pack(side="left", padx=6)
 
         # 트리 컨테이너는 _apply_mgmt_collapsed가 전담해 pack한다 — 여기서 미리
         # pack하면 접었다 펼 때 pack 순서가 액션 바보다 앞으로 가 액션 바가 붕괴한다.
@@ -64,27 +95,33 @@ class MgmtPanelMixin:
             tv, columns=("status", "cap"), show="tree headings",
             selectmode="browse",
         )
+        widths = self._mgmt_cols
         self.mgmt_tree.heading("#0", text=f"{t['col_device']} / {t['col_src_name']}")
-        self.mgmt_tree.column("#0", width=320, anchor="w")
+        self.mgmt_tree.column("#0", width=widths["#0"], anchor="w")
         self.mgmt_tree.heading("status", text=t["col_status"])
-        self.mgmt_tree.column("status", width=90, anchor="w")
+        self.mgmt_tree.column("status", width=widths["status"], anchor="w")
         self.mgmt_tree.heading("cap", text=t["col_capacity"])
-        self.mgmt_tree.column("cap", width=190, anchor="w")
+        self.mgmt_tree.column("cap", width=widths["cap"], anchor="w")
         sb = ttk.Scrollbar(tv, orient="vertical", command=self.mgmt_tree.yview)
         self.mgmt_tree.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")  # 트리보다 먼저(넓은 저장 폭에 밀리지 않게)
         self.mgmt_tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
         self.mgmt_tree.bind("<<TreeviewSelect>>", self._mgmt_on_select)
         self.mgmt_tree.bind("<Motion>", self._mgmt_motion)
+        # 비었거나 불러오지 못했을 때의 안내(빈 트리만 두면 고장으로 보인다).
+        self._mgmt_empty_label = ttk.Label(
+            tv, text="", anchor="center", justify="center",
+            foreground=theme.text_colour("fg_subtle", dark=self.theme == "dark"))
         self._apply_mgmt_tags()
         self._mgmt_meta: dict = {}  # iid → {kind, self, id, path}
         tooltip.attach(self.mgmt_tree, lambda: getattr(self, "_mgmt_tip", ""))
         self._apply_mgmt_collapsed()
+        _show_mgmt_empty(self, t["busy_browse"] if self.config_path
+                         else t["mgmt_empty_config"])
+        fit_first_column(self.mgmt_tree, "#0", ("status", "cap"))
 
     def _apply_mgmt_tags(self) -> None:
         """가득 찬 소스 경고 색을 현재 테마에 맞춘다."""
-        from stardustlib.gui import theme
-
         tree = getattr(self, "mgmt_tree", None)
         if tree is None or not tree.winfo_exists():
             return
@@ -161,12 +198,18 @@ class MgmtPanelMixin:
     # --- 갱신 ---
 
     def _refresh_mgmt(self) -> None:
-        """레지스트리 단일 원천으로 디바이스·소스 트리를 갱신한다(비로그인/오프라인은 강등)."""
-        if not self.config_path or not getattr(self, "mgmt_tree", None):
+        """레지스트리 단일 원천으로 디바이스·소스 트리를 갱신한다(비로그인/오프라인은 강등).
+
+        앞선 갱신이 아직 큐에 있으면 다시 내지 않는다(긴 전송 뒤에 쌓이지 않도록).
+        """
+        if not getattr(self, "mgmt_tree", None):
+            return
+        if not self.config_path:
+            _show_mgmt_empty(self, self.t["mgmt_empty_config"])
             return
         cfg = self.config_path
-        self.worker.submit(
-            lambda: actions.storage_and_devices(cfg), self._populate_mgmt)
+        self._submit_once(
+            "mgmt", lambda: actions.storage_and_devices(cfg), self._populate_mgmt)
 
     def _mgmt_poll(self) -> None:
         """스토리지·디바이스 패널 주기 갱신. 백업 중에는 주기를 줄인다.
@@ -189,7 +232,12 @@ class MgmtPanelMixin:
         self._mgmt_meta.clear()
         self.mgmt_detach_btn.config(state="disabled")
         if not ok or not isinstance(data, dict):
+            if not ok:
+                logger.warning("스토리지·디바이스 조회 실패: %r", data)
+            _show_mgmt_empty(self, self.t["mgmt_empty_failed"])
             return
+        _show_mgmt_empty(
+            self, "" if data.get("devices") else self.t["mgmt_empty_none"])
         # 디바이스 온라인/전체 요약을 같은 응답에서 계산한다(별도 GET /devices 없음).
         # 서버 미도달(강등)일 때는 이 기기 로컬만 보이므로 카운트를 건드리지 않는다.
         if data.get("online"):
@@ -238,31 +286,35 @@ class MgmtPanelMixin:
 
         def submit(values, dlg) -> None:
             cfg = self.config_path
-            try:
-                sid = actions.add_source(
-                    cfg, "loopback", values["path"],
-                    size=values["size_mb"] * 1024 * 1024)
-            except Exception as e:  # noqa: BLE001 — 사유를 폼 안에 남긴다
-                dlg.error(str(e))
-                return
-            dlg.close()
-            self._set_status(t["src_init_busy"])
-            self._refresh_mgmt()  # '초기화 중' 즉시 표시
+            path, size = values["path"], values["size_mb"] * 1024 * 1024
 
-            def _fmt():
+            def added(ok, payload):
+                if not ok:
+                    # 사유를 폼 안에 남기고 입력값은 유지한다.
+                    dlg.error(errors.describe(payload, t))
+                    return
+                dlg.close()
+                self._job_begin("storage_init", t["src_init_busy"])
+                self._refresh_mgmt()  # '초기화 중' 즉시 표시
+                self.worker.submit(lambda: _fmt(payload), _fmt_done)
+
+            def _fmt(sid):
                 actions.create_storage_image(cfg, sid)
                 actions.invalidate(cfg)
 
             def _fmt_done(ok, payload):
+                self._job_end("storage_init")
                 if not ok:
-                    self._show_banner(str(payload))
+                    self._show_banner(errors.describe(payload, t))
                     return
-                self._set_status(self.t["ready"])
                 self._reload_daemon()
                 self._refresh_mgmt()
                 self.refresh()
 
-            self.worker.submit(_fmt, _fmt_done)
+            # config 파일 쓰기도 메인 스레드에서 하지 않는다.
+            self.worker.submit(
+                lambda: actions.add_source(cfg, "loopback", path, size=size),
+                added)
 
         FormDialog(self, t["src_add_loop"], storage_fields(t), submit)
 
@@ -280,14 +332,12 @@ class MgmtPanelMixin:
         sid = meta.get("id")
         # 데이터를 옮기는 되돌리기 어려운 동작이라 확인은 모달로 남긴다.
         if not messagebox.askyesno(
-            t["src_remove"], t["src_detach_confirm"].format(id=sid)
+            t["src_detach"], t["src_detach_confirm"].format(id=sid),
+            parent=self.root,
         ):
             return
 
-        def done(ok, report):
-            if not ok:
-                self._show_banner(str(report))
-                return
+        def detached(report):
             if report.get("detached"):
                 self._set_status(t["src_detach_done"].format(
                     moved=len(report.get("moved", []))))
@@ -305,5 +355,5 @@ class MgmtPanelMixin:
             self._refresh_mgmt()
             self.refresh()
 
-        self._set_status(t["src_detach_busy"])
-        self.worker.submit(lambda: actions.detach_source(cfg, sid), done)
+        self._submit(lambda: actions.detach_source(cfg, sid), detached,
+                     t["src_detach_busy"])

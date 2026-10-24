@@ -1,4 +1,4 @@
-"""GUI 사용자 설정(테마·언어) 지속.
+"""GUI 사용자 설정(테마·언어·창 상태·마지막 설정 파일) 지속.
 
 config가 아니라 사용자 단위다 — GUI는 config 없이도 뜨고 실행 중에 config를 고를 수
 있으므로, 표시 설정을 config에 묶으면 설정을 바꿀 때마다 테마가 되돌아간다.
@@ -81,3 +81,49 @@ def ratio(key: str, default: float, *, low: float = 0.2,
     if isinstance(value, (int, float)) and low <= float(value) <= high:
         return float(value)
     return default
+
+
+def text(key: str, default: str = "") -> str:
+    """저장된 문자열(마지막 설정 파일 경로 등). 문자열이 아니면 default."""
+    value = load().get(key)
+    return value if isinstance(value, str) and value else default
+
+
+# 컬럼 폭으로 받아들이는 범위(px). 밖이면 손상으로 보고 기본값을 쓴다.
+_WIDTH_RANGE = (20, 4000)
+
+
+def widths(key: str, defaults: dict[str, int]) -> dict[str, int]:
+    """저장된 컬럼 폭. 컬럼마다 따로 검증해 없거나 이상한 값은 기본값으로 둔다."""
+    saved = load().get(key)
+    out = dict(defaults)
+    if isinstance(saved, dict):
+        low, high = _WIDTH_RANGE
+        for col in defaults:
+            value = saved.get(col)
+            if isinstance(value, int) and low <= value <= high:
+                out[col] = value
+    return out
+
+
+def last_vpath(config_path: str | None) -> str:
+    """그 설정에서 마지막으로 보던 가상 폴더(다른 설정이면 루트)."""
+    value = load().get("last_vpath")
+    if (config_path and isinstance(value, list) and len(value) == 2
+            and value[0] == config_path and isinstance(value[1], str)
+            and value[1].startswith("/")):
+        return value[1]
+    return "/"
+
+
+def window() -> dict:
+    """저장된 창 상태 {geometry: 'WxH+X+Y', zoomed: bool}. 형식이 다르면 빈 dict."""
+    value = load().get("window")
+    if not isinstance(value, dict):
+        return {}
+    out: dict = {}
+    if isinstance(value.get("geometry"), str):
+        out["geometry"] = value["geometry"]
+    if isinstance(value.get("zoomed"), bool):
+        out["zoomed"] = value["zoomed"]
+    return out

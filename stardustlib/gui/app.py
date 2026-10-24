@@ -4,11 +4,13 @@
 이 모듈은 창·테마·메뉴·트레이와 워커 브리지만 담고, 화면 영역별 동작은 믹스인으로
 나눠 두었다:
 
-- panel_files / file_ops: 파일 목록 위젯과 파일 동작
+- panel_files / uploads / file_ops: 파일 목록 위젯, 업로드 큐, 파일 동작
 - panel_mgmt: 하단 스토리지·디바이스 패널
 - statusbar: 하단 상태바, 진행 표시, 메타데이터 폴링
-- daemon_control: daemon 감독
+- daemon_control: 데몬 감독
 - session: 설정 진입과 로그인
+- jobs: 워커 브리지(작업 제출, 진행 중 작업 추적)
+- window_state / window_theme: 창 상태 지속, 테마 적용
 
 i18n(ko/en), 시스템 트레이 최소화(선택 의존 pystray) 지원. 창 닫기(X)는 트레이로
 숨기고, 트레이 '종료'로만 실제 종료한다.
@@ -27,16 +29,23 @@ from tkinter import ttk
 from stardustlib.gui import i18n, prefs, theme, tray
 from stardustlib.gui.daemon_control import DaemonControlMixin
 from stardustlib.gui.file_ops import FileOpsMixin
-from stardustlib.gui.panel_files import FilesPanelMixin
-from stardustlib.gui.panel_mgmt import MgmtPanelMixin
+from stardustlib.gui.jobs import JobsMixin
+from stardustlib.gui.panel_files import FILE_COL_DEFAULTS, FilesPanelMixin
+from stardustlib.gui.panel_mgmt import MGMT_COL_DEFAULTS, MgmtPanelMixin
 from stardustlib.gui.session import SessionMixin
 from stardustlib.gui.statusbar import StatusBarMixin
+from stardustlib.gui.toolbar import ToolbarMixin
+from stardustlib.gui.uploads import UploadsMixin
+from stardustlib.gui.window_state import (
+    FILE_COLS_KEY,
+    MGMT_COLS_KEY,
+    ViewStateMixin,
+)
 from stardustlib.gui.window_theme import WindowThemeMixin
-from stardustlib.gui.worker import Worker
 
 logger = logging.getLogger(__name__)
 
-# 창 기본 크기·최소 크기(px).
+# 창 기본 크기·최소 크기(96 DPI 기준 px).
 _WIN_SIZE = (900, 620)
 _WIN_MIN = (760, 480)
 
@@ -51,14 +60,30 @@ _FILE_PANE_RATIO = 0.58
 _MIN_LIST_HEIGHT = 60
 
 
+def _initial_config(config_path: str | None) -> str | None:
+    """명시한 설정이 없으면 마지막으로 연 설정을 쓴다(파일이 남아 있을 때만).
+
+    절대 경로로 맞춘다 — 상대 경로를 저장하면 다른 작업 디렉터리에서 실행했을 때
+    찾지 못한다.
+    """
+    if config_path:
+        return os.path.abspath(config_path)
+    last = prefs.text("last_config")
+    return last if last and os.path.isfile(last) else None
+
+
 class StardustApp(
     FilesPanelMixin,
+    ToolbarMixin,
+    UploadsMixin,
     FileOpsMixin,
     MgmtPanelMixin,
     StatusBarMixin,
     DaemonControlMixin,
     SessionMixin,
     WindowThemeMixin,
+    ViewStateMixin,
+    JobsMixin,
 ):
     """메인 윈도우."""
 
@@ -66,12 +91,13 @@ class StardustApp(
         self, root: tk.Tk, config_path: str | None, instance_lock=None
     ) -> None:
         self.root = root
-        self.config_path = config_path
+        self.config_path = _initial_config(config_path)
         # 단일 인스턴스 락(선택). 메인루프에서 heartbeat를 갱신하고, 두 번째 실행이
         # 남긴 포커스 요청을 소비해 창을 앞으로 올린다.
         self._instance_lock = instance_lock
-        self.vpath = "/"
-        self.worker = Worker()
+        self.vpath = prefs.last_vpath(self.config_path)
+        self._init_jobs()
+        self._login_cache: dict[str, bool] = {}
         self._rows: dict[str, dict] = {}
         self._last_rows: list[dict] = []  # 마지막으로 받은 서버 목록(정렬 재적용용)
         # 업로드 큐. 별도 창 없이 파일 목록에 진행 행으로 그린다.
@@ -86,6 +112,8 @@ class StardustApp(
         self._daemon_was_running: bool | None = None
         # 상태바에 복제 진행을 표시 중인지(끝나면 기본 문구로 되돌리기 위함).
         self._showing_progress = False
+        self._progress_text = ""
+        self._daemon_state: tuple[str, str, str] | None = None
         self._last_meta_mtime = 0.0
         # 표시 설정은 사용자 단위로 저장한다. 없으면 언어는 로케일 추정,
         # 테마는 디자인 시스템 기본(Primer 다크).
@@ -95,16 +123,21 @@ class StardustApp(
         self._sort = prefs.sort()
         self._mgmt_collapsed = prefs.flag("mgmt_collapsed")
         self._sash_ratio = prefs.ratio("sash_ratio", _FILE_PANE_RATIO)
+        # 기본 폭은 화면 배율에 맞춘다(저장된 폭은 실제 px 그대로 쓴다).
+        self._file_cols = prefs.widths(FILE_COLS_KEY, {
+            c: theme.px(root, w) for c, w in FILE_COL_DEFAULTS.items()})
+        self._mgmt_cols = prefs.widths(MGMT_COLS_KEY, {
+            c: theme.px(root, w) for c, w in MGMT_COL_DEFAULTS.items()})
         self._icon_photo = None  # 브랜드 마크 아이콘 참조(GC 방지)
 
         root.title(self.t["app_title"])
-        # 주 모니터 중앙에 배치(위치 미지정 시 터미널/커서 기준으로 화면 밖·보조
-        # 모니터에 열려 "안 보임"으로 오인되는 것을 막는다).
-        _w, _h = _WIN_SIZE
-        _sw, _sh = root.winfo_screenwidth(), root.winfo_screenheight()
-        _x, _y = max(0, (_sw - _w) // 2), max(0, (_sh - _h) // 2)
-        root.geometry(f"{_w}x{_h}+{_x}+{_y}")
-        root.minsize(*_WIN_MIN)
+        # 마지막 창 위치·크기로 연다. 저장값이 없거나 그 위치가 지금 연결된 모니터
+        # 밖이면 주 모니터 가운데(화면 밖·보조 모니터에 열려 "안 보임"으로 오인되는
+        # 것을 막는다).
+        self._restore_window(
+            tuple(theme.px(root, v) for v in _WIN_SIZE),
+            tuple(theme.px(root, v) for v in _WIN_MIN),
+        )
         self._icon_photo = theme.set_window_icon(root)
         self._apply_theme()
         self._build_menu()
@@ -260,6 +293,7 @@ class StardustApp(
         X가 종료가 아니라는 것은 처음 보면 알 수 없다. 상태바 문구는 놓치기 쉬우므로
         최초 1회만 배너로 알리고 그 뒤로는 조용히 숨는다.
         """
+        self._capture_view_state()  # 숨긴 뒤에는 창 위치를 읽을 수 없다
         self.root.withdraw()
         self._set_status(self.t["tray_minimised"])
         if not prefs.flag("tray_hint_shown"):
@@ -267,7 +301,11 @@ class StardustApp(
             self._show_banner(self.t["tray_hint"], level="info")
 
     def _quit(self) -> None:
-        # 종료 시 daemon도 정지(센티넬만 즉시 생성, 대기 없음 — daemon이 ~1초 내 종료).
+        try:
+            self._capture_view_state()
+        except Exception:  # noqa: BLE001 — 상태 저장 실패가 종료를 막으면 안 된다
+            logger.warning("창 상태 저장 실패", exc_info=True)
+        # 종료 시 데몬도 정지(센티넬만 즉시 생성, 대기 없음 — 데몬이 ~1초 내 종료).
         if self.config_path:
             try:
                 from stardustlib.gui import actions
@@ -339,6 +377,9 @@ class StardustApp(
         # 있다. 드래그 중·놓을 때 하한으로 되민다.
         paned.bind("<B1-Motion>", self._clamp_sash, add="+")
         paned.bind("<ButtonRelease-1>", self._clamp_sash, add="+")
+        # 놓는 순간의 위치를 기억한다(되민 뒤의 값이 저장되도록 clamp 다음에 둔다).
+        paned.bind("<ButtonRelease-1>",
+                   lambda _e: self._save_sash_ratio(), add="+")
 
         self._refresh_login_state()
 
@@ -373,62 +414,31 @@ class StardustApp(
 
         paned.after_idle(_apply)
 
-    def _save_sash_ratio(self) -> None:
-        """현재 분할선 위치를 비율로 기억한다(다음 실행·언어 전환에서 복원)."""
-        paned = getattr(self, "_paned", None)
-        if paned is None:
-            return
-        try:
-            height = paned.winfo_height()
-            if height < 100:
-                return
-            ratio = paned.sashpos(0) / height
-        except (tk.TclError, ZeroDivisionError):
-            return
-        if 0.2 <= ratio <= 0.9 and abs(ratio - self._sash_ratio) > 0.01:
-            self._sash_ratio = ratio
-            prefs.save(sash_ratio=round(ratio, 3))
-
     def _rebuild_body(self) -> None:
-        """본문 위젯을 전부 다시 만든다(언어 전환 등 라벨 일괄 변경 시).
+        """본문 위젯을 전부 다시 만든다(언어·테마 전환 등 라벨·색 일괄 변경 시).
 
-        경로·정렬·분할선 비율·관리 패널 접힘은 인스턴스 상태이므로 재구성 후에도
-        그대로 복원된다 — 언어를 바꿨다고 보고 있던 폴더가 루트로 돌아가지 않는다.
+        경로·정렬·분할선 비율·컬럼 폭·관리 패널 접힘은 인스턴스 상태이므로 재구성
+        후에도 그대로 복원된다 — 언어를 바꿨다고 보고 있던 폴더가 루트로 돌아가지
+        않는다. 떠 있던 배너와 데몬 상태 점도 새 위젯에 다시 그린다.
         """
         self._save_sash_ratio()
+        self._capture_columns()
+        banner = (self._banner_message, self._banner_count, self._banner_level)
         self.body.destroy()
         self.body = ttk.Frame(self.root)
         self.body.pack(fill="both", expand=True)
         self._build_body()
+        if self._daemon_state is not None:
+            self._daemon_dot(*self._daemon_state)
+        message, count, level = banner
+        if message:
+            self._banner_message, self._banner_count = message, count - 1
+            self._show_banner(message, level=level)
         if self.config_path:
             self.refresh()
+            self._refresh_mgmt()
         else:
             self._set_status(self.t["select_config_hint"])
-
-    # --- 워커 브리지 ---
-
-    def _tick(self) -> None:
-        self.worker.poll()
-        self.root.after(80, self._tick)
-
-    def _submit(self, fn, on_ok=None, busy: str | None = None) -> None:
-        if not self.config_path:
-            self._show_banner(self.t["need_config"], level="warning")
-            return
-        self._set_status(busy or self.t["busy_browse"])
-
-        def done(ok, payload):
-            if ok:
-                self._set_status(self.t["ready"])
-                if on_ok:
-                    on_ok(payload)
-            else:
-                # 실패는 모달 대신 배너로 알린다 — 실패가 이어질 때 확인 버튼만
-                # 반복해 누르게 만들지 않는다.
-                self._set_status(self.t["err_status"].format(msg=payload))
-                self._show_banner(str(payload))
-
-        self.worker.submit(fn, done)
 
     @staticmethod
     def _enable(btn, on: bool) -> None:
@@ -472,6 +482,26 @@ def _hide_console_if_frozen() -> None:
         pass
 
 
+def _enable_dpi_awareness() -> None:
+    """Windows 고DPI 화면에서 흐릿한 비트맵 확대 대신 실제 해상도로 그리게 한다.
+
+    DPI를 인식하지 않는 프로세스는 Windows가 96 DPI로 그린 창을 통째로 늘려 글자가
+    흐려진다. 인식하면 Tk가 화면 DPI로 폰트를 키우므로, px 상수는 theme.px로 같은
+    비율만큼 키운다. Tk 루트를 만들기 전에 불러야 한다.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # SYSTEM_DPI_AWARE
+        except (AttributeError, OSError):
+            ctypes.windll.user32.SetProcessDPIAware()  # Windows 8.0 이하
+    except Exception:  # noqa: BLE001 — 실패하면 OS 확대로 남는다
+        logger.debug("DPI 인식 설정 실패", exc_info=True)
+
+
 def run_gui(config_path: str | None) -> int:
     """GUI를 실행한다 (블로킹). 이미 실행 중이면 그 창을 띄우고 1을 반환한다.
 
@@ -488,6 +518,7 @@ def run_gui(config_path: str | None) -> int:
         return 1
 
     _hide_console_if_frozen()
+    _enable_dpi_awareness()
     root = tk.Tk()
     try:
         StardustApp(root, config_path, instance_lock=lock)

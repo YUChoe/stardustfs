@@ -24,6 +24,13 @@ class RemotePathExists(OSError):
     """
 
 
+class LoginRequired(RuntimeError):
+    """온라인 세션이 필요한데 로그인 토큰이 없다(GUI가 사용자 문구로 바꿔 보여준다)."""
+
+    def __init__(self) -> None:
+        super().__init__("로그인이 필요합니다. 먼저 로그인하세요.")
+
+
 # 오프라인 조회용 세션 캐시. 워커 스레드 단일 실행 가정(sqlite 연결은 스레드별).
 # 매 새로고침마다 _build_core(스토리지 초기화)가 반복 실행/로깅되는 것을 막는다.
 _offline_cache: dict[str, "object"] = {}
@@ -72,7 +79,7 @@ async def _run_online(config_path: str, aop, sync: bool):
     session = await CLISession.open_online(config_path, sync=sync)
     try:
         if not session.online:
-            raise RuntimeError("로그인이 필요합니다. 먼저 로그인하세요.")
+            raise LoginRequired()
         return await aop(session)
     finally:
         await session.aclose()

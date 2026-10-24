@@ -74,3 +74,20 @@ def test_methods_exist_on_app():
 
     for action in _all_actions():
         assert hasattr(StardustApp, action.method), action.method
+
+
+def test_context_menu_covers_toolbar():
+    """우클릭만 쓰는 사용자도 툴바의 모든 동작에 닿는다."""
+    menu = {a.key for a in action_defs.CONTEXT_MENU if a is not None}
+    for group in action_defs.TOOLBAR_GROUPS:
+        for action in group:
+            assert action.key in menu, action.key
+
+
+def test_upload_controls_have_methods_and_labels():
+    from stardustlib.gui.app import StardustApp
+
+    for action in action_defs.UPLOAD_CONTROLS:
+        assert hasattr(StardustApp, action.method)
+        for table in i18n.TRANSLATIONS.values():
+            assert action.key in table and f"tip_{action.key}" in table

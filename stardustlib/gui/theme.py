@@ -36,7 +36,42 @@ PALETTE: dict[str, str] = {
     "danger": "#f85149",
     "danger_border": "#6e3030",
     "danger_subtle": "#3d1f1f",
+    "attention": "#d29922",          # 경고(노랑)
 }
+
+# 툴팁(Primer는 라이트 테마에서도 어두운 툴팁을 쓴다 — neutral emphasis).
+_TOOLTIP = {
+    True: {"bg": PALETTE["surface"], "fg": PALETTE["fg_default"],
+           "border": PALETTE["border_default"]},
+    False: {"bg": "#24292f", "fg": "#ffffff", "border": "#24292f"},
+}
+
+
+def tooltip_colours(*, dark: bool) -> dict[str, str]:
+    """툴팁 배경·글자·테두리 색."""
+    return _TOOLTIP[bool(dark)]
+
+
+# 디자인 값(px)은 96 DPI 기준이다. 고DPI 화면에서 Tk가 DPI를 인식하면 폰트는 포인트
+# 단위라 커지는데 px 상수는 그대로라 행 높이·컬럼 폭이 글자에 비해 좁아진다.
+_BASE_DPI = 96.0
+_scale: float | None = None
+
+
+def ui_scale(root: tk.Misc) -> float:
+    """화면 DPI / 96 (1.0 미만이면 1.0). Tk가 뜬 뒤 한 번만 계산한다."""
+    global _scale
+    if _scale is None:
+        try:
+            _scale = max(1.0, float(root.winfo_fpixels("1i")) / _BASE_DPI)
+        except Exception:  # noqa: BLE001 — 조회 실패 시 배율 없음
+            _scale = 1.0
+    return _scale
+
+
+def px(root: tk.Misc, value: int) -> int:
+    """96 DPI 기준 px 값을 현재 화면 배율로 환산한다."""
+    return int(round(value * ui_scale(root)))
 
 
 # 본문 폰트 후보(앞선 것 우선). 한글 자형이 있는 시스템 폰트를 플랫폼별로 고른다 —
@@ -158,6 +193,7 @@ _LIGHT_TEXT = {
     "success": "#1a7f37",
     "accent": "#0969da",
     "danger": "#cf222e",
+    "attention": "#9a6700",
     "fg_default": "",      # 빈 문자열 = 위젯 기본 전경색 사용
     "fg_subtle": "#656d76",
     "fg_faint": "#8c959f",

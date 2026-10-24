@@ -51,19 +51,31 @@ TOOLBAR_GROUPS: tuple[tuple[Action, ...], ...] = (
     ),
 )
 
-# 컨텍스트 메뉴 항목(None은 구분선). 선택된 행에 대한 동작만 싣는다.
+# 컨텍스트 메뉴 항목(None은 구분선). 툴바의 동작을 모두 싣고(우클릭만 쓰는 사용자도
+# 같은 동작에 닿도록), 우클릭 전용인 '지금 백업 요청'과 업로드 큐 정리를 더한다.
 CONTEXT_MENU: tuple[Action | None, ...] = (
-    Action("ctx_announce", "_announce_selected", Need.FILES),
+    Action("download", "_download", Need.ONE_FILE),
+    Action("rename", "_rename", Need.ONE),
+    Action("move", "_move", Need.ONE),
+    Action("copy", "_copy", Need.ONE_FILE),
+    Action("delete", "_delete", Need.ANY),
     None,
+    Action("ctx_announce", "_announce_selected", Need.FILES),
     Action("backup_now", "_backup_selected", Need.FILES),
     Action("heal_now", "_heal_selected", Need.FILES),
     Action("restore_now", "_restore_selected", Need.FILES),
     None,
-    Action("download", "_download", Need.ONE_FILE),
-    Action("rename", "_rename", Need.ONE),
-    Action("delete", "_delete", Need.ANY),
+    Action("upload", "_upload", Need.NOTHING),
+    Action("mkdir", "_mkdir", Need.NOTHING),
     None,
     Action("upload_cancel", "_cancel_uploads", Need.NOTHING),
+    Action("upload_clear", "_clear_uploads", Need.NOTHING),
+)
+
+# 업로드 큐 정리 — 툴바 오른쪽에 해당 항목이 있을 때만 보인다.
+UPLOAD_CONTROLS: tuple[Action, ...] = (
+    Action("upload_cancel", "_cancel_uploads", Need.NOTHING),
+    Action("upload_clear", "_clear_uploads", Need.NOTHING),
 )
 
 

@@ -80,7 +80,8 @@ class FormDialog:
 
         # 오류 표시 자리. 실패해도 창을 닫지 않고 여기에 사유를 남긴다.
         self.error_label = ttk.Label(
-            body, text="", wraplength=380, justify="left",
+            body, text="", wraplength=theme.px(self.app.root, 380),
+            justify="left",
             foreground=theme.text_colour(
                 "danger", dark=getattr(self.app, "theme", "dark") == "dark"),
         )

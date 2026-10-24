@@ -14,13 +14,18 @@ from typing import Any
 
 
 class Worker:
-    """단일 백그라운드 스레드에서 작업을 순차 실행한다."""
+    """단일 백그라운드 스레드에서 작업을 순차 실행한다.
 
-    def __init__(self) -> None:
+    코어(sqlite 세션)를 쓰는 작업은 모두 같은 Worker 하나에서 돌아야 한다. 제어 파일
+    읽기·로컬 HTTP 조회처럼 세션을 쓰지 않는 가벼운 폴링은 별도 Worker에 두어, 큰
+    전송이 도는 동안에도 상태 표시가 멈추지 않게 한다.
+    """
+
+    def __init__(self, name: str = "stardust-gui-worker") -> None:
         self._tasks: queue.Queue = queue.Queue()
         self._results: queue.Queue = queue.Queue()
         self._thread = threading.Thread(
-            target=self._run, daemon=True, name="stardust-gui-worker"
+            target=self._run, daemon=True, name=name
         )
         self._thread.start()
 

@@ -47,3 +47,38 @@ def test_save_failure_does_not_raise(tmp_path, monkeypatch):
     os.makedirs(prefs._path(), exist_ok=True)  # 파일 자리에 디렉토리
     prefs.save(theme="light")                  # 예외 없이 통과
     assert prefs.theme("dark") == "dark"
+
+
+def test_widths_validate_each_column(tmp_path, monkeypatch):
+    """컬럼마다 따로 검증해 이상한 값만 기본값으로 둔다."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    defaults = {"name": 440, "size": 110}
+    assert prefs.widths("cols", defaults) == defaults
+    prefs.save(cols={"name": 300, "size": -5, "extra": 99})
+    assert prefs.widths("cols", defaults) == {"name": 300, "size": 110}
+    prefs.save(cols="broken")
+    assert prefs.widths("cols", defaults) == defaults
+
+
+def test_last_vpath_belongs_to_its_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    assert prefs.last_vpath("a.json") == "/"
+    prefs.save(last_vpath=["a.json", "/movies"])
+    assert prefs.last_vpath("a.json") == "/movies"
+    assert prefs.last_vpath("b.json") == "/"     # 다른 설정이면 루트
+    assert prefs.last_vpath(None) == "/"
+    prefs.save(last_vpath=["a.json", "relative"])
+    assert prefs.last_vpath("a.json") == "/"     # 형식이 다르면 루트
+
+
+def test_window_and_text(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    assert prefs.window() == {}
+    assert prefs.text("last_config") == ""
+    prefs.save(window={"geometry": "900x620+1+2", "zoomed": True, "x": 1},
+               last_config="C:/cfg.json")
+    assert prefs.window() == {"geometry": "900x620+1+2", "zoomed": True}
+    assert prefs.text("last_config") == "C:/cfg.json"
+    prefs.save(window=[1, 2], last_config=5)
+    assert prefs.window() == {}
+    assert prefs.text("last_config", "d") == "d"

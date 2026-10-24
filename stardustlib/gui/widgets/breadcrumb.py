@@ -78,7 +78,7 @@ class Breadcrumb:
 
     def _add_segment(self, label: str, target: str, *, last: bool) -> None:
         btn = ttk.Button(
-            self.frame, text=label, style="Toolbutton", takefocus=False,
+            self.frame, text=label, style="Toolbutton",
             command=lambda t=target: self.on_navigate(t),
         )
         btn.pack(side="left")
@@ -98,7 +98,7 @@ class Breadcrumb:
         """접힌 앞쪽 경로를 여는 '…' 버튼."""
         self._add_separator()
         btn = ttk.Button(self.frame, text="…", style="Toolbutton", width=3,
-                         takefocus=False, command=self._show_hidden)
+                         command=self._show_hidden)
         btn.pack(side="left")
         self._widgets.append(btn)
         self._ellipsis_btn = btn

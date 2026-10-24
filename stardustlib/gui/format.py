@@ -26,3 +26,21 @@ def human_bytes(n: int) -> str:
             return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
         size /= 1024
     return f"{n} B"
+
+
+def fit_text(text: str, width: int, measure) -> str:
+    """measure(text)->px 기준으로 width에 들어가도록 끝을 '…'로 줄인다.
+
+    라벨이 공간보다 길면 Tk는 글자를 중간에서 잘라 버린다. 들어가는 가장 긴 앞부분을
+    이분 탐색으로 찾아 줄임표를 붙인다. 한 글자도 안 들어가면 '…'만 남긴다.
+    """
+    if width <= 0 or measure(text) <= width:
+        return text
+    low, high = 0, len(text)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if measure(text[:mid].rstrip() + "…") <= width:
+            low = mid
+        else:
+            high = mid - 1
+    return text[:low].rstrip() + "…"

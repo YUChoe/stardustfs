@@ -33,20 +33,27 @@ class DaemonControlMixin:
         """
         if self.config_path:
             cfg = self.config_path
-            self.worker.submit(lambda: actions.daemon_status(cfg), self._on_daemon)
+            self._submit_once("daemon", lambda: actions.daemon_status(cfg),
+                              self._on_daemon, io=True)
         self.root.after(_DAEMON_POLL_MS, self._refresh_daemon)
 
-    def _daemon_dot(self, text: str, color: str, detail: str = "") -> None:
-        """상태바 왼쪽의 daemon 점. 진단용 상세(pid 등)는 툴팁으로 돌린다.
+    def _daemon_dot(self, text: str, colour: str, detail: str = "") -> None:
+        """상태바 왼쪽의 데몬 점. 진단용 상세(pid 등)는 툴팁으로 돌린다.
 
-        상태바 한 줄에 daemon·스토리지·디바이스·진행·백업 요약이 모두 들어가므로,
-        평소 읽을 필요가 없는 값까지 문구에 넣으면 오른쪽 항목이 잘린다.
+        colour는 테마 색 이름(theme.text_colour)이다 — 테마를 바꾸면 같은 이름으로
+        다시 칠한다. 상태바 한 줄에 항목이 많으므로 평소 읽을 필요가 없는 값까지
+        문구에 넣으면 오른쪽 항목이 잘린다.
         """
-        self.daemon_label.config(text="● " + text, foreground=color)
+        self._daemon_state = (text, colour, detail)
+        from stardustlib.gui import theme
+
+        self.daemon_label.config(
+            text="● " + text,
+            foreground=theme.text_colour(colour, dark=self.theme == "dark"))
         self._daemon_detail = detail or text
 
     def _on_daemon(self, ok, payload) -> None:
-        grey, green, orange = "#9aa0a6", "#2da44e", "#d29922"
+        grey, green, orange = "fg_subtle", "success", "attention"
         if not ok:
             self._daemon_dot(self.t["daemon_unknown"], grey)
             return
@@ -119,7 +126,7 @@ class DaemonControlMixin:
         # 시작 직후 1회 상태 점검으로 점을 갱신한다(별도 폴링 루프 추가 없이).
         self._submit(
             lambda: actions.daemon_start(cfg),
-            lambda _pid: self.worker.submit(
+            lambda _pid: self.io_worker.submit(
                 lambda: actions.daemon_status(cfg), self._on_daemon
             ),
             self.t["daemon_start_busy"],

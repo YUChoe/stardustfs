@@ -10,6 +10,13 @@ import asyncio
 from stardustlib.config_loader import ConfigLoader
 
 
+class ServerNotConfigured(RuntimeError):
+    """설정에 server.url이 없어 로그인할 수 없다."""
+
+    def __init__(self) -> None:
+        super().__init__("server.url이 설정되어 있지 않습니다.")
+
+
 def login(config_path: str, email: str, password: str,
           key_password: str | None = None) -> None:
     from stardustlib.auth_client import AuthClient
@@ -20,7 +27,7 @@ def login(config_path: str, email: str, password: str,
         server = config.get("server") or {}
         server_url = server.get("url") if isinstance(server, dict) else None
         if not server_url:
-            raise RuntimeError("server.url이 설정되어 있지 않습니다.")
+            raise ServerNotConfigured()
         store = CredentialStore(config["metadata_db"])
         auth = AuthClient(server_url, credential_store=store)
         try:

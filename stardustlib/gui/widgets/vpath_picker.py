@@ -12,7 +12,7 @@ import tkinter as tk
 from collections.abc import Callable
 from tkinter import ttk
 
-from stardustlib.gui import actions, theme
+from stardustlib.gui import actions, errors, theme
 
 
 class VPathPicker:
@@ -30,7 +30,8 @@ class VPathPicker:
         win = tk.Toplevel(self.app.root)
         self.win = win
         win.title(self.t["pick_folder"])
-        win.geometry("420x420")
+        win.geometry(f"{theme.px(self.app.root, 420)}x"
+                     f"{theme.px(self.app.root, 420)}")
         self.app.make_modal(win, self.app.root)
 
         self.path_label = ttk.Label(win, text=self.vpath, padding=(12, 10))
@@ -45,6 +46,10 @@ class VPathPicker:
         self.list.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
         self.list.bind("<Double-1>", lambda _e: self._enter())
+        # 키보드: 목록에서 Enter = 들어가기, BackSpace = 상위, 창 어디서나 Esc = 취소.
+        self.list.bind("<Return>", lambda _e: self._enter())
+        self.list.bind("<BackSpace>", lambda _e: self._up())
+        win.bind("<Escape>", lambda _e: self.win.destroy())
 
         self.error_label = ttk.Label(
             win, text="", padding=(12, 0),
@@ -73,13 +78,18 @@ class VPathPicker:
             if not self.win.winfo_exists():
                 return
             if not ok:
-                self.error_label.config(text=str(payload))
+                self.error_label.config(text=errors.describe(payload, self.t))
                 return
             self.error_label.config(text="")
             self._dirs = [r["name"] for r in payload["rows"]
                           if r.get("type") == "dir"]
             for name in self._dirs:
                 self.list.insert("end", name)
+            if self._dirs:
+                # 키보드로 바로 고를 수 있게 첫 폴더에 초점을 둔다.
+                self.list.selection_set(0)
+                self.list.activate(0)
+            self.list.focus_set()
 
         self._dirs: list[str] = []
         self.app.worker.submit(lambda: actions.browse(cfg, vp), done)

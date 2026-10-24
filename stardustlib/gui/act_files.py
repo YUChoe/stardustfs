@@ -34,11 +34,46 @@ def _delegate(config_path: str, op: str, virtual_path: str, local_path: str):
     )
 
 
-def put_file(config_path: str, local: str, remote: str) -> int:
+def free_name(exists, virtual_path: str) -> str:
+    """같은 폴더에서 쓰이지 않는 이름을 찾는다 — 'a.txt' → 'a (1).txt'.
+
+    exists(path) -> bool 은 경로 존재 여부. 파일 탐색기와 같은 규칙으로 확장자 앞에
+    번호를 붙인다(점으로 시작하는 이름은 확장자가 없는 것으로 본다).
+    """
+    if not exists(virtual_path):
+        return virtual_path
+    folder, _, name = virtual_path.rpartition("/")
+    stem, dot, ext = name.rpartition(".")
+    if not stem:  # 확장자 없음 또는 '.bashrc' 같은 이름
+        stem, dot, ext = name, "", ""
+    n = 1
+    while True:
+        candidate = f"{folder}/{stem} ({n}){dot}{ext}"
+        if not exists(candidate):
+            return candidate
+        n += 1
+
+
+# 업로드 대상 경로에 이미 파일이 있을 때의 처리.
+ON_CONFLICT = ("error", "overwrite", "rename")
+
+
+def put_file(config_path: str, local: str, remote: str,
+             on_conflict: str = "error") -> int:
+    """로컬 파일을 가상 경로에 올린다.
+
+    on_conflict: 같은 경로가 이미 있을 때 error(RemotePathExists), overwrite(덮어쓰기),
+    rename(번호를 붙인 새 이름). GUI만 이 가드를 쓴다 — 코어 write_file의 덮어쓰기
+    의미는 CLI/데몬/동기화/복제에서 그대로다.
+    """
+    if on_conflict not in ON_CONFLICT:
+        raise ValueError(f"unknown on_conflict: {on_conflict}")
     rv = _vpath(remote)
-    # 같은 가상 경로가 이미 있으면 덮어쓰지 않고 알린다(WAL이라 데몬이 커밋한 최신
-    # 메타데이터도 읽힌다). 호출자(업로드 다이얼로그)가 RemotePathExists를 처리한다.
-    if _offline_session(config_path).metadata.lookup(rv) is not None:
+    # WAL이라 데몬이 커밋한 최신 메타데이터도 읽힌다.
+    metadata = _offline_session(config_path).metadata
+    if on_conflict == "rename":
+        rv = free_name(lambda p: metadata.lookup(p) is not None, rv)
+    elif on_conflict == "error" and metadata.lookup(rv) is not None:
         raise RemotePathExists(rv)
     # 데몬 위임 우선(로컬 만석 시 홀펀칭 리모트 스필오버). 미실행이면 직접 수행.
     res = _delegate(config_path, "put", rv, local)

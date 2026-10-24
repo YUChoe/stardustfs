@@ -11,6 +11,7 @@ import os
 from tkinter import ttk
 
 from stardustlib.gui import prefs, theme
+from stardustlib.gui.widgets import tooltip
 
 try:  # 현대적 플랫 테마(Windows 11 풍). 미설치 시 기본 ttk로 폴백.
     import sv_ttk
@@ -31,6 +32,7 @@ class WindowThemeMixin:
             except Exception:  # noqa: BLE001
                 pass
         self._apply_font()
+        tooltip.set_dark(self.theme == "dark")
         # 디자인 시스템(Primer) 팔레트를 sv_ttk 위에 재지정한다.
         try:
             theme.apply_palette(self.root, ttk.Style(), dark=self.theme == "dark")
@@ -62,7 +64,7 @@ class WindowThemeMixin:
                     style.configure(st, font=fnt)
                 except Exception:  # noqa: BLE001
                     pass
-            style.configure("Treeview", rowheight=28)
+            style.configure("Treeview", rowheight=theme.px(self.root, 28))
         except Exception:  # noqa: BLE001
             pass
 
@@ -90,14 +92,14 @@ class WindowThemeMixin:
             pass
 
     def _set_theme(self, name: str) -> None:
+        if name == self.theme:
+            return
         self.theme = name
         prefs.save(theme=name)  # 다음 실행에도 유지
         self._apply_theme()
-        # 메뉴바 드롭다운(tk.Menu) 색은 테마를 자동으로 따르지 않으므로 재구성한다.
+        # 테마 색은 위젯을 만들 때 정해지는 곳이 많다(tk.Menu, 행 태그, 배너·빈 상태
+        # 라벨, 브레드크럼 구분자 등). 하나씩 다시 칠하면 새 위젯을 추가할 때마다
+        # 빠뜨리기 쉬우므로 언어 전환과 같이 메뉴·본문을 다시 만든다(보던 폴더·정렬·
+        # 분할선·배너는 재구성 후에도 유지된다).
         self._build_menu()
-        # 컨텍스트 메뉴도 tk.Menu라 색을 다시 입혀야 한다(본문 재구성 없이).
-        self._build_context_menu()
-        # 목록 행 태그 색은 다크/라이트가 다르다(다크용 밝은 회색을 라이트 배경에
-        # 그대로 쓰면 글자가 묻는다).
-        self._apply_row_tags()
-        self._apply_mgmt_tags()
+        self._rebuild_body()

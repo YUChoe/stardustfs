@@ -1,7 +1,8 @@
-"""파일 목록 패널 — 브레드크럼 경로 바, 목록 Treeview, 컨텍스트 메뉴, 탐색.
+"""파일 목록 패널 — 브레드크럼 경로 바, 목록 Treeview, 탐색, 선택.
 
 StardustApp에 믹스인으로 결합한다. 파일에 대한 실제 동작(업로드/삭제/백업 등)은
-file_ops.py가 담당하고, 이 모듈은 무엇을 보여주고 무엇이 선택됐는지를 다룬다.
+file_ops.py·uploads.py가, 액션 툴바와 컨텍스트 메뉴는 toolbar.py가 담당하고, 이
+모듈은 무엇을 보여주고 무엇이 선택됐는지를 다룬다.
 
 경로는 `self.vpath` 하나만을 원천으로 쓴다. 상위 폴더로는 브레드크럼 세그먼트,
 '↑ 상위' 버튼, 목록 첫 행의 `..`로 갈 수 있다.
@@ -13,15 +14,10 @@ import logging
 import tkinter as tk
 from tkinter import ttk
 
-from stardustlib.gui import action_defs, actions, theme
+from stardustlib.gui import actions, prefs, theme
 from stardustlib.gui.format import human_bytes
-from stardustlib.gui.widgets import tooltip
 from stardustlib.gui.widgets.breadcrumb import Breadcrumb
-
-try:  # Accent 버튼 스타일 제공(미설치 시 기본 버튼).
-    import sv_ttk
-except Exception:  # noqa: BLE001
-    sv_ttk = None
+from stardustlib.gui.window_state import fit_first_column
 
 logger = logging.getLogger(__name__)
 
@@ -31,13 +27,8 @@ PARENT_NAME = ".."
 # 백업 상태 정렬 순위(완료 > 대기 > 미백업).
 _BACKUP_RANK = {"replicated": 0, "pending": 1}
 
-# 업로드 진행 행의 상태별 표시 키.
-_UPLOAD_STATE_KEYS = {
-    "queued": "up_state_queued",
-    "running": "up_state_running",
-    "failed": "up_state_failed",
-    "exists": "up_state_exists",
-}
+# 파일 목록 기본 컬럼 폭(96 DPI 기준 px).
+FILE_COL_DEFAULTS = {"name": 440, "size": 110, "backup": 140}
 
 
 class FilesPanelMixin:
@@ -80,23 +71,26 @@ class FilesPanelMixin:
         cols = ("name", "size", "backup")
         self.tree = ttk.Treeview(holder, columns=cols, show="headings",
                                  selectmode="extended")
-        for c, head, w, anchor in (
-            ("name", t["col_name"], 440, "w"),
-            ("size", t["col_size"], 110, "e"),
-            ("backup", t["col_backup"], 140, "w"),
+        for c, head, anchor in (
+            ("name", t["col_name"], "w"),
+            ("size", t["col_size"], "e"),
+            ("backup", t["col_backup"], "w"),
         ):
             # 헤딩은 Tk 기본(가운데)을 유지한다. 데이터 정렬에 맞추면 오른쪽 정렬한
             # '크기'와 왼쪽 정렬한 '백업'이 컬럼 경계에서 붙어 한 단어로 읽힌다
             # (다크 테마에서 컬럼 구분선이 거의 보이지 않는다).
             self.tree.heading(
                 c, text=head, command=lambda col=c: self._sort_by(col))
-            self.tree.column(c, width=w, anchor=anchor)
+            self.tree.column(c, width=self._file_cols[c], anchor=anchor)
         sb = ttk.Scrollbar(holder, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True, padx=(6, 0))
+        # 스크롤바를 먼저 pack한다 — 저장된 컬럼 폭 합이 창보다 넓으면 트리가 공간을
+        # 다 가져가 나중에 놓인 스크롤바가 사라진다(고정 위젯 먼저, expand는 나중).
         sb.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="both", expand=True, padx=(6, 0))
 
         self._apply_row_tags()
+        fit_first_column(self.tree, "name", ("size", "backup"))
 
         # 행이 없을 때 사유를 목록 한가운데 안내한다(상태바 문구만으로는 놓치기 쉽다).
         self._empty_label = ttk.Label(
@@ -104,39 +98,12 @@ class FilesPanelMixin:
             foreground=theme.text_colour("fg_subtle", dark=self.theme == "dark"))
 
         self.tree.bind("<Double-1>", self._on_double)
+        # 키보드로도 폴더에 들어간다(Enter = 더블클릭과 같은 동작).
+        self.tree.bind("<Return>", self._on_double)
+        self.tree.bind("<KP_Enter>", self._on_double)
         self.tree.bind("<<TreeviewSelect>>", self._sync_action_states)
+        self._drop_enabled = self._register_drop(self.tree)
         self._build_context_menu()
-        self._sync_action_states()
-
-    def _build_action_toolbar(self, parent) -> None:
-        """액션 툴바 — action_defs.TOOLBAR_GROUPS 정의대로 만든다.
-
-        파일 목록과 같은 부모(분할 pane)에 목록보다 먼저 pack한다 — 좁은 창·높은
-        DPI 배율에서도 업로드·백업 버튼이 잘리지 않도록 고정 높이 영역을 먼저
-        확보하고, 분할선을 옮겨도 목록 바로 아래에 붙어 있게 한다.
-        """
-        tb = ttk.Frame(parent, padding=(8, 6))
-        tb.pack(fill="x", side="bottom")
-        self._toolbar = tb
-        self._action_buttons: dict[str, ttk.Button] = {}
-
-        for gi, group in enumerate(action_defs.TOOLBAR_GROUPS):
-            if gi:
-                ttk.Separator(tb, orient="vertical").pack(
-                    side="left", fill="y", padx=10)
-            for ai, action in enumerate(group):
-                style = ("Cta.TButton"
-                         if (action.accent and sv_ttk is not None) else "TButton")
-                btn = ttk.Button(
-                    tb, text=self.t[action.key], style=style,
-                    command=getattr(self, action.method),
-                )
-                btn.pack(side="left", padx=(0 if not ai else 6, 0))
-                self._action_buttons[action.key] = btn
-                tooltip.attach(btn, lambda a=action, b=btn: action_defs.tooltip(
-                    a, self.t, enabled="disabled" not in b.state()))
-        # 업로드 버튼은 잘림 회귀 테스트에서 참조하므로 이름을 남긴다.
-        self.upload_btn = self._action_buttons["upload"]
         self._sync_action_states()
 
     def _apply_row_tags(self) -> None:
@@ -162,61 +129,6 @@ class FilesPanelMixin:
             ("parent", "fg_subtle"),
         ):
             self.tree.tag_configure(tag, foreground=colour(name))
-
-    def _build_context_menu(self) -> None:
-        """파일 목록의 오른쪽 클릭 팝업 메뉴 — 툴바와 같은 정의를 쓴다."""
-        menu = tk.Menu(self.tree, tearoff=0)
-        # 팝업 시 항목 활성 상태를 갱신하려면 인덱스를 알아야 한다(구분선 포함 순번).
-        self._ctx_entries: list[tuple[int, action_defs.Action]] = []
-        for index, action in enumerate(action_defs.CONTEXT_MENU):
-            if action is None:
-                menu.add_separator()
-                continue
-            menu.add_command(label=self.t[action.key],
-                             command=getattr(self, action.method))
-            self._ctx_entries.append((index, action))
-        theme.style_menu(menu, dark=self.theme == "dark")
-        self._ctx_menu = menu
-        # Windows/X11은 Button-3, macOS는 Button-2
-        self.tree.bind("<Button-3>", self._on_context_menu)
-        self.tree.bind("<Button-2>", self._on_context_menu)
-
-    def _on_context_menu(self, event) -> None:
-        """클릭 위치의 행을 선택(이미 다중 선택된 행이면 유지)하고 메뉴를 띄운다."""
-        iid = self.tree.identify_row(event.y)
-        if iid and iid not in self.tree.selection():
-            self.tree.selection_set(iid)
-        rows = self._selected_rows()
-        has_config = bool(self.config_path)
-        for index, action in self._ctx_entries:
-            enabled = action_defs.is_enabled(action, rows, has_config=has_config)
-            if action.key == "upload_cancel":
-                enabled = bool(getattr(self, "_uploads", None))
-            self._ctx_menu.entryconfigure(
-                index, state="normal" if enabled else "disabled")
-        try:
-            self._ctx_menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self._ctx_menu.grab_release()
-
-    def _sync_action_states(self, _e=None) -> None:
-        """선택 상태에 맞춰 툴바 버튼 활성/비활성을 맞춘다.
-
-        선택 없이 누른 뒤 안내 창으로 돌려보내는 대신, 누를 수 없음을 미리 보여준다.
-        """
-        buttons = getattr(self, "_action_buttons", None)
-        if not buttons:
-            return
-        # 툴바는 목록보다 먼저 만들어지므로(하단 공간 선점) 첫 호출에는 tree가 없다.
-        # 언어 전환 재구성 중에는 옛 tree 객체가 남아 있으나 이미 파괴된 상태다.
-        rows = self._selected_rows() if self._tree_alive() else []
-        has_config = bool(self.config_path)
-        for group in action_defs.TOOLBAR_GROUPS:
-            for action in group:
-                btn = buttons.get(action.key)
-                if btn is not None:
-                    self._enable(btn, action_defs.is_enabled(
-                        action, rows, has_config=has_config))
 
     # --- 탐색 ---
 
@@ -281,8 +193,6 @@ class FilesPanelMixin:
         """헤딩 클릭 — 같은 컬럼이면 방향을 뒤집는다."""
         col, desc = self._sort
         self._sort = (column, not desc if col == column else False)
-        from stardustlib.gui import prefs
-
         prefs.save(sort=list(self._sort))
         self._populate(self._last_rows)
 
@@ -366,6 +276,7 @@ class FilesPanelMixin:
         self._update_empty_state(rows)
         # 목록을 다시 채우면 선택이 사라지므로 버튼 상태도 함께 되돌린다.
         self._sync_action_states()
+        self._sync_upload_controls()
 
     def _update_empty_state(self, rows: list[dict]) -> None:
         """행이 없을 때만 사유별 안내를 목록 위에 겹쳐 보여준다."""
@@ -379,40 +290,28 @@ class FilesPanelMixin:
             text = self.t["select_config_hint"]
         elif not self._logged_in():
             text = self.t["login_required"]
+        elif getattr(self, "_drop_enabled", False):
+            text = self.t["empty_folder_drop"]
         else:
             text = self.t["empty_folder"]
-        label.config(text=text)
+        label.config(text=text, justify="center")
         label.place(relx=0.5, rely=0.4, anchor="center")
-
-    def _render_uploads(self) -> None:
-        """현재 폴더가 대상인 업로드 항목을 진행 행으로 얹는다.
-
-        서버 목록과 업로드 큐를 한 자료구조에 섞지 않는다 — 3초 폴링이 목록을 통째로
-        다시 그려도 진행 행이 살아남아야 하기 때문이다.
-        """
-        for item in getattr(self, "_uploads", []):
-            if item.dest != self.vpath:
-                continue  # 다른 폴더에 올리는 중
-            state = self.t[_UPLOAD_STATE_KEYS[item.state]]
-            tag = "upload_failed" if item.state == "failed" else "upload"
-            iid = self.tree.insert(
-                "", 0, values=(f"⬆  {item.name}", "", state), tags=(tag,))
-            self._rows[iid] = {"type": "file", "name": item.name,
-                               "upload": True}
 
     def _show_browse(self, d: dict, counts: bool = True) -> None:
         self._populate(d["rows"])
-        # 스토리지 상태: 소스 수 + 사용/총 용량
+        # 스토리지 상태: 사용/총 용량(소스 수 등 자세한 값은 툴팁)
+        used, total = human_bytes(d["used"]), human_bytes(d["total"])
         self.storage_label.config(text=self.t["storage_status"].format(
-            sources=d.get("sources", 0), used=human_bytes(d["used"]),
-            total=human_bytes(d["total"]),
-        ))
+            used=used, total=total))
+        self._storage_tip = self.t["storage_status_tip"].format(
+            sources=d.get("sources", 0), used=used, total=total)
         bs = d.get("backup_summary")
         if bs:
-            self.backup_status.config(text=self.t["backup_summary"].format(
-                replicated=bs["replicated"], pending=bs["pending"],
-                none=bs["none"],
-            ))
+            values = {"replicated": bs["replicated"], "pending": bs["pending"],
+                      "none": bs["none"]}
+            self.backup_status.config(
+                text=self.t["backup_summary"].format(**values))
+            self._backup_tip = self.t["backup_summary_tip"].format(**values)
         # 방금 본 메타데이터 시점을 기록(자동 새로고침이 즉시 재발동하지 않도록).
         self._mark_meta_seen()
         if not counts:

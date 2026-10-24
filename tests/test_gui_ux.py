@@ -135,7 +135,7 @@ def test_empty_state_message_depends_on_reason(app):
 
 def test_upload_rows_survive_refresh(app):
     """진행 중인 업로드는 목록을 다시 그려도 남는다."""
-    from stardustlib.gui.file_ops import UploadItem
+    from stardustlib.gui.uploads import UploadItem
 
     app._set_vpath("/")
     app._uploads.append(
@@ -151,7 +151,7 @@ def test_upload_rows_survive_refresh(app):
 
 def test_upload_rows_hidden_in_other_folders(app):
     """대상 폴더가 아니면 진행 행을 그리지 않는다(업로드는 계속된다)."""
-    from stardustlib.gui.file_ops import UploadItem
+    from stardustlib.gui.uploads import UploadItem
 
     app._uploads.append(
         UploadItem(local="C:/tmp/y.bin", name="y.bin", dest="/other"))
@@ -169,7 +169,7 @@ def test_upload_rows_hidden_in_other_folders(app):
 
 def test_upload_row_is_not_an_action_target(app):
     """업로드 진행 행은 삭제·백업 등의 대상이 되지 않는다."""
-    from stardustlib.gui.file_ops import UploadItem
+    from stardustlib.gui.uploads import UploadItem
 
     app._uploads.append(
         UploadItem(local="C:/tmp/z.bin", name="z.bin", dest="/"))
@@ -185,7 +185,7 @@ def test_upload_row_is_not_an_action_target(app):
 
 def test_cancel_uploads_drops_only_queued(app):
     """취소는 대기 항목만 버리고 진행 중인 파일은 남긴다."""
-    from stardustlib.gui.file_ops import UploadItem
+    from stardustlib.gui.uploads import UploadItem
 
     app._set_vpath("/")
     running = UploadItem(local="C:/tmp/r.bin", name="r.bin", dest="/",

@@ -13,6 +13,15 @@ from stardustlib.gui import theme
 
 _DELAY_MS = 600
 
+# 현재 테마(창 테마를 바꾸면 window_theme이 갱신한다). 툴팁은 표시할 때마다 새로
+# 만들므로 다음 표시부터 바로 반영된다.
+_dark = True
+
+
+def set_dark(dark: bool) -> None:
+    global _dark
+    _dark = bool(dark)
+
 
 class _Tip:
     """위젯 하나에 붙는 툴팁 상태."""
@@ -57,11 +66,12 @@ class _Tip:
             win = tk.Toplevel(self.widget)
             win.wm_overrideredirect(True)  # 제목표시줄 없는 떠 있는 상자
             win.wm_geometry(f"+{x}+{y}")
+            colours = theme.tooltip_colours(dark=_dark)
             tk.Label(
                 win, text=text, justify="left", wraplength=320,
-                background=theme.PALETTE["surface"],
-                foreground=theme.PALETTE["fg_default"],
-                relief="solid", borderwidth=1, padx=8, pady=4,
+                background=colours["bg"], foreground=colours["fg"],
+                highlightthickness=1, highlightbackground=colours["border"],
+                borderwidth=0, padx=8, pady=4,
             ).pack()
             self._window = win
         except tk.TclError:  # 위젯이 이미 사라짐
